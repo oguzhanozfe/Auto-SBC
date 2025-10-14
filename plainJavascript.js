@@ -6607,9 +6607,9 @@ const fetchSingleCheapest = async (rating) => {
       .replace('/', '');
 
     const futggResponse = await makeGetRequest(
-      `https://www.fut.gg/api/fut/player-prices/25/?ids=${playerLink}`
+      `https://www.fut.gg/api/fut/player-prices/26/?ids=${playerLink}`
     );
-    //  console.log(rating,doc,`https://www.fut.gg/api/fut/player-prices/25/?ids=${playerLink}`, doc.getElementsByClassName("fut-card-container")[0].href)
+    //  console.log(rating,doc,`https://www.fut.gg/api/fut/player-prices/26/?ids=${playerLink}`, doc.getElementsByClassName("fut-card-container")[0].href)
 
     priceResponse = JSON.parse(futggResponse);
     priceResponse = priceResponse.data;
@@ -6649,7 +6649,7 @@ let fetchPlayerPrices = async (players) => {
 
     try {
       const futggResponse = await makeGetRequest(
-        `https://www.fut.gg/api/fut/player-prices/25/?ids=${playersIdArray}`
+        `https://www.fut.gg/api/fut/player-prices/26/?ids=${playersIdArray}`
       );
 
       let priceResponse = JSON.parse(futggResponse).data;
