@@ -3,6 +3,7 @@ import csv
 import json
 import time
 import random
+import argparse
 from pathlib import Path
 
 from selenium import webdriver
@@ -16,7 +17,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 BASE_URL = "https://www.fut.gg/players/?page={page}"
 OUT_CSV = "allPlayers.csv"
 START_PAGE = 1
-END_PAGE = 334  # inclusive
+END_PAGE = None  # Will be auto-detected
+MAX_CONSECUTIVE_EMPTY_PAGES = 5  # Stop after this many consecutive empty pages
+MAX_CONSECUTIVE_NO_CHANGE_PAGES = 300  # Stop after this many pages with no new players or price changes
 
 # Your exact header (note the leading empty column name)
 HEADERS = [
@@ -40,24 +43,33 @@ def init_driver(headless=True):
     chrome_options.add_argument("--window-size=1200,1200")
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # Set the binary location to your Chromium installation
-    chrome_options.binary_location = r"C:\Users\Oguzhan\AppData\Local\Chromium\Application\chrome.exe"
-
+    # System-agnostic Chrome detection - let Selenium auto-detect Chrome installation
+    # This works on Windows, macOS, and Linux
+    
     try:
-        # Clear cache and get ChromeDriver version 133.0.6943.141 to match your Chromium
+        # Clear cache and get latest ChromeDriver to match your Chrome version
         import shutil
         cache_path = os.path.join(os.path.expanduser('~'), '.wdm')
         if os.path.exists(cache_path):
             shutil.rmtree(cache_path, ignore_errors=True)
         
-        service = Service(ChromeDriverManager(driver_version="133.0.6943.141").install())
+        print("🔍 Auto-detecting Chrome and downloading compatible ChromeDriver...")
+        # Let webdriver-manager automatically find the best matching version
+        service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("✅ Successfully initialized Chrome with webdriver-manager")
             
     except Exception as e:
-        print(f"Failed with webdriver-manager: {e}")
-        print("Trying with system ChromeDriver...")
-        # Fallback to system ChromeDriver
-        driver = webdriver.Chrome(options=chrome_options)
+        print(f"⚠️  Failed with webdriver-manager: {e}")
+        print("🔄 Trying with system ChromeDriver...")
+        try:
+            # Fallback to system ChromeDriver
+            driver = webdriver.Chrome(options=chrome_options)
+            print("✅ Successfully initialized Chrome with system ChromeDriver")
+        except Exception as e2:
+            print(f"❌ Failed with system ChromeDriver: {e2}")
+            print("💡 Please ensure Chrome is installed and accessible")
+            raise e2
     
     driver.set_page_load_timeout(60)
     return driver
@@ -210,8 +222,16 @@ def append_rows(path, rows):
         for r in rows:
             w.writerow(r)
 
-def slow_scrape():
-    driver = init_driver(headless=True)
+def slow_scrape(start_page=None, end_page=None, headless=True, quick_update=False):
+    if start_page is None:
+        start_page = START_PAGE
+    if end_page is None:
+        end_page = END_PAGE
+    
+    # Adjust stopping criteria for quick update mode
+    max_no_change = 10 if quick_update else MAX_CONSECUTIVE_NO_CHANGE_PAGES
+        
+    driver = init_driver(headless=headless)
     ensure_csv_with_header(OUT_CSV)
 
     # Initialize momentum changed players file
@@ -232,9 +252,17 @@ def slow_scrape():
     price_updates = 0
 
     try:
-        for page in range(START_PAGE, END_PAGE + 1):
+        page = start_page
+        consecutive_empty_pages = 0
+        consecutive_no_change_pages = 0
+        
+        while True:
+            # If we have a fixed end page, check if we've reached it
+            if end_page and page > end_page:
+                print(f"   🏁 Reached specified end page {end_page}. Stopping.")
+                break
             url = BASE_URL.format(page=page)
-            print(f"\n➡️  Opening page {page}/{END_PAGE}: {url}")
+            print(f"\n➡️  Opening page {page}: {url}")
             try:
                 driver.get(url)
                 # Wait for SSR matches ready OR card container present
@@ -254,14 +282,29 @@ def slow_scrape():
                     matches = json.loads(matches)
                 except Exception as e2:
                     print(f"   ❌ Retry failed on page {page}: {e2}")
+                    consecutive_empty_pages += 1
+                    if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY_PAGES:
+                        print(f"   🛑 Reached {MAX_CONSECUTIVE_EMPTY_PAGES} consecutive failed pages. Stopping.")
+                        break
                     # go to next page after a polite nap
                     nap = random.uniform(1.5, 3)
                     print(f"   ⏭️  Skipping page {page}. Waiting {nap:.1f}s before next.")
                     time.sleep(nap)
+                    page += 1
                     continue
 
             items = extract_player_items(matches)
             print(f"   📦 Found {len(items)} player items on page {page}")
+            
+            # Check if this page is empty
+            if len(items) == 0:
+                consecutive_empty_pages += 1
+                print(f"   📭 Empty page {page} (consecutive empty: {consecutive_empty_pages})")
+                if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY_PAGES:
+                    print(f"   🛑 Reached {MAX_CONSECUTIVE_EMPTY_PAGES} consecutive empty pages. Stopping.")
+                    break
+            else:
+                consecutive_empty_pages = 0  # Reset counter when we find content
 
             page_new_rows = 0
             page_price_updates = 0
@@ -335,18 +378,26 @@ def slow_scrape():
             # Save data after each page to prevent data loss
             if page_new_rows > 0 or page_price_updates > 0:
                 save_updated_data(OUT_CSV, all_rows)
+                consecutive_no_change_pages = 0  # Reset counter when we have changes
                 if page_new_rows > 0:
                     print(f"   💾 Page {page} completed: {page_new_rows} new players added, {page_price_updates} price updates")
                 else:
                     print(f"   ✅ Page {page} completed: {page_price_updates} price updates")
             else:
-                print(f"   ✅ Page {page} completed: No changes")
+                consecutive_no_change_pages += 1
+                print(f"   ✅ Page {page} completed: No changes (consecutive no-change: {consecutive_no_change_pages})")
+                
+                # Stop if we've gone through many pages without any changes
+                if consecutive_no_change_pages >= max_no_change:
+                    print(f"   🛑 Reached {max_no_change} consecutive pages with no changes.")
+                    print(f"   💡 This suggests we've processed all available data. Stopping early.")
+                    break
 
             # polite randomized delay 2–4 sec before next page
             delay = random.uniform(2, 4)
-            if page < END_PAGE:
-                print(f"   ⏳ Sleeping {delay:.1f} seconds before next page…")
-                time.sleep(delay)
+            print(f"   ⏳ Sleeping {delay:.1f} seconds before next page…")
+            time.sleep(delay)
+            page += 1
 
         # Save all data back to CSV
         save_updated_data(OUT_CSV, all_rows)
@@ -358,4 +409,28 @@ def slow_scrape():
         driver.quit()
 
 if __name__ == "__main__":
-    slow_scrape()
+    parser = argparse.ArgumentParser(description='Scrape FIFA player data from fut.gg')
+    parser.add_argument('--start-page', type=int, default=START_PAGE, help='Page number to start from (default: 1)')
+    parser.add_argument('--end-page', type=int, default=END_PAGE, help='Page number to end at (default: auto-detect)')
+    parser.add_argument('--headless', action='store_true', default=True, help='Run browser in headless mode (default: True)')
+    parser.add_argument('--no-headless', action='store_false', dest='headless', help='Run browser with GUI')
+    parser.add_argument('--quick-update', action='store_true', help='Skip pages that have no new players or price changes (faster for updates)')
+    
+    args = parser.parse_args()
+    
+    # Determine stopping criteria based on mode
+    if args.quick_update:
+        max_no_change = 10  # Stop sooner in quick update mode
+        print(f"🚀 Quick update mode: Starting from page {args.start_page}")
+        print(f"⚡ Will stop after {max_no_change} consecutive pages with no changes")
+    else:
+        max_no_change = MAX_CONSECUTIVE_NO_CHANGE_PAGES
+        print(f"🚀 Full scrape mode: Starting from page {args.start_page}")
+        print(f"🔍 Will stop after {max_no_change} consecutive pages with no changes")
+    
+    if args.end_page:
+        print(f"📍 Will stop at page {args.end_page}")
+    else:
+        print(f"🔍 Auto-detecting last page (stop after {MAX_CONSECUTIVE_EMPTY_PAGES} empty pages)")
+    
+    slow_scrape(start_page=args.start_page, end_page=args.end_page, headless=args.headless, quick_update=args.quick_update)
