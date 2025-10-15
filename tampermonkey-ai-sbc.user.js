@@ -4353,77 +4353,100 @@ const updateProgressBar = (progressBarId, progress) => {
 let isConceptPlayerFetchInProgress = false;
 
 let getConceptPlayers = async function (playerCount = 999999) {
-  // If already fetching concepts, return the current conceptPlayers array
-  if (isConceptPlayerFetchInProgress || conceptPlayersCollected) {
-    console.log('Already fetching concept players or already collected.');
-
+  // If already collected, return the current conceptPlayers array
+  if (conceptPlayersCollected) {
+    console.log('Concept players already collected from local database.');
     return conceptPlayers;
   }
 
-  return new Promise((resolve, reject) => {
+  // If already fetching concepts, return the current conceptPlayers array
+  if (isConceptPlayerFetchInProgress) {
+    console.log('Already fetching concept players.');
+    return conceptPlayers;
+  }
+
+  return new Promise(async (resolve, reject) => {
     isConceptPlayerFetchInProgress = true;
-    console.log('Getting Concept Players');
-    const gatheredPlayers = [];
-    const searchCriteria = new UTBucketedItemSearchViewModel().searchCriteria;
-    searchCriteria.offset = 0;
-    searchCriteria.sortBy = SearchSortType.RECENCY;
-    searchCriteria.count = DEFAULT_SEARCH_BATCH_SIZE;
-
-    // Create progress bar using the extracted utility function
-    const containerId = 'concept-progress-container';
-    const progressBarId = 'concept-progress-bar';
-    createProgressBar(progressBarId, containerId, 'Fetching Concepts');
-
-    // Start with 0% progress
-    updateProgressBar(progressBarId, 0);
-
-    // Estimate total players to be around 20000 for progress calculation
-    // Try to get saved total from localStorage first
-    const savedEstimatedTotal = localStorage.getItem('conceptPlayerTotal');
-    const estimatedTotal = savedEstimatedTotal ? parseInt(savedEstimatedTotal) : 20000;
-
-    // Update the total once we have more data
-    const updateTotal = (newTotal) => {
-      if (newTotal > 1000) {
-        // Only save if it seems like a reasonable count
-        localStorage.setItem('conceptPlayerTotal', newTotal);
-        console.log(`Updated concept player count to ${newTotal}`);
-      }
-    };
-
-    const getAllConceptPlayers = () => {
-      searchConceptPlayers(searchCriteria).observe(this, async function (sender, response) {
-        gatheredPlayers.push(...response.response.items);
-
-        // Update progress based on current offset
-        const progress = (searchCriteria.offset / estimatedTotal) * 100;
-        updateProgressBar(progressBarId, progress);
-
-        if (
-          response.status !== 400 &&
-          !response.response.endOfList &&
-          searchCriteria.offset <= playerCount
-        ) {
-          searchCriteria.offset += searchCriteria.count;
-
-          getAllConceptPlayers();
-        } else {
-          if (playerCount > 1) {
-            conceptPlayersCollected = true;
-            showNotification('Collected All Concept Players', UINotificationType.POSITIVE);
-          }
-          // Set progress to 100% when complete
-          updateProgressBar(progressBarId, 100);
-          // Remove progress bar after a delay
-          removeProgressBar(containerId);
-          // Reset the flag when done
-          isConceptPlayerFetchInProgress = false;
-          console.table(gatheredPlayers.slice(0, 10));
-          resolve(gatheredPlayers);
-        }
+    console.log('Getting Concept Players from local database');
+    
+    try {
+      // Ensure local database is loaded
+      await ensureLocalPlayerData();
+      
+      // Create progress bar
+      const containerId = 'concept-progress-container';
+      const progressBarId = 'concept-progress-bar';
+      createProgressBar(progressBarId, containerId, 'Loading Concepts from Local Database');
+      
+      // Filter concept players from local database
+      const conceptPlayersFromDB = localPlayerDataList.filter(player => 
+        player.concept === true || player.concept === 'true'
+      );
+      
+      // Convert local player data to concept player format expected by the EA API
+      const gatheredPlayers = conceptPlayersFromDB.slice(0, playerCount).map(player => {
+        // Create a mock player object that matches EA's structure
+        const mockPlayer = {
+          definitionId: player.definitionId,
+          assetId: player.assetId,
+          id: player.id,
+          rating: player.rating,
+          _staticData: {
+            name: player.name,
+            rating: player.rating,
+            position: player.preferredPosition,
+            teamId: player.teamId,
+            leagueId: player.leagueId,
+            nationId: player.nationId,
+            rarityId: player.rarityId,
+            cardType: player.cardType
+          },
+          concept: true,
+          price: player.price || player.futggPrice,
+          
+          // Add required methods that EA players have
+          isPlayer: function() { return true; },
+          getStaticData: function() { return this._staticData; },
+          getDefinitionId: function() { return this.definitionId; },
+          isGoldPlayer: function() { return this.rating >= 75; },
+          isSilverPlayer: function() { return this.rating >= 65 && this.rating < 75; },
+          isBronzePlayer: function() { return this.rating < 65; },
+          getPreferredPosition: function() { return this._staticData.position; },
+          getTeamId: function() { return this._staticData.teamId; },
+          getLeagueId: function() { return this._staticData.leagueId; },
+          getNationId: function() { return this._staticData.nationId; },
+          getRarityId: function() { return this._staticData.rarityId; }
+        };
+        
+        return mockPlayer;
       });
-    };
-    getAllConceptPlayers();
+      
+      updateProgressBar(progressBarId, 100);
+      
+      if (gatheredPlayers.length > 0) {
+        conceptPlayersCollected = true;
+        showNotification(`Loaded ${gatheredPlayers.length} concept players from local database`, UINotificationType.POSITIVE);
+      }
+      
+      // Remove progress bar after completion
+      removeProgressBar(containerId);
+      
+      // Reset the flag when done
+      isConceptPlayerFetchInProgress = false;
+      
+      console.log(`Loaded ${gatheredPlayers.length} concept players from local database`);
+      console.table(gatheredPlayers.slice(0, 10));
+      
+      conceptPlayers = gatheredPlayers;
+      resolve(gatheredPlayers);
+      
+    } catch (error) {
+      console.error('Failed to load concept players from local database:', error);
+      isConceptPlayerFetchInProgress = false;
+      removeProgressBar(containerId);
+      showNotification('Failed to load concept players from local database', UINotificationType.NEGATIVE);
+      resolve([]);
+    }
   });
 };
 const searchConceptPlayers = (searchCriteria) => {
@@ -5968,12 +5991,39 @@ const sbcViewOverride = () => {
   UTSBCSquadDetailPanelView.prototype.init = function (...args) {
     const response = squadDetailPanelView.call(this, ...args);
 
-    const button = createButton('idSolveSbc', 'Solve SBC', async function () {
-      const { _challenge } = getControllerInstance();
-
-      solveSBC(_challenge.setId, _challenge.id);
-    });
-    insertAfter(button, this._btnExchange.__root);
+    try {
+      console.log('🎯 SBC Squad Detail Panel initialized - adding Solve SBC button');
+      
+      const button = createButton('idSolveSbc', 'Solve SBC', async function () {
+        console.log('🚀 Solve SBC button clicked');
+        try {
+          const { _challenge } = getControllerInstance();
+          console.log('🎮 Challenge data:', _challenge);
+          solveSBC(_challenge.setId, _challenge.id);
+        } catch (error) {
+          console.error('❌ Error in Solve SBC:', error);
+          alert('Error solving SBC: ' + error.message);
+        }
+      });
+      
+      if (this._btnExchange && this._btnExchange.__root) {
+        insertAfter(button, this._btnExchange.__root);
+        console.log('✅ Solve SBC button added successfully');
+      } else {
+        console.warn('⚠️ Exchange button not found, trying alternative placement');
+        // Try to find any suitable container
+        const container = this.getView ? this.getView() : this;
+        if (container && container.appendChild) {
+          container.appendChild(button);
+          console.log('✅ Solve SBC button added to alternative container');
+        } else {
+          console.error('❌ Could not add Solve SBC button - no suitable container found');
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error adding Solve SBC button:', error);
+    }
+    
     return response;
   };
 };
@@ -6600,117 +6650,328 @@ const convertAbbreviatedNumber = (number) => {
   return number * 1;
 };
 
+let localPlayerDataPromise;
+let localPlayerDataMap;
+let localPlayerDataList;
+let localRatingMinPriceMap;
+let localRatingRange = { min: 45, max: 45 };
+
+const normalizeNumber = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  const trimmed = String(value).replace(/[^0-9.\-]/g, '');
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeBoolean = (value) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (value === null || value === undefined) {
+    return false;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+};
+
+const normalizeArrayFromString = (value, delimiter = '|') => {
+  if (!value) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return String(value)
+    .split(delimiter)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+};
+
+const ensureLocalPlayerData = async () => {
+  if (localPlayerDataPromise) {
+    return localPlayerDataPromise;
+  }
+
+  localPlayerDataPromise = (async () => {
+    try {
+      const csvUrl = `${apiUrl}/allPlayers.csv`;
+      const csvText = await makeGetRequest(csvUrl);
+      const parsedRows = typeof d3 !== 'undefined' && d3.csv ? d3.csv.parse(csvText) : [];
+
+      localPlayerDataList = [];
+      localPlayerDataMap = new Map();
+      localRatingMinPriceMap = new Map();
+      localRatingRange = { min: 99, max: 45 };
+
+      parsedRows.forEach((row) => {
+        const definitionId = row.definitionId ? row.definitionId.trim() : '';
+        if (!definitionId) {
+          return;
+        }
+
+        const rating = normalizeNumber(row.rating);
+        const priceValue = normalizeNumber(row.futggPrice ?? row.price);
+        const entry = {
+          id: normalizeNumber(row.id),
+          definitionId,
+          assetId: normalizeNumber(row.assetId),
+          name: row.name || '',
+          cardType: row.cardType || '',
+          rating,
+          teamId: normalizeNumber(row.teamId),
+          leagueId: normalizeNumber(row.leagueId),
+          nationId: normalizeNumber(row.nationId),
+          rarityId: normalizeNumber(row.rarityId),
+          ratingTier: normalizeNumber(row.ratingTier),
+          preferredPosition: row.preferredPosition || '',
+          possiblePositions: normalizeArrayFromString(row.possiblePositions),
+          groups: normalizeArrayFromString(row.groups),
+          concept: normalizeBoolean(row.concept),
+          price: priceValue,
+          futggPrice: priceValue,
+          maxChem: normalizeNumber(row.maxChem),
+          teamChem: {
+            calculationType: row['teamChem.calculationType'] || '',
+            contribution: normalizeNumber(row['teamChem.contribution']),
+            parameterId: normalizeNumber(row['teamChem.parameterId']),
+          },
+          leagueChem: {
+            calculationType: row['leagueChem.calculationType'] || '',
+            contribution: normalizeNumber(row['leagueChem.contribution']),
+            parameterId: normalizeNumber(row['leagueChem.parameterId']),
+          },
+          nationChem: {
+            calculationType: row['nationChem.calculationType'] || '',
+            contribution: normalizeNumber(row['nationChem.contribution']),
+            parameterId: normalizeNumber(row['nationChem.parameterId']),
+          },
+        };
+
+        localPlayerDataMap.set(definitionId, entry);
+        localPlayerDataList.push(entry);
+
+        if (Number.isFinite(rating)) {
+          localRatingRange.min = Math.min(localRatingRange.min, rating);
+          localRatingRange.max = Math.max(localRatingRange.max, rating);
+        }
+
+        if (Number.isFinite(rating) && Number.isFinite(priceValue) && priceValue > 0) {
+          const existing = localRatingMinPriceMap.get(rating);
+          if (!existing || priceValue < existing.price) {
+            localRatingMinPriceMap.set(rating, { price: priceValue, definitionId });
+          }
+        }
+      });
+
+      if (localRatingRange.min === 99) {
+        localRatingRange.min = 45;
+      }
+    } catch (error) {
+      console.error('Failed to load local player data', error);
+      localPlayerDataList = [];
+      localPlayerDataMap = new Map();
+      localRatingMinPriceMap = new Map();
+      localRatingRange = { min: 45, max: 45 };
+      throw error;
+    }
+  })();
+
+  return localPlayerDataPromise.catch((error) => {
+    localPlayerDataPromise = null;
+    throw error;
+  });
+};
+
+const getLocalPlayerEntry = (definitionId) => {
+  if (!localPlayerDataMap) {
+    return null;
+  }
+  return localPlayerDataMap.get(String(definitionId));
+};
+
+const getCheapestPriceForRatingFromLocal = (rating) => {
+  if (!localRatingMinPriceMap) {
+    return null;
+  }
+  const entry = localRatingMinPriceMap.get(Number(rating));
+  return entry ? entry.price : null;
+};
+
+const getLocalRatingRange = () => {
+  return { ...localRatingRange };
+};
+
 let priceResponse;
 const fetchLowestPriceByRating = async () => {
-  let PriceItems = getPriceItems();
-  let timeStamp = new Date(Date.now());
+  try {
+    await ensureLocalPlayerData();
+  } catch (error) {
+    console.warn('Unable to prime rating minima from local data', error);
+    return;
+  }
 
-  for (let i = 45; i <= 81; i++) {
-    PriceItems[i + '_CBR'] = {
-      price: i < 75 ? 200 : 400,
-      timestamp: timeStamp,
-      rating: i,
+  let PriceItems = getPriceItems();
+  const timeStamp = new Date(Date.now());
+  const { min, max } = getLocalRatingRange();
+  const lowerBound = Math.min(45, Number.isFinite(min) ? min : 45);
+  const upperBound = Number.isFinite(max) ? max : 99;
+
+  for (let rating = lowerBound; rating <= upperBound; rating++) {
+    const cheapest = getCheapestPriceForRatingFromLocal(rating);
+    const fallbackPrice = rating < 75 ? 200 : 400;
+    PriceItems[`${rating}_CBR`] = {
+      ...(PriceItems[`${rating}_CBR`] || {}),
+      eaId: `${rating}_CBR`,
+      price: Number.isFinite(cheapest) ? cheapest : fallbackPrice,
+      rating,
+      timeStamp,
+      isExtinct: false,
+      isObjective: false,
+      isSbc: false,
     };
   }
+
   cachedPriceItems = PriceItems;
-  let highestRating = await getConceptPlayers(1);
-  updateCBRMinPrice();
-  for (let i = 81; i <= Math.max(...highestRating.map((m) => m.rating)); i++) {
-    if (isPriceOld({ definitionId: i + '_CBR' })) {
-      await fetchSingleCheapest(i);
-    }
-    await fetchSingleCheapest(i);
-  }
+  savePriceItems();
   updateCBRMinPrice();
 };
 const fetchSingleCheapest = async (rating) => {
-  return //this doesnt work any more since futgg changed their site
-  const futggSingleCheapestByRatingResponse = await makeGetRequest(
-    `https://www.fut.gg/players/?overall__gte=${rating}&overall__lte=${rating}&price__gte=100&sorts=current_price&market_players=1`
-  );
-
-  const doc = new DOMParser().parseFromString(futggSingleCheapestByRatingResponse, 'text/html');
-
+  // Use local database instead of fut.gg
   try {
-    let playerLink = doc
-      .getElementsByClassName('fut-card-container')[0]
-      .href?.split('25-')[1]
-      .replace('/', '');
-
-    const futggResponse = await makeGetRequest(
-      `https://www.fut.gg/api/fut/player-prices/26/?ids=${playerLink}`
-    );
-    //  console.log(rating,doc,`https://www.fut.gg/api/fut/player-prices/26/?ids=${playerLink}`, doc.getElementsByClassName("fut-card-container")[0].href)
-
-    priceResponse = JSON.parse(futggResponse);
-    priceResponse = priceResponse.data;
+    await ensureLocalPlayerData();
+    const cheapestPrice = getCheapestPriceForRatingFromLocal(rating);
+    
+    if (cheapestPrice !== null) {
+      console.log(`Found cheapest price for rating ${rating}: ${cheapestPrice}`);
+      return cheapestPrice;
+    } else {
+      console.log(`No price found for rating ${rating} in local database`);
+      return 15000000; // Fallback high price
+    }
   } catch (error) {
-    console.error(error, doc);
-
-    return;
+    console.error(`Error fetching cheapest price for rating ${rating}:`, error);
+    return 15000000; // Fallback high price
   }
-  let PriceItems = getPriceItems();
-  let timeStamp = new Date(Date.now());
-  for (let key in priceResponse) {
-    priceResponse[key]['timeStamp'] = timeStamp;
-    priceResponse[key]['rating'] = rating;
-    PriceItems[rating + '_CBR'] = priceResponse[key];
-  }
-  cachedPriceItems = PriceItems;
-  console.log(rating, PriceItems[rating + '_CBR']);
+};
 };
 let fetchPlayerPrices = async (players) => {
-  // Filter out players that need price updates
-  let idsArray = players.filter((f) => isPriceOld(f) && f?.isPlayer()).map((p) => p.definitionId);
+  if (!Array.isArray(players) || players.length === 0) {
+    return;
+  }
 
-  // If no prices to fetch, return early
-  if (idsArray.length === 0) return;
+  const idsNeedingUpdate = Array.from(
+    new Set(
+      players
+        .filter((player) => {
+          if (!player || player.definitionId === undefined || player.definitionId === null) {
+            return false;
+          }
+          if (!isPriceOld(player)) {
+            return false;
+          }
+          if (typeof player.isPlayer === 'function') {
+            try {
+              return player.isPlayer();
+            } catch (error) {
+              console.warn('Unable to determine player status, assuming valid', error);
+              return true;
+            }
+          }
+          return true;
+        })
+        .map((player) => String(player.definitionId))
+    )
+  );
 
-  // Create progress bar
+  if (idsNeedingUpdate.length === 0) {
+    return;
+  }
+
   const progressBarId = 'prices-progress-bar';
   const containerId = 'prices-progress-container';
   createProgressBar(progressBarId, containerId, 'Fetching Player Prices');
 
-  let duplicateIds = await fetchDuplicateIds();
-  let totalPrices = idsArray.length;
-  let fetched = 0;
-
-  while (idsArray.length) {
-    const playersIdArray = idsArray.splice(0, 50);
-
-    try {
-      const futggResponse = await makeGetRequest(
-        `https://www.fut.gg/api/fut/player-prices/26/?ids=${playersIdArray}`
-      );
-
-      let priceResponse = JSON.parse(futggResponse).data;
-      // Add rating and name information to the price response
-      for (let key in priceResponse) {
-        // Find the matching player in the players array
-        const matchingPlayer = players.find((p) => p.definitionId == priceResponse[key]['eaId']);
-
-        priceResponse[key].rating = matchingPlayer.rating;
-        priceResponse[key].name = matchingPlayer._staticData?.name || '';
-      }
-      PriceItem(priceResponse);
-
-      // Update progress
-      fetched += playersIdArray.length;
-      const progress = (fetched / totalPrices) * 100;
-      updateProgressBar(progressBarId, progress);
-    } catch (error) {
-      console.error(error);
-      await wait();
-      continue;
-    }
-    updateCBRMinPrice();
+  try {
+    await ensureLocalPlayerData();
+  } catch (error) {
+    console.error('Failed to load local player database for prices', error);
+    removeProgressBar(containerId, 0);
+    showNotification('Unable to load local price database', UINotificationType.NEGATIVE);
+    return;
   }
 
-  // Remove progress bar after completion
+  const playerLookup = new Map();
+  players.forEach((player) => {
+    if (player && player.definitionId !== undefined && player.definitionId !== null) {
+      playerLookup.set(String(player.definitionId), player);
+    }
+  });
+
+  const total = idsNeedingUpdate.length;
+  let processed = 0;
+  let resolved = 0;
+  const missingIds = [];
+  const pricePayload = {};
+
+  idsNeedingUpdate.forEach((definitionId) => {
+    processed += 1;
+    const entry = getLocalPlayerEntry(definitionId);
+    const originalPlayer = playerLookup.get(definitionId);
+
+    if (!entry) {
+      missingIds.push(definitionId);
+    } else {
+      const priceValue =
+        Number.isFinite(entry.futggPrice) && entry.futggPrice > 0
+          ? entry.futggPrice
+          : Number.isFinite(entry.price) && entry.price > 0
+          ? entry.price
+          : null;
+
+      pricePayload[definitionId] = {
+        eaId: definitionId,
+        price: Number.isFinite(priceValue) ? priceValue : -1,
+        futggPrice: Number.isFinite(priceValue) ? priceValue : -1,
+        rating: Number.isFinite(entry.rating)
+          ? entry.rating
+          : Number.isFinite(normalizeNumber(originalPlayer?.rating))
+          ? normalizeNumber(originalPlayer?.rating)
+          : null,
+        name: entry.name || originalPlayer?._staticData?.name || '',
+        isExtinct: false,
+        isObjective: false,
+        isSbc: false,
+      };
+      resolved += 1;
+    }
+
+    const progress = (processed / total) * 100;
+    updateProgressBar(progressBarId, progress);
+  });
+
+  if (Object.keys(pricePayload).length > 0) {
+    PriceItem(pricePayload);
+  }
+
   removeProgressBar(containerId);
 
-  if (totalPrices > 0) {
-    showNotification(`Fetched ${totalPrices} player prices`, UINotificationType.POSITIVE);
+  if (resolved > 0) {
+    showNotification(
+      `Loaded prices for ${resolved}/${total} players`,
+      UINotificationType.POSITIVE
+    );
+  }
+
+  if (missingIds.length > 0) {
+    console.warn('Missing local price entries for players:', missingIds);
   }
 };
 let sound = new Audio('https://raw.githubusercontent.com/Yousuke777/sound/main/kansei.mp3');
@@ -9073,31 +9334,43 @@ document.addEventListener('keydown', async function onKeyR(e) {
   }
 });
 
+// Static flag to track if initialization has already occurred
+let sbcSolverInitialized = false;
+
 const init = () => {
-  // Static flag to track if initialization has already occurred
-  let sbcSolverInitialized = false;
   if (sbcSolverInitialized) {
+    console.log('SBC Solver: Already initialized, skipping.');
     return;
   }
 
   let isAllLoaded = false;
-  if (services.Localization) {
+  if (typeof services !== 'undefined' && services.Localization) {
     isAllLoaded = true;
   }
+  
   if (isAllLoaded) {
-    // Mark as initialized
-    sbcSolverInitialized = true;
-    sbcViewOverride();
-    sbcButtonOverride();
-    playerItemOverride();
-    playerSlotOverride();
-    packOverRide();
-    sideBarNavOverride();
-    favTagOverride();
-    sbcSubmitChallengeOverride();
-    unassignedItemsOverride();
-    initDefaultSettings();
-    futHomeOverride();
+    try {
+      // Mark as initialized
+      sbcSolverInitialized = true;
+      console.log('SBC Solver: Initializing...');
+      
+      sbcViewOverride();
+      sbcButtonOverride();
+      playerItemOverride();
+      playerSlotOverride();
+      packOverRide();
+      sideBarNavOverride();
+      favTagOverride();
+      sbcSubmitChallengeOverride();
+      unassignedItemsOverride();
+      initDefaultSettings();
+      futHomeOverride();
+      
+      console.log('SBC Solver: Initialization complete!');
+    } catch (error) {
+      console.error('SBC Solver: Error during initialization:', error);
+      sbcSolverInitialized = false; // Reset flag on error
+    }
   } else {
     setTimeout(init, 4000);
     console.log('SBC Solver: Waiting for all services to load before initializing.');

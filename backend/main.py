@@ -2,7 +2,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import time
 import json
 from fastapi import Request, FastAPI, BackgroundTasks
-import setup
+from . import setup
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import functools
@@ -10,7 +10,7 @@ import signal
 import sys
 import uvicorn
 import logging
-import logger  # Import the logger module
+from . import logger  # Import the logger module
 import requests
 
 # Configure logging

@@ -3,7 +3,7 @@ from threading import Timer
 import time
 from ortools.sat.python import cp_model
 from decimal import Decimal
-from logger import add_log  # Import the add_log function from globals
+from .logger import add_log  # Import the add_log function from globals
 
 
 def runtime(func):
