@@ -134,6 +134,30 @@ def clear_logs_handler():
 async def clear_solver_logs():
     return await run_in_threadpool(clear_logs_handler)()
 
+# Add endpoint to serve the CSV file
+@app.get('/allPlayers.csv')
+async def get_all_players_csv():
+    """Serve the allPlayers.csv file for the Tampermonkey script"""
+    import os
+    from fastapi.responses import FileResponse
+    
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'allPlayers.csv')
+    
+    if os.path.exists(csv_path):
+        logging.info(f"Serving CSV file from: {csv_path}")
+        return FileResponse(
+            csv_path,
+            media_type='text/csv',
+            headers={
+                'Content-Disposition': 'inline; filename=allPlayers.csv',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+    else:
+        logging.warning(f"CSV file not found at: {csv_path}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="CSV file not found")
+
 def process_relay_request(body):
     logging.info("Received relay request")
     logging.debug("Relay request data: %s", body)
