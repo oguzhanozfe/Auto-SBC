@@ -6861,7 +6861,6 @@ const fetchSingleCheapest = async (rating) => {
     return 15000000; // Fallback high price
   }
 };
-};
 let fetchPlayerPrices = async (players) => {
   if (!Array.isArray(players) || players.length === 0) {
     return;
