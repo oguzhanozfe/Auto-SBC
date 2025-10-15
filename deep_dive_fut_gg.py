@@ -15,7 +15,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 BASE_URL = "https://www.fut.gg/players/?page={page}"
-OUT_CSV = "allPlayers.csv"
+OUT_CSV = "conceptPlayers.csv"
+ALL_PLAYERS_CSV = "allPlayers.csv"
 START_PAGE = 1
 END_PAGE = None  # Will be auto-detected
 MAX_CONSECUTIVE_EMPTY_PAGES = 5  # Stop after this many consecutive empty pages
@@ -115,7 +116,7 @@ def first_non_null(*vals):
             return v
     return None
 
-def to_row_dict(p, row_index):
+def to_row_dict(p, row_index, club_player_ids, club_definition_ids):
     """
     Map fut.gg player item -> your CSV schema.
     Some fields are not present; those are emitted as empty cells to match your header.
@@ -145,9 +146,11 @@ def to_row_dict(p, row_index):
     # maxChem: try to emit 3 if page marks the item as full-chem
     maxChem = 3 if p.get("isFullChemistry") else ""
 
+    player_id = str(p.get("id", "")).strip() if p.get("id") is not None else ""
+
     return {
         "": row_index,
-        "id": p.get("id", ""),
+        "id": player_id,
         "name": pick_name(p),
         "cardType": p.get("rarityName", ""),
         "assetId": assetId or "",
@@ -164,7 +167,14 @@ def to_row_dict(p, row_index):
         "possiblePositions": possiblePositions,
         "groups": "",
         "isFixed": "",
-        "concept": "",
+        "concept": (
+            "False"
+            if (
+                (player_id and player_id in club_player_ids)
+                or (definitionId and str(definitionId) in club_definition_ids)
+            )
+            else "True"
+        ),
         "price": price if price is not None else "",
         "futggPrice": price if price is not None else "",
         "maxChem": maxChem,
@@ -201,6 +211,22 @@ def load_existing_data(path):
     print(f"📚 Loaded {len(all_rows)} existing players with {len(existing_data)} valid IDs")
     
     return existing_data, all_rows
+
+def load_club_identifiers(path):
+    player_ids = set()
+    definition_ids = set()
+    if not Path(path).exists():
+        return player_ids, definition_ids
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            player_id = row.get("id")
+            if player_id:
+                player_ids.add(str(player_id).strip())
+            definition_id = row.get("definitionId")
+            if definition_id:
+                definition_ids.add(str(definition_id).strip())
+    return player_ids, definition_ids
 
 def save_updated_data(path, rows):
     """Save all data back to CSV"""
@@ -242,6 +268,7 @@ def slow_scrape(start_page=None, end_page=None, headless=True, quick_update=Fals
 
     # Load existing data for comparison
     existing_data, all_rows = load_existing_data(OUT_CSV)
+    club_player_ids, club_definition_ids = load_club_identifiers(ALL_PLAYERS_CSV)
     
     # de-dup by (definitionId, assetId) - but now we update instead of skip
     seen = set()
@@ -311,7 +338,7 @@ def slow_scrape(start_page=None, end_page=None, headless=True, quick_update=Fals
 
             for p in items:
                 # Create the new row data
-                new_row = to_row_dict(p, row_index)
+                new_row = to_row_dict(p, row_index, club_player_ids, club_definition_ids)
                 player_id = new_row.get("id")
                 
                 # Ensure player_id is a string for comparison

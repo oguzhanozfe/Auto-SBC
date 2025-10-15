@@ -140,9 +140,9 @@ async def get_all_players_csv():
     """Serve the allPlayers.csv file for the Tampermonkey script"""
     import os
     from fastapi.responses import FileResponse
-    
+
     csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'allPlayers.csv')
-    
+
     if os.path.exists(csv_path):
         logging.info(f"Serving CSV file from: {csv_path}")
         return FileResponse(
@@ -157,6 +157,30 @@ async def get_all_players_csv():
         logging.warning(f"CSV file not found at: {csv_path}")
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="CSV file not found")
+
+
+@app.get('/conceptPlayers.csv')
+async def get_concept_players_csv():
+    """Serve the conceptPlayers.csv file for the Tampermonkey script"""
+    import os
+    from fastapi.responses import FileResponse
+
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'conceptPlayers.csv')
+
+    if os.path.exists(csv_path):
+        logging.info(f"Serving concept CSV file from: {csv_path}")
+        return FileResponse(
+            csv_path,
+            media_type='text/csv',
+            headers={
+                'Content-Disposition': 'inline; filename=conceptPlayers.csv',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+    else:
+        logging.warning(f"Concept CSV file not found at: {csv_path}")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Concept CSV file not found")
 
 def process_relay_request(body):
     logging.info("Received relay request")
@@ -223,4 +247,3 @@ if __name__ == "__main__":
             thread_pool.shutdown(wait=False)
         logging.info("Application terminated")
     sys.exit(0)
-

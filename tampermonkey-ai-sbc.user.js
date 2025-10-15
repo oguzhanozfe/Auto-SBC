@@ -4370,18 +4370,16 @@ let getConceptPlayers = async function (playerCount = 999999) {
     console.log('Getting Concept Players from local database');
     
     try {
-      // Ensure local database is loaded
-      await ensureLocalPlayerData();
+      // Ensure concept database is loaded
+      const conceptData = await ensureLocalConceptPlayerData();
       
       // Create progress bar
       const containerId = 'concept-progress-container';
       const progressBarId = 'concept-progress-bar';
       createProgressBar(progressBarId, containerId, 'Loading Concepts from Local Database');
       
-      // Filter concept players from local database
-      const conceptPlayersFromDB = localPlayerDataList.filter(player => 
-        player.concept === true || player.concept === 'true'
-      );
+      // Use concept players from dedicated dataset
+      const conceptPlayersFromDB = conceptData.filter((player) => player.concept === true);
       
       // Convert local player data to concept player format expected by the EA API
       const gatheredPlayers = conceptPlayersFromDB.slice(0, playerCount).map(player => {
@@ -4640,6 +4638,68 @@ let fetchDuplicateIds = () => {
 };
 
 let apiUrl = 'http://127.0.0.1:8000';
+
+const fallbackClubCsv = `
+,id,name,cardType,assetId,definitionId,rating,teamId,leagueId,nationId,rarityId,ratingTier,isDuplicate,isStorage,preferredPosition,possiblePositions,groups,isFixed,concept,price,futggPrice,maxChem,normalizeClubId,teamChem.calculationType,teamChem.contribution,teamChem.parameterId,leagueChem.calculationType,leagueChem.contribution,leagueChem.parameterId,nationChem.calculationType,nationChem.contribution,nationChem.parameterId
+0,701504757680,Kolo Muani,Gold Rare,237679,50569327,81,18,13,18,1,3,False,False,25,[25],[4],False,False,1200,1200,False,18,1,1,1,1,1,2,1,1,3
+2,701219225131,Bergvall,In-Progress Evolution,272926,50604574,85,18,13,46,60,3,False,False,14,[10, 14, 18],[0],False,False,25500,12750,False,18,1,1,1,1,1,2,1,1,3
+4,700201377681,Agbadou,Gold Rare,258575,258575,79,110,13,108,1,3,False,False,5,[5],[4],False,False,700,1900,False,110,1,1,1,1,1,2,1,1,3
+8,707521390736,Coady,Squad Foundations,202048,50533696,84,1947,14,14,87,3,False,False,5,[5],[0],False,False,150,-1,False,1947,1,1,1,1,2,2,1,1,3
+9,707521390737,Dembélé,Squad Foundations,246682,50578330,84,15,14,14,87,3,False,False,12,[12, 14, 18, 23],[0],False,False,150,-1,False,15,1,1,1,1,2,2,1,1,3
+11,708415075555,Milinković-Savić,Gold Rare,223848,223848,84,605,350,51,1,3,False,False,14,[10, 14, 18],[4],True,False,1,1200,False,605,1,1,1,1,1,2,1,1,3
+13,706435241900,Tozé,Squad Foundations,212729,50544377,83,113037,350,38,87,3,False,False,14,[14, 18],[0],False,False,150,-1,False,113037,1,1,1,1,2,2,1,1,3
+14,708415075554,Ferran Torres,Gold Rare,241461,241461,83,241,53,45,1,3,False,False,27,[16, 23, 25, 27],[4],True,False,1,750,False,241,1,1,1,1,1,2,1,1,3
+15,707521677891,Ibañez,Gold Rare,247257,247257,82,112387,350,54,1,3,False,False,5,[5],[4],False,False,750,4600,False,112387,1,1,1,1,1,2,1,1,3
+16,705926737320,Gómez,Team of the Week,269278,50600926,80,1808,13,58,3,3,False,False,12,[10, 12, 14, 23],[4],False,False,850,11250,False,1808,1,1,1,1,1,2,1,1,3
+17,706447327876,Aina,Gold Rare,224656,224656,80,14,13,133,1,3,False,False,3,[3, 7, 12],[4],False,False,850,900,False,14,1,1,1,1,1,2,1,1,3
+18,706739160011,Halkett,Team of the Week,222045,50553693,80,80,50,42,3,3,False,False,5,[5],[4],False,False,850,11000,False,80,1,1,1,1,1,2,1,1,3
+19,699517745193,Aina,Gold Rare,224656,224656,80,14,13,133,1,3,False,False,3,[3, 7, 12],[4],False,False,850,900,False,14,1,1,1,1,1,2,1,1,3
+20,700855768927,Udogie,Gold Rare,259583,259583,80,18,13,27,1,3,False,False,7,[7],[4],False,False,850,850,False,18,1,1,1,1,1,2,1,1,3
+21,706738926543,Ndoye,Gold Rare,257980,257980,79,14,13,47,1,3,False,False,16,[12, 16, 27],[4],False,False,700,700,False,14,1,1,1,1,1,2,1,1,3
+22,706447327878,Aitor Paredes,Gold Common,259524,259524,78,448,53,45,0,3,False,False,5,[5],[0],False,False,400,400,False,448,1,1,1,1,1,2,1,1,3
+23,706738926521,Yasmim,Gold Common,274758,274758,75,116326,2222,54,0,3,False,False,7,[7, 16],[0],False,False,350,350,False,243,1,1,1,1,1,2,1,1,3
+24,701822827913,Garrincha,World Tour Silver Superstar,247553,50579201,70,112658,2118,54,69,2,False,False,23,[12, 23],[5],False,False,150,-1,True,112658,1,3,1,2,1,2,1,0,3
+25,706446813960,Kalem,Bronze Rare,263970,263970,64,492,2076,21,1,1,False,False,12,[12, 16, 23],[4],False,False,150,-1,False,492,1,1,1,1,1,2,1,1,3
+26,706446813961,Maestre,Bronze Rare,201413,201413,64,15012,54,45,1,1,False,False,10,[5, 10, 14],[4],False,False,150,-1,False,15012,1,1,1,1,1,2,1,1,3
+27,706446813962,Kastanaras,Bronze Rare,269951,269951,63,110697,2076,21,1,1,False,False,25,[25],[4],False,False,150,-1,False,110697,1,1,1,1,1,2,1,1,3
+28,706447747195,Decarli,Bronze Common,213323,213323,63,322,189,47,0,1,False,False,5,[5],[0],False,False,150,-1,False,322,1,1,1,1,1,2,1,1,3
+30,706446813963,Garcés,Bronze Rare,75612,75612,62,101099,1014,56,1,1,False,False,25,[25],[4],False,False,150,-1,False,101099,1,1,1,1,1,2,1,1,3
+31,706446813959,Butler-Oyedeji,Bronze Rare,273926,273926,59,1862,189,14,1,1,False,False,25,[25],[4],False,False,150,-1,False,1862,1,1,1,1,1,2,1,1,3
+32,706447747202,McMullan,Bronze Common,273558,273558,59,753,65,35,0,1,False,False,0,[0],[0],False,False,150,-1,False,753,1,1,1,1,1,2,1,1,3
+33,706447747213,Liu Yixin,Bronze Common,268959,268959,58,111779,2012,155,0,1,False,False,7,[7, 16],[0],False,False,150,-1,False,111779,1,1,1,1,1,2,1,1,3
+34,706447747208,Singh,Bronze Common,277489,277489,53,113040,2149,159,0,1,False,False,18,[12, 14, 18, 25],[0],False,False,150,-1,False,113040,1,1,1,1,1,2,1,1,3
+`
+
+const fallbackConceptCsv = `
+,id,name,cardType,assetId,definitionId,rating,teamId,leagueId,nationId,rarityId,ratingTier,isDuplicate,isStorage,preferredPosition,possiblePositions,groups,isFixed,concept,price,futggPrice,maxChem,normalizeClubId,teamChem.calculationType,teamChem.contribution,teamChem.parameterId,leagueChem.calculationType,leagueChem.contribution,leagueChem.parameterId,nationChem.calculationType,nationChem.contribution,nationChem.parameterId
+0,701504757680,Kolo Muani,Gold Rare,237679,50569327,81,18,13,18,1,3,False,False,25,[25],[4],False,True,1200,1200,False,18,1,1,1,1,1,2,1,1,3
+2,701219225131,Bergvall,In-Progress Evolution,272926,50604574,85,18,13,46,60,3,False,False,14,[10, 14, 18],[0],False,True,25500,12750,False,18,1,1,1,1,1,2,1,1,3
+4,700201377681,Agbadou,Gold Rare,258575,258575,79,110,13,108,1,3,False,False,5,[5],[4],False,True,700,1900,False,110,1,1,1,1,1,2,1,1,3
+8,707521390736,Coady,Squad Foundations,202048,50533696,84,1947,14,14,87,3,False,False,5,[5],[0],False,True,150,-1,False,1947,1,1,1,1,2,2,1,1,3
+9,707521390737,Dembélé,Squad Foundations,246682,50578330,84,15,14,14,87,3,False,False,12,[12, 14, 18, 23],[0],False,True,150,-1,False,15,1,1,1,1,2,2,1,1,3
+11,708415075555,Milinković-Savić,Gold Rare,223848,223848,84,605,350,51,1,3,False,False,14,[10, 14, 18],[4],True,True,1,1200,False,605,1,1,1,1,1,2,1,1,3
+13,706435241900,Tozé,Squad Foundations,212729,50544377,83,113037,350,38,87,3,False,False,14,[14, 18],[0],False,True,150,-1,False,113037,1,1,1,1,2,2,1,1,3
+14,708415075554,Ferran Torres,Gold Rare,241461,241461,83,241,53,45,1,3,False,False,27,[16, 23, 25, 27],[4],True,True,1,750,False,241,1,1,1,1,1,2,1,1,3
+15,707521677891,Ibañez,Gold Rare,247257,247257,82,112387,350,54,1,3,False,False,5,[5],[4],False,True,750,4600,False,112387,1,1,1,1,1,2,1,1,3
+16,705926737320,Gómez,Team of the Week,269278,50600926,80,1808,13,58,3,3,False,False,12,[10, 12, 14, 23],[4],False,True,850,11250,False,1808,1,1,1,1,1,2,1,1,3
+17,706447327876,Aina,Gold Rare,224656,224656,80,14,13,133,1,3,False,False,3,[3, 7, 12],[4],False,True,850,900,False,14,1,1,1,1,1,2,1,1,3
+18,706739160011,Halkett,Team of the Week,222045,50553693,80,80,50,42,3,3,False,False,5,[5],[4],False,True,850,11000,False,80,1,1,1,1,1,2,1,1,3
+19,699517745193,Aina,Gold Rare,224656,224656,80,14,13,133,1,3,False,False,3,[3, 7, 12],[4],False,True,850,900,False,14,1,1,1,1,1,2,1,1,3
+20,700855768927,Udogie,Gold Rare,259583,259583,80,18,13,27,1,3,False,False,7,[7],[4],False,True,850,850,False,18,1,1,1,1,1,2,1,1,3
+21,706738926543,Ndoye,Gold Rare,257980,257980,79,14,13,47,1,3,False,False,16,[12, 16, 27],[4],False,True,700,700,False,14,1,1,1,1,1,2,1,1,3
+22,706447327878,Aitor Paredes,Gold Common,259524,259524,78,448,53,45,0,3,False,False,5,[5],[0],False,True,400,400,False,448,1,1,1,1,1,2,1,1,3
+23,706738926521,Yasmim,Gold Common,274758,274758,75,116326,2222,54,0,3,False,False,7,[7, 16],[0],False,True,350,350,False,243,1,1,1,1,1,2,1,1,3
+24,701822827913,Garrincha,World Tour Silver Superstar,247553,50579201,70,112658,2118,54,69,2,False,False,23,[12, 23],[5],False,True,150,-1,True,112658,1,3,1,2,1,2,1,0,3
+25,706446813960,Kalem,Bronze Rare,263970,263970,64,492,2076,21,1,1,False,False,12,[12, 16, 23],[4],False,True,150,-1,False,492,1,1,1,1,1,2,1,1,3
+26,706446813961,Maestre,Bronze Rare,201413,201413,64,15012,54,45,1,1,False,False,10,[5, 10, 14],[4],False,True,150,-1,False,15012,1,1,1,1,1,2,1,1,3
+27,706446813962,Kastanaras,Bronze Rare,269951,269951,63,110697,2076,21,1,1,False,False,25,[25],[4],False,True,150,-1,False,110697,1,1,1,1,1,2,1,1,3
+28,706447747195,Decarli,Bronze Common,213323,213323,63,322,189,47,0,1,False,False,5,[5],[0],False,True,150,-1,False,322,1,1,1,1,1,2,1,1,3
+30,706446813963,Garcés,Bronze Rare,75612,75612,62,101099,1014,56,1,1,False,False,25,[25],[4],False,True,150,-1,False,101099,1,1,1,1,1,2,1,1,3
+31,706446813959,Butler-Oyedeji,Bronze Rare,273926,273926,59,1862,189,14,1,1,False,False,25,[25],[4],False,True,150,-1,False,1862,1,1,1,1,1,2,1,1,3
+32,706447747202,McMullan,Bronze Common,273558,273558,59,753,65,35,0,1,False,False,0,[0],[0],False,True,150,-1,False,753,1,1,1,1,1,2,1,1,3
+33,706447747213,Liu Yixin,Bronze Common,268959,268959,58,111779,2012,155,0,1,False,False,7,[7, 16],[0],False,True,150,-1,False,111779,1,1,1,1,1,2,1,1,3
+34,706447747208,Singh,Bronze Common,277489,277489,53,113040,2149,159,0,1,False,False,18,[12, 14, 18, 25],[0],False,True,150,-1,False,113040,1,1,1,1,1,2,1,1,3
+`;
 
 let LOCKED_ITEMS_KEY = 'excludePlayers';
 let cachedLockedItems;
@@ -6656,6 +6716,10 @@ let localPlayerDataList;
 let localRatingMinPriceMap;
 let localRatingRange = { min: 45, max: 45 };
 
+let conceptPlayerDataPromise;
+let conceptPlayerDataMap = new Map();
+let conceptPlayerDataList = [];
+
 const normalizeNumber = (value) => {
   if (value === null || value === undefined || value === '') {
     return null;
@@ -6703,8 +6767,22 @@ const ensureLocalPlayerData = async () => {
   localPlayerDataPromise = (async () => {
     try {
       const csvUrl = `${apiUrl}/allPlayers.csv`;
-      const csvText = await makeGetRequest(csvUrl);
-      const parsedRows = typeof d3 !== 'undefined' && d3.csv ? d3.csv.parse(csvText) : [];
+      let csvText = fallbackClubCsv;
+      let usingFallback = true;
+      try {
+        const fetchedCsv = await makeGetRequest(csvUrl);
+        if (fetchedCsv && fetchedCsv.trim().length > 0) {
+          csvText = fetchedCsv;
+          usingFallback = false;
+        } else {
+          console.warn('Received empty CSV from backend API, using embedded fallback.');
+        }
+      } catch (fetchError) {
+        console.warn('Failed to fetch allPlayers.csv from backend API, using embedded fallback.', fetchError);
+      }
+
+      const parsedRows =
+        typeof d3 !== 'undefined' && d3.csv ? d3.csv.parse(csvText) : [];
 
       localPlayerDataList = [];
       localPlayerDataMap = new Map();
@@ -6755,6 +6833,12 @@ const ensureLocalPlayerData = async () => {
           },
         };
 
+        if (usingFallback && (!Number.isFinite(entry.price) || entry.price <= 0)) {
+          const ratingFloor = Number.isFinite(entry.rating) ? entry.rating : 60;
+          entry.price = ratingFloor >= 82 ? 2000 : ratingFloor >= 75 ? 800 : 500;
+          entry.futggPrice = entry.price;
+        }
+
         localPlayerDataMap.set(definitionId, entry);
         localPlayerDataList.push(entry);
 
@@ -6774,6 +6858,10 @@ const ensureLocalPlayerData = async () => {
       if (localRatingRange.min === 99) {
         localRatingRange.min = 45;
       }
+
+      if (usingFallback) {
+        console.info('Loaded club player data from embedded fallback CSV. Start the backend API to refresh data automatically.');
+      }
     } catch (error) {
       console.error('Failed to load local player data', error);
       localPlayerDataList = [];
@@ -6790,11 +6878,117 @@ const ensureLocalPlayerData = async () => {
   });
 };
 
+const ensureLocalConceptPlayerData = async () => {
+  if (conceptPlayerDataPromise) {
+    return conceptPlayerDataPromise;
+  }
+
+  conceptPlayerDataPromise = (async () => {
+    try {
+      const csvUrl = `${apiUrl}/conceptPlayers.csv`;
+      let csvText = fallbackConceptCsv;
+      let usingFallback = true;
+      try {
+        const fetchedCsv = await makeGetRequest(csvUrl);
+        if (fetchedCsv && fetchedCsv.trim().length > 0) {
+          csvText = fetchedCsv;
+          usingFallback = false;
+        } else {
+          console.warn('Received empty concept CSV from backend API, using embedded fallback.');
+        }
+      } catch (fetchError) {
+        console.warn('Failed to fetch conceptPlayers.csv from backend API, using embedded fallback.', fetchError);
+      }
+
+      const parsedRows =
+        typeof d3 !== 'undefined' && d3.csv ? d3.csv.parse(csvText) : [];
+
+      conceptPlayerDataList = [];
+      conceptPlayerDataMap = new Map();
+
+      parsedRows.forEach((row) => {
+        const definitionId = row.definitionId ? row.definitionId.trim() : '';
+        if (!definitionId) {
+          return;
+        }
+
+        const rating = normalizeNumber(row.rating);
+        const priceValue = normalizeNumber(row.futggPrice ?? row.price);
+        const entry = {
+          id: normalizeNumber(row.id),
+          definitionId,
+          assetId: normalizeNumber(row.assetId),
+          name: row.name || '',
+          cardType: row.cardType || '',
+          rating,
+          teamId: normalizeNumber(row.teamId),
+          leagueId: normalizeNumber(row.leagueId),
+          nationId: normalizeNumber(row.nationId),
+          rarityId: normalizeNumber(row.rarityId),
+          ratingTier: normalizeNumber(row.ratingTier),
+          preferredPosition: row.preferredPosition || '',
+          possiblePositions: normalizeArrayFromString(row.possiblePositions),
+          groups: normalizeArrayFromString(row.groups),
+          concept: true,
+          price: priceValue,
+          futggPrice: priceValue,
+          maxChem: normalizeNumber(row.maxChem),
+          teamChem: {
+            calculationType: row['teamChem.calculationType'] || '',
+            contribution: normalizeNumber(row['teamChem.contribution']),
+            parameterId: normalizeNumber(row['teamChem.parameterId']),
+          },
+          leagueChem: {
+            calculationType: row['leagueChem.calculationType'] || '',
+            contribution: normalizeNumber(row['leagueChem.contribution']),
+            parameterId: normalizeNumber(row['leagueChem.parameterId']),
+          },
+          nationChem: {
+            calculationType: row['nationChem.calculationType'] || '',
+            contribution: normalizeNumber(row['nationChem.contribution']),
+            parameterId: normalizeNumber(row['nationChem.parameterId']),
+          },
+        };
+
+        if (!Number.isFinite(entry.price) || entry.price <= 0) {
+          const ratingFloor = Number.isFinite(entry.rating) ? entry.rating : 60;
+          entry.price = ratingFloor >= 82 ? 2000 : ratingFloor >= 75 ? 800 : 500;
+          entry.futggPrice = entry.price;
+        }
+
+        conceptPlayerDataMap.set(definitionId, entry);
+        conceptPlayerDataList.push(entry);
+      });
+
+      if (usingFallback) {
+        console.info('Loaded concept player data from embedded fallback CSV. Start the backend API to refresh data automatically.');
+      }
+    } catch (error) {
+      console.error('Failed to load concept player data', error);
+      conceptPlayerDataList = [];
+      conceptPlayerDataMap = new Map();
+      throw error;
+    }
+  })();
+
+  return conceptPlayerDataPromise.catch((error) => {
+    conceptPlayerDataPromise = null;
+    throw error;
+  });
+};
+
 const getLocalPlayerEntry = (definitionId) => {
   if (!localPlayerDataMap) {
     return null;
   }
   return localPlayerDataMap.get(String(definitionId));
+};
+
+const getLocalConceptEntry = (definitionId) => {
+  if (!conceptPlayerDataMap) {
+    return null;
+  }
+  return conceptPlayerDataMap.get(String(definitionId));
 };
 
 const getCheapestPriceForRatingFromLocal = (rating) => {
@@ -6900,6 +7094,9 @@ let fetchPlayerPrices = async (players) => {
 
   try {
     await ensureLocalPlayerData();
+    if (players.some((player) => player && player.concept)) {
+      await ensureLocalConceptPlayerData();
+    }
   } catch (error) {
     console.error('Failed to load local player database for prices', error);
     removeProgressBar(containerId, 0);
@@ -6922,7 +7119,10 @@ let fetchPlayerPrices = async (players) => {
 
   idsNeedingUpdate.forEach((definitionId) => {
     processed += 1;
-    const entry = getLocalPlayerEntry(definitionId);
+    let entry = getLocalPlayerEntry(definitionId);
+    if (!entry) {
+      entry = getLocalConceptEntry(definitionId);
+    }
     const originalPlayer = playerLookup.get(definitionId);
 
     if (!entry) {
