@@ -179,13 +179,13 @@ def to_row_dict(p, row_index, club_player_ids, club_definition_ids):
         "futggPrice": price if price is not None else "",
         "maxChem": maxChem,
         "normalizeClubId": teamId or "",
-        "teamChem.calculationType": "futgg",
+        "teamChem.calculationType": "",
         "teamChem.contribution": team_contrib if isinstance(team_contrib, int) else "",
         "teamChem.parameterId": teamId or "",
-        "leagueChem.calculationType": "futgg",
+        "leagueChem.calculationType": "",
         "leagueChem.contribution": league_contrib if isinstance(league_contrib, int) else "",
         "leagueChem.parameterId": leagueId or "",
-        "nationChem.calculationType": "futgg",
+        "nationChem.calculationType": "",
         "nationChem.contribution": nation_contrib if isinstance(nation_contrib, int) else "",
         "nationChem.parameterId": nationId or "",
     }
@@ -202,6 +202,13 @@ def load_existing_data(path):
         reader = csv.DictReader(f)
         for row in reader:
             # Use only 'id' as the unique key
+            for chem_field in (
+                "teamChem.calculationType",
+                "leagueChem.calculationType",
+                "nationChem.calculationType",
+            ):
+                if row.get(chem_field) == "futgg":
+                    row[chem_field] = ""
             player_id = row.get("id")
             if player_id:  # Only store if ID exists
                 player_id = str(player_id)  # Ensure it's a string
@@ -420,8 +427,8 @@ def slow_scrape(start_page=None, end_page=None, headless=True, quick_update=Fals
                     print(f"   💡 This suggests we've processed all available data. Stopping early.")
                     break
 
-            # polite randomized delay 2–4 sec before next page
-            delay = random.uniform(2, 4)
+            # polite randomized delay 0.2–0.8 sec before next page
+            delay = random.uniform(0.2, 0.8)
             print(f"   ⏳ Sleeping {delay:.1f} seconds before next page…")
             time.sleep(delay)
             page += 1
