@@ -1,5 +1,21 @@
 ## EAFC Automated SBC Solving ⚽
 
+> **Fork scope:** The solver and original project come from
+> [`titiroMonkey/Auto-SBC`](https://github.com/titiroMonkey/Auto-SBC). This fork
+> contains seven Oğuzhan Özdemir commits focused on FC 26 compatibility, local
+> player-data workflows, browser-script integration, diagnostics, and error
+> handling. It is not presented as an original solver implementation.
+
+### Changes in this fork
+
+- Updated the player-price endpoint from FC 25 to FC 26.
+- Added CSV endpoints and local/concept-player fallback workflows.
+- Expanded Tampermonkey scraping, connectivity diagnostics, and error handling.
+- Added local server start/status scripts and focused integration tests.
+
+The branch is intentionally kept as a contribution record; review the upstream
+project first for the core optimizer, setup, and license.
+
 If you want to add any new features to the idedas section of the discussions tab and ill try to implement them.
 
 #### The goal is to automatically solve the SBC using the currently available players in the club with the minimum cost.
