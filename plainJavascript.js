@@ -195,6 +195,132 @@
   return { defaults, normalizePolicy, blockedReason, parsePaletools, validateConcept, validateSolution, errorMessage };
 });
 
+/* Native SBC entrypoint using the MIT upstream EA detail-panel adapter. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.AutoSBCNative = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const BUTTON_ID = 'autosbc-native-solve';
+  const contextKey = context => context && context.setId != null && context.challengeId != null
+    ? `${context.setId}:${context.challengeId}` : null;
+
+  function install(options) {
+    const document = options.document;
+    let prototype, originalInit, wrappedInit, panel, pendingView, anchor, button;
+    let observedKey = null, stableObservations = 0, pending = false, disposed = false;
+    let previousContext = null;
+
+    function readContext() {
+      if (!anchor?.isConnected || !button?.isConnected) return null;
+      try { return options.resolveContext(panel) || null; } catch { return null; }
+    }
+    function gate(context) {
+      if (!contextKey(context)) return { ready: false, reason: 'EA görevi yükleniyor…' };
+      try { return options.getGate(context) || { ready: false, reason: 'Hazırlanıyor…' }; }
+      catch { return { ready: false, reason: 'EA görevi henüz hazır değil.' }; }
+    }
+    function showDisabled(reason) {
+      if (!button) return;
+      button.disabled = true;
+      button.textContent = pending ? 'Auto-SBC · Çözülüyor…' : 'Auto-SBC · Hazırlanıyor…';
+      button.title = reason || 'EA görevi yükleniyor…';
+    }
+    function notifyNavigation(context) {
+      const next = contextKey(context);
+      if (previousContext && next !== previousContext) options.onContextChanged?.(previousContext, next);
+      previousContext = next;
+    }
+    async function clicked(event) {
+      event.preventDefault?.();
+      const context = readContext(), key = contextKey(context), ready = gate(context);
+      if (pending || button.disabled || !key || key !== observedKey || stableObservations < 2 || !ready.ready) {
+        showDisabled(ready.reason || 'Görev değişti; yeniden hazırlanıyor.');
+        tick();
+        return;
+      }
+      // The current IDs are captured only at the user's click, not panel init.
+      pending = true;
+      showDisabled('Çözüm hazırlanıyor; sonucu incelemeden kadro uygulanmaz.');
+      try { await options.onSolveCurrent({ ...context }); }
+      catch (error) { options.onError?.(error); }
+      finally { pending = false; stableObservations = 0; tick(); }
+    }
+    function mount(view) {
+      if (disposed) return;
+      const exchange = view?._btnExchange?.__root;
+      if (!exchange?.parentNode) return;
+      if (!button) {
+        button = document.createElement('button');
+        button.id = BUTTON_ID;
+        button.type = 'button';
+        button.className = 'btn-standard';
+        button.setAttribute('data-autosbc-native', 'true');
+        showDisabled('EA görevi yükleniyor…');
+        // Bind before insertion: a visible button must never lack its handler.
+        button.addEventListener('click', clicked);
+      }
+      const changed = anchor !== exchange || panel !== view;
+      panel = view;
+      anchor = exchange;
+      if (changed) { stableObservations = 0; observedKey = null; showDisabled(); }
+      if (button.parentNode !== exchange.parentNode || button.previousSibling !== exchange) {
+        exchange.parentNode.insertBefore(button, exchange.nextSibling);
+      }
+      if (changed) options.onMount?.();
+    }
+    function hook() {
+      if (prototype || disposed) return;
+      const target = options.getPrototype();
+      if (!target || typeof target.init !== 'function') return;
+      prototype = target;
+      originalInit = target.init;
+      wrappedInit = function (...args) {
+        const result = originalInit.apply(this, args);
+        pendingView = this;
+        try { mount(this); } catch (error) { options.onError?.(error); }
+        return result;
+      };
+      target.init = wrappedInit;
+    }
+    function tick() {
+      if (disposed) return;
+      hook();
+      if (pendingView && (!button || panel !== pendingView || anchor !== pendingView?._btnExchange?.__root || !button.parentNode)) {
+        try { mount(pendingView); } catch (error) { options.onError?.(error); }
+      }
+      if (!button) return;
+      const context = readContext(), key = contextKey(context);
+      notifyNavigation(context);
+      if (key && key === observedKey) stableObservations++;
+      else { observedKey = key; stableObservations = key ? 1 : 0; }
+      const ready = gate(context);
+      if (pending || !ready.ready || stableObservations < 2) showDisabled(ready.reason);
+      else {
+        button.disabled = false;
+        button.textContent = 'Auto-SBC ile çöz';
+        button.title = 'Bu görevi yerel motorla çöz; kadroyu uygulamadan önce incele.';
+      }
+    }
+    hook();
+    const stop = options.schedule ? options.schedule(tick) : (() => {
+      const timer = setInterval(tick, 250);
+      timer?.unref?.();
+      return () => clearInterval(timer);
+    })();
+    return {
+      tick,
+      dispose() {
+        disposed = true; stop?.(); button?.remove();
+        // Do not remove another extension's wrapper installed after ours.
+        if (prototype?.init === wrappedInit) prototype.init = originalInit;
+      }
+    };
+  }
+  return { install, contextKey, BUTTON_ID };
+});
+
 /* Auto-SBC Local. EA adapter adapted from TitiroMonkey's MIT Auto-SBC.
  * This panel makes no submissions, purchases, pack or inventory-move requests.
  */
@@ -206,7 +332,7 @@
   const BASE = 'http://127.0.0.1:8000';
   const STORAGE = 'autosbc.local.policy.v1';
   const SCOPE_STORAGE = 'autosbc.local.scope.v1';
-  const state = { busy: false, sets: [], challenges: [], preview: null, input: null, cancel: 0 };
+  const state = { busy: false, sets: [], challenges: [], preview: null, input: null, cancel: 0, backendScope: null, nativeActive: null };
 
   function http(path, method = 'GET', data, timeout = 15000) {
     if (!['/health','/api/solve/jobs'].includes(path.split('?')[0]) && !/^\/api\/solve\/jobs\/[a-zA-Z0-9-]+$/.test(path)) throw new Error('Unsupported local endpoint.');
@@ -260,6 +386,25 @@
     return typeof services !== 'undefined' && services.SBC && services.Club && services.Item &&
       typeof UTBucketedItemSearchViewModel !== 'undefined' && typeof UTSBCSquadOverviewViewController !== 'undefined';
   }
+  function activeChallengeContext() {
+    try {
+      if (!ready() || typeof getAppMain !== 'function') return null;
+      // This controller path and _challenge are from the MIT upstream adapter.
+      const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
+      const challenge = current.getCurrentController().childViewControllers?.[0]?._challenge;
+      if (!challenge || !challenge.id || !challenge.setId || challenge.status === 'COMPLETED' ||
+          !Array.isArray(challenge.eligibilityRequirements) || !Array.isArray(challenge.squad?._formation?.generalPositions) ||
+          !challenge.squad._formation.generalPositions.length) return null;
+      return { setId: challenge.setId, challengeId: challenge.id };
+    } catch { return null; }
+  }
+  function assertNativeContext(context) {
+    if (!context) return;
+    const current = activeChallengeContext();
+    if (!current || String(current.setId) !== String(context.setId) || String(current.challengeId) !== String(context.challengeId)) {
+      throw new Error('SBC ekranı değişti. Eski görevin çözümü uygulanmadı; açık görev için yeniden çözün.');
+    }
+  }
   async function pages(storage) {
     const found = new Map();
     for (let offset = 0, page = 0; page < 500; page++, offset += 91) {
@@ -283,18 +428,43 @@
     const duplicates = new Set((unassigned.items || []).filter(item => item.duplicateId > 0).map(item => String(item.duplicateId)));
     const storageIds = new Set(storage.map(item => String(item.id)));
     const unique = new Map([...club, ...storage].map(item => [String(item.id), item]));
-    return { items: [...unique.values()], storageIds, duplicates };
+    const squadService = services.Squad;
+    if (!squadService || typeof squadService.requestSquadList !== 'function' ||
+        typeof squadService.getActiveSquadId !== 'function' || typeof squadService.requestSquadById !== 'function') {
+      throw new Error('Aktif kadro okunamıyor. Kadronuzdaki oyuncuları korumak için işlem durduruldu.');
+    }
+    await observe(squadService.requestSquadList(), 'Active squad list');
+    const activeId = squadService.getActiveSquadId();
+    if (activeId == null || String(activeId).trim() === '') throw new Error('Aktif kadro kimliği okunamadı. İşlem durduruldu.');
+    const active = await observe(squadService.requestSquadById(activeId), 'Active squad players');
+    const slots = active.squad?._players;
+    if (!Array.isArray(slots) || slots.some(slot => !slot?._item || slot._item.id == null)) {
+      throw new Error('Aktif kadro oyuncuları okunamadı. İşlem durduruldu.');
+    }
+    const activeSquadIds = new Set(slots.map(slot => String(slot._item.id)).filter(id => id !== '0' && id !== ''));
+    return { items: [...unique.values()], storageIds, duplicates, activeSquadIds };
   }
   function card(item, inventoryState, chem) {
-    const special = typeof item.isSpecial === 'function' ? item.isSpecial() : Number(item.rareflag) > 1;
+    const rawRarity = item.rareflag ?? item._rareflag;
+    const rarity = (typeof rawRarity === 'number' || typeof rawRarity === 'string' && /^\d+$/.test(rawRarity)) &&
+      Number.isInteger(Number(rawRarity)) && Number(rawRarity) >= 0 ? Number(rawRarity) : undefined;
+    const reportedSpecial = typeof item.isSpecial === 'function' ? item.isSpecial() : undefined;
+    const special = reportedSpecial === true || (rarity === undefined ? reportedSpecial !== false : rarity > 1);
     const tier = typeof item.getTier === 'function' ? item.getTier() : (item.rating >= 75 ? 3 : item.rating >= 65 ? 2 : 1);
-    const cardType = services.Localization?.localize('item.raretype' + item.rareflag) || String(item.rareflag);
+    const cardType = rarity === undefined ? 'Unknown rarity' : services.Localization?.localize('item.raretype' + rarity) || String(rarity);
     const profile = chem?.getChemProfileForPlayer(item);
+    // EA currently exposes `tradable`; older adapters used `untradeable`.
+    // Missing/nonboolean/conflicting metadata never earns an untradeable discount.
+    const tradable = typeof item.tradable === 'boolean' ? item.tradable :
+      typeof item.untradeable === 'boolean' ? !item.untradeable : null;
+    const conflicting = typeof item.tradable === 'boolean' && typeof item.untradeable === 'boolean' && item.tradable === item.untradeable;
+    const tradeabilityKnown = tradable !== null && !conflicting;
     return {
       id: item.id, definitionId: item.definitionId, assetId: item._metaData?.id ?? item.assetId ?? item._staticData?.id,
       name: item._staticData?.name ?? item.name ?? String(item.definitionId), cardType,
       rating: item.rating, teamId: item.teamId, leagueId: item.leagueId, nationId: item.nationId,
-      rarityId: item.rareflag, ratingTier: tier, isUntradeable: Boolean(item.untradeable),
+      rarityId: rarity, ratingTier: tier, isUntradeable: tradeabilityKnown && !tradable, tradeabilityKnown,
+      isLocked: inventoryState.activeSquadIds.has(String(item.id)),
       isDuplicate: inventoryState.duplicates.has(String(item.id)), isStorage: inventoryState.storageIds.has(String(item.id)),
       isLoan: !Number.isFinite(Number(item.loans)) || Number(item.loans) >= 0, isTimeLimited: Boolean(item.isTimeLimited?.()),
       isSpecial: Boolean(special), isEvolution: Boolean(item.upgrades || (typeof item.isEvolution === 'function' && item.isEvolution()) || /evolution/i.test(cardType)),
@@ -372,7 +542,7 @@
     state.busy = true;
     [ui.refresh,ui.solve,ui.apply].forEach(button => { button.disabled = true; });
     try { await callback(); } catch (error) { fail(error); }
-    finally { state.busy = false; ui.refresh.disabled = false; ui.solve.disabled = false; ui.apply.disabled = !state.preview || state.preview.rows.some(row => row.player.concept); }
+    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.apply.disabled = !state.preview || state.preview.rows.some(row => row.player.concept); }
   }
   function invalidate() { state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true; ui.review.replaceChildren(); ui.poolInfo.textContent = ''; }
   function scope(required = true) {
@@ -389,12 +559,15 @@
     try {
       const selected = scope(false);
       const result = await http('/health' + (selected ? `?gameYear=${selected.gameYear}&platform=${selected.platform}` : ''));
+      const currentScope = scope(false);
+      if (`${selected?.gameYear}:${selected?.platform}` !== `${currentScope?.gameYear}:${currentScope?.platform}`) return result;
+      state.backendScope = result.status === 'ok' && selected ? `${selected.gameYear}:${selected.platform}` : null;
       const db = result.database || {};
       ui.health.textContent = selected ? `Sunucu bağlı · FC ${selected.gameYear} / ${selected.platform.toUpperCase()} · ${db.count ?? '?'} kart · ${db.pricedCount ?? '?'} piyasa fiyatı${result.solverBusy ? ' · çözücü meşgul' : ''}` : 'Sunucu bağlı. Sezon ve platform seçimini yapın.';
       if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} için güncel piyasa fiyatı henüz hazır değil. Konsept alım önerisi üretilmez; kulüp kartlarıyla çözüm aranabilir. Diğer sezonun fiyatları kullanılmaz.`;
       else ui.marketNotice.textContent = selected ? `Fiyatlar yalnızca FC ${selected.gameYear} / ${selected.platform.toUpperCase()} kaynağından alınır.` : '';
       return result;
-    } catch (error) { ui.health.textContent = 'Yerel sunucuya bağlanılamadı'; throw error; }
+    } catch (error) { state.backendScope = null; ui.health.textContent = 'Yerel sunucuya bağlanılamadı'; throw error; }
   }
   async function loadSets() {
     if (!ready()) throw new Error('EA Web App hesabına giriş yapıp kulüp ekranının yüklenmesini bekleyin.');
@@ -413,8 +586,9 @@
     options(ui.challenge, state.challenges);
     status(`${state.challenges.length} görev hazır. Kart politikalarını kontrol edip çözebilirsiniz.`);
   }
-  async function solve() {
+  async function solve(nativeContext = null) {
     invalidate();
+    state.nativeActive = nativeContext;
     const version = state.cancel;
     if (!ready()) throw new Error('EA Web App henüz hazır değil.');
     const selectedScope = scope();
@@ -423,13 +597,29 @@
       if ([26,27].includes(detectedYear) && detectedYear !== selectedScope.gameYear) throw new Error(`EA Web App FC ${detectedYear} bildiriyor. Sezon seçimini düzeltin.`);
     }
     await health();
+    assertNativeContext(nativeContext);
+    if (nativeContext) {
+      const data = await observe(services.SBC.requestSets(), 'Current SBC set');
+      assertNativeContext(nativeContext);
+      state.sets = data.sets || [];
+      const selectedSet = state.sets.find(set => String(set.id) === String(nativeContext.setId));
+      if (!selectedSet) throw new Error('Açık SBC seti artık bulunamıyor. EA ekranını yenileyin.');
+      options(ui.set, state.sets); ui.set.value = selectedSet.id;
+      const challenges = await observe(services.SBC.requestChallengesForSet(selectedSet), 'Current SBC challenge');
+      assertNativeContext(nativeContext);
+      state.challenges = (challenges.challenges || []).filter(challenge => challenge.status !== 'COMPLETED');
+      options(ui.challenge, state.challenges); ui.challenge.value = nativeContext.challengeId;
+    }
     const currentPolicy = policy(), pale = readPaletools();
     if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
     const set = state.sets.find(set => String(set.id) === ui.set.value);
     const challenge = state.challenges.find(challenge => String(challenge.id) === ui.challenge.value);
     if (!set || !challenge) throw new Error('Önce SBC listesini yükleyip bir görev seçin.');
     const sbcData = await challengeData(challenge, set);
+    assertNativeContext(nativeContext);
     const inv = await inventory(), chem = chemistry();
+    assertNativeContext(nativeContext);
+    currentPolicy.lockedItemIds = [...new Set([...currentPolicy.lockedItemIds, ...inv.activeSquadIds])];
     let players = inv.items.map(item => card(item, inv, chem));
     // Existing reserves are protected: never silently consume a substitute.
     players = players.filter(player => !sbcData.subs.map(String).includes(String(player.definitionId)));
@@ -453,6 +643,7 @@
     // Short polling requests keep Chrome MV3's worker alive even for long solves.
     // Never retry the creation POST: a lost response must not launch two jobs.
     if (version !== state.cancel) { status('İptal edildi. Yeni çözüm işi başlatılmadı.'); return; }
+    assertNativeContext(nativeContext);
     const job = await http('/api/solve/jobs', 'POST', state.input);
     if (!job.jobId || !/^[a-zA-Z0-9-]+$/.test(job.jobId)) throw new Error('Local server returned an invalid solve job ID.');
     let result;
@@ -468,10 +659,11 @@
     }
     if (!result) throw new Error('Yerel çözüm süresi doldu. Sunucu durumunu kontrol edin.');
     if (version !== state.cancel) { status('İptal edildi. Sonuç uygulanmadı.'); return; }
+    assertNativeContext(nativeContext);
     const conceptCoverage = result.diagnostics?.conceptCoverage ?? result.conceptCoverage ?? result.conceptPool ?? null;
     if (conceptCoverage) ui.poolInfo.textContent = `Piyasa adayları: ${conceptCoverage.returned ?? conceptCoverage.addedToPool ?? '?'} / ${conceptCoverage.totalEligible ?? '?'} uygun kart. ${conceptCoverage.complete ? 'Politikaya uygun katalog adayları tarandı.' : 'Sınırlı, çeşitlendirilmiş havuz; tüm piyasada en ucuz çözüm garantisi yok.'}`;
     const rows = P.validateSolution(result, state.input, currentPolicy, pale);
-    state.preview = { rows, set, challenge, input: state.input, policy: currentPolicy, time: Date.now(), result, rejected, conceptCoverage };
+    state.preview = { rows, set, challenge, input: state.input, policy: currentPolicy, time: Date.now(), result, rejected, conceptCoverage, nativeContext };
     renderReview(state.preview);
     status('Çözüm hazır. Listeyi inceleyin; Uygula yalnızca SBC kadrosunu kaydeder. Gönderme işlemi EA ekranında size aittir.');
   }
@@ -479,6 +671,7 @@
     const preview = state.preview;
     const version = state.cancel;
     if (!preview) throw new Error('Önce bir çözüm oluşturun.');
+    assertNativeContext(preview.nativeContext);
     if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('Önizleme 5 dakikadan eski. Kulübü yeniden okuyup çözün.'); }
     if (preview.rows.some(row => row.player.concept)) throw new Error('Konsept çözümü yalnızca önizlenebilir.');
     const pale = readPaletools();
@@ -500,6 +693,7 @@
     const { _squad, _challenge } = controller;
     if (!_squad || !_challenge) throw new Error('EA squad adapter changed. Nothing was applied.');
     if (version !== state.cancel) throw new Error('Uygulama iptal edildi.');
+    assertNativeContext(preview.nativeContext);
     const oldItems = (_squad._players || []).map(slot => slot?._item);
     const squad = Array.from({ length: 11 }, () => new UTItemEntity());
     preview.rows.forEach(row => { squad[row.squadPosition] = currentItems.get(String(row.id)); });
@@ -526,7 +720,7 @@
     ['Slot','Oyuncu','RTG','Tür','Fiyat'].forEach(label => el('th', label, head));
     for (const row of preview.rows) {
       const tr = el('tr', undefined, table);
-      const type = row.player.concept ? 'Alınacak' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
+      const type = row.player.concept ? 'Alınacak' : row.player.tradeabilityKnown === false ? 'Kulüp · satış durumu bilinmiyor' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
       const price = Number(row.marketPrice ?? row.futggPrice ?? row.player.marketPrice);
       [row.squadPosition + 1, row.player.name, row.player.rating, type, price > 0 ? Math.round(price).toLocaleString() : 'Tahmini'].forEach(value => el('td', String(value), tr));
     }
@@ -562,6 +756,7 @@
     if (diagnostics && (Array.isArray(diagnostics) ? diagnostics.length : true)) el('pre', JSON.stringify(diagnostics, null, 2), ui.review);
     const details = el('details', undefined, ui.review); el('summary', 'Korunan kartlar ve Paletools', details);
     el('pre', JSON.stringify(preview.rejected, null, 2), details);
+    el('p', 'Aktif kadrodaki kartlar korunur ve Uygula öncesi yeniden okunur. Bu kontrol geçmişte oynanmış tüm kartları tespit etmez. Satış bilgisi bilinmeyen kartlar satılabilir kart politikasıyla değerlendirilir.', details);
     el('p', 'Paletools kayıtlı kart/ülke/takım/lig/nadirlik kilitleri okunur. Farklı hesapların kayıtlı kilitleri de korunur. Paletools ayarları değiştirilmez.', details);
     ui.apply.disabled = preview.rows.some(row => row.player.concept);
   }
@@ -632,4 +827,22 @@
   ui.solve.addEventListener('click', () => action(solve));
   ui.apply.addEventListener('click', () => action(apply));
   for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time]) input.addEventListener('change', invalidate);
+  if (window.AutoSBCNative) {
+    window.AutoSBCNative.install({
+      document,
+      getPrototype: () => typeof UTSBCSquadDetailPanelView !== 'undefined' ? UTSBCSquadDetailPanelView.prototype : null,
+      resolveContext: activeChallengeContext,
+      getGate: () => {
+        if (state.busy) return { ready: false, reason: 'Mevcut çözüm işlemi bitene kadar bekleyin.' };
+        const gameYear = Number(ui.season.value), platform = ui.platform.value;
+        if (![26,27].includes(gameYear) || !['ps5','pc'].includes(platform)) return { ready: false, reason: 'Auto-SBC panelinden sezon ve platform seçin.' };
+        if (state.backendScope !== `${gameYear}:${platform}`) return { ready: false, reason: 'Auto-SBC panelinden yerel sunucu bağlantısını kontrol edin.' };
+        return { ready: true };
+      },
+      onMount: () => { health().catch(fail); },
+      onSolveCurrent: context => { panel.classList.remove('hidden'); return action(() => solve(context)); },
+      onContextChanged: () => { if (state.nativeActive || state.preview?.nativeContext) invalidate(); },
+      onError: fail
+    });
+  }
 })();

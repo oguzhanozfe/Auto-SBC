@@ -3,7 +3,7 @@
 This is an independently implemented local companion built on the MIT-licensed
 TitiroMonkey Auto-SBC repository and its EA service adapters. It does not contain
 SBC Monkey or Paletools proprietary code. Both installation formats are generated
-from `policy.js` and `companion.js`; do not edit the generated files.
+from `policy.js`, `native-entry.js` and `companion.js`; do not edit the generated files.
 
 ## Build and test
 
@@ -39,6 +39,21 @@ blocks localhost requests, use the bundled extension. The extension requests onl
 `http://127.0.0.1:8000/*` host access, plus injection on the EA Web App URL paths.
 
 ## Review flow
+
+On the native EA SBC squad screen, **Auto-SBC ile çöz** appears after the native
+Exchange button. It uses the unique `autosbc-native-solve` ID, so it can coexist
+with SBC Monkey's button. Its click handler is bound before it is inserted. The
+button stays disabled until the active EA challenge has loaded, its identity is
+stable, an explicit season/platform has been chosen, and the scoped local backend
+is known to be available. Hover the disabled button for the missing prerequisite;
+the floating Auto-SBC panel provides the scope and backend controls.
+
+The native entry resolves the current challenge through the MIT upstream EA
+controller adapter and uses the same solve-and-review pipeline as the floating
+panel. It reads current IDs again on click. Leaving the challenge discards a
+pending result and prevents applying its preview. **Apply remains an explicit
+second action**, and native **Exchange Players remains manual**. Requirements for
+special cards never weaken the selected protection policy automatically.
 
 Select a set and challenge. Set the rating ceiling, card budget, purchase budget,
 total squad-value budget,
@@ -83,7 +98,26 @@ that script. All saved accounts' explicit locks are combined conservatively;
 temporary Paletools per-item unlock exceptions are not allowed to weaken them.
 Corrupt lock data blocks solving. Existing Auto-SBC global/set/challenge
 `excludePlayers` settings are also preserved. This companion never modifies
-Paletools storage and does not replace EA or Paletools prototypes.
+Paletools storage. The native entry wraps only the upstream-identified
+`UTSBCSquadDetailPanelView.init` view initializer and preserves its `this`, arguments,
+return value and the existing wrapper chain. It does not replace EA ratings,
+player entities, submission methods or Paletools behavior.
+
+The active squad is read through EA's squad service on both solve and Apply.
+Its owned inventory IDs are hard locks, including any substitutes present in the
+returned roster. An unreadable active roster blocks the action. This protects the
+current squad; it does not establish which other cards have been played before.
+Current EA boolean `tradable` and legacy boolean `untradeable` are supported.
+Missing, nonboolean or conflicting values use the full tradeable cost policy and
+are excluded when tradeable cards are disallowed; review labels them as unknown.
+
+Sanitized observed UI fixtures are recorded in
+`fixtures/native-ui-observations.json`. Lifetime **COMPLETED**, current **Repeatable**
+remaining and the challenge fraction are distinct values. On an exhausted daily,
+COMPLETED can disappear while Repeatable explicitly shows zero. This version does
+not invent or display a daily counter from private field guesses. A concrete
+rendered DOM anchor is still needed before adding a counter reader. Menu entries
+such as **Remove Last Evolution** do not establish that a selected card is evolved.
 
 Public catalog concepts form a server-selected, diversified pool filtered using
 the active policy and challenge attributes. The server can expand the candidate
@@ -109,5 +143,10 @@ solve is read-only, explicit Apply is the only squad-save path, lock changes aft
 review prevent Apply, and cancellation/foreign IDs cannot produce an actionable
 preview. Mixed, market-only and FC 27-without-quotes cases are covered, along with
 cross-season quotes, stale prices, source/identity/shopping-list tampering and the
-separate purchase budget. The current user's live EA account was not used to test or save a squad.
+separate purchase budget. Native-entry tests cover original initializer semantics,
+handler binding before mount, repeated rendering, missing/late challenge data,
+rapid clicks, challenge identity changes and result cancellation on navigation.
+The native integration has not yet been installed and validated against the user's
+live EA account. EA's own UI was observed separately; the tests' EA object shapes
+still come from the upstream adapter and controlled fixtures.
 EA's private adapter APIs may change; unreadable responses fail with diagnostics.
