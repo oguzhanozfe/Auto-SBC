@@ -4,7 +4,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.type !== 'autosbc-local-http') return false;
   const origin = sender.tab?.url;
   if (!origin || !/^https:\/\/www\.(ea\.com|easports\.com)\//.test(origin)) return false;
-  const paths = { '/health': 'GET', '/api/players': 'GET', '/api/concepts': 'POST', '/api/solve/jobs': 'POST' };
+  const paths = { '/health': 'GET', '/api/solve/jobs': 'POST' };
   let url;
   try { url = new URL(message.path, 'http://127.0.0.1:8000'); } catch { return false; }
   const permittedMethod = /^\/api\/solve\/jobs\/[a-zA-Z0-9-]+$/.test(url.pathname) ? 'GET' : paths[url.pathname];

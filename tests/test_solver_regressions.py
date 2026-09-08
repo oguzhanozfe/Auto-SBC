@@ -1,6 +1,7 @@
 """Synthetic regressions; no EA account, remote market, or inventory mutation."""
 import json
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,7 +18,10 @@ def player(number, **changes):
         "ratingTier": 3, "groups": [4], "possiblePositions": [0],
         "isUntradeable": True, "isDuplicate": False, "isStorage": False,
         "concept": False, "isFixed": False, "price": 1000,
-        "marketPrice": 1000,
+        "marketPrice": 1000, "priceSource": "Synthetic test quote",
+        "priceSnapshotAt": datetime.now(timezone.utc).isoformat(),
+        "priceFetchedAt": datetime.now(timezone.utc).isoformat(), "priceStale": False,
+        "gameYear": 27, "platform": "ps5",
     }
     row.update(changes)
     return row
@@ -331,3 +335,144 @@ def test_stale_imported_quotes_never_enter_cost_or_candidate_percentile():
     assert rows[0]["marketPrice"] == 2000
     assert rows[2]["marketPrice"] == 2000
     assert rows[2]["priceSource"] == "candidateRatingP60"
+
+
+def market_player(number, **changes):
+    row = player(number, concept=True, isUntradeable=False,
+                 id=f"concept:{number}",
+                 url=f"https://example.test/players/{number}/")
+    row.update(changes)
+    return row
+
+
+def test_mixed_nine_owned_two_purchases_has_separate_cash_and_opportunity_costs():
+    owned = [player(i, marketPrice=10000) for i in range(1, 10)]
+    concepts = [market_player(10, marketPrice=600), market_player(11, marketPrice=800)]
+    result = solve(owned + concepts, challenge(requirements=[requirement("CHEMISTRY_POINTS", 33)]),
+                   {"allowConcept": True, "maxPurchasePrice": 1400})
+    assert result["status_code"] == 4
+    summary = result["summary"]
+    assert summary["ownedPlayers"] == 9
+    assert summary["conceptPlayers"] == 2
+    assert summary["purchaseCost"] == summary["purchaseCoins"] == 1400
+    assert summary["ownedOpportunityCost"] == 90000
+    assert summary["marketCost"] == 91400
+    assert summary["weightedCost"] == 65800
+    assert summary["chemistry"] == 33
+    assert len(result["shoppingList"]) == 2
+    for entry in result["shoppingList"]:
+        assert entry["definitionId"] in {10, 11}
+        assert entry["quantity"] == 1
+        assert entry["priceSnapshotAt"] and entry["priceFetchedAt"]
+        assert entry["source"] == "Synthetic test quote"
+        assert entry["gameYear"] == 27 and entry["platform"] == "ps5"
+        assert entry["url"].startswith("https://example.test/players/")
+    assert solve(owned + concepts, policy={"allowConcept": True, "maxPurchasePrice": 1399})["status_code"] == 3
+
+
+def test_empty_club_can_plan_eleven_actual_market_purchases():
+    concepts = [market_player(i, marketPrice=500) for i in range(1, 12)]
+    result = solve(concepts, challenge(requirements=[requirement("CHEMISTRY_POINTS", 33)]), {"allowConcept": True, "maxPurchasePrice": 5500})
+    assert result["status_code"] == 4
+    assert result["summary"]["ownedPlayers"] == 0
+    assert result["summary"]["conceptPlayers"] == 11
+    assert result["summary"]["ownedOpportunityCost"] == 0
+    assert result["summary"]["purchaseCost"] == 5500
+    assert result["summary"]["weightedCost"] == 11000
+    assert len(result["shoppingList"]) == 11
+    assert all(row["concept"] and row["id"].startswith("concept:") for row in result["solution"])
+
+
+def test_purchase_budget_does_not_charge_owned_cards_or_use_concept_weight():
+    owned = player(1, marketPrice=100000)
+    concept = market_player(2, marketPrice=700)
+    result = solve([owned, concept], challenge(2), {"allowConcept": True, "maxPurchasePrice": 700})
+    assert result["status_code"] == 4
+    assert result["summary"]["purchaseCost"] == 700
+    assert result["summary"]["weightedCost"] == 71400
+    assert solve([owned, concept], challenge(2), {"allowConcept": True, "maxTotalPrice": 100699})["status_code"] == 3
+    assert solve([owned, concept], challenge(2), {"allowConcept": True, "maxPurchasePrice": 0})["status_code"] == 4
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"marketPrice": None, "futggPrice": None, "price": 500}, "conceptMissingMarketQuote"),
+    ({"marketPrice": 1, "priceStale": True}, "conceptStaleQuote"),
+    ({"marketPrice": 1, "priceSnapshotAt": "2020-01-01T00:00:00Z", "priceStale": False}, "conceptStaleQuote"),
+    ({"marketPrice": 1, "priceSnapshotAt": None, "priceUpdatedAt": None}, "conceptUnknownQuoteFreshness"),
+    ({"marketPrice": 1, "priceSource": "candidateRatingP60"}, "conceptMissingMarketQuote"),
+    ({"marketPrice": 1, "isObjective": True}, "conceptNotMarketAvailable"),
+    ({"marketPrice": 1, "isSbc": True}, "conceptNotMarketAvailable"),
+    ({"marketPrice": 1, "priceSource": None}, "conceptMissingQuoteSource"),
+    ({"marketPrice": 1, "gameYear": None}, "conceptMissingScope"),
+    ({"marketPrice": 1, "platform": None}, "conceptMissingScope"),
+])
+def test_unpriced_stale_unsourced_concepts_never_use_rating_estimates(changes, reason):
+    concept = market_player(1, **changes)
+    result = solve([concept], challenge(1), {"allowConcept": True, "ratingFallbackPrices": {"80": 500}})
+    assert result["status_code"] == 3
+    assert result["solution"] == [] and result["shoppingList"] == []
+    assert result["diagnostics"]["filteredCounts"].get(reason) == 1
+
+
+def test_concept_quote_without_published_timestamp_cannot_be_freshened_by_fetch_time():
+    concept = market_player(1, priceSnapshotAt=None,
+                            priceFetchedAt=datetime.now(timezone.utc).isoformat())
+    result = solve([concept], challenge(1), {"allowConcept": True})
+    assert result["diagnostics"]["filteredCounts"]["conceptUnknownQuoteFreshness"] == 1
+
+
+def test_future_concept_quote_is_rejected_and_does_not_contaminate_owned_p60():
+    future = market_player(1, marketPrice=1,
+                           priceSnapshotAt=(datetime.now(timezone.utc) + timedelta(days=2)).isoformat())
+    unknown_owned = player(2, marketPrice=None, price=None)
+    rows, _, _ = prepare_players([future, unknown_owned], {"allowConcept": True})
+    assert len(rows) == 1
+    assert rows[0]["marketPrice"] == 15000000
+    assert rows[0]["priceSource"] == "unknownConservativeFallback"
+
+
+def test_owned_and_concept_cannot_duplicate_the_same_athlete():
+    result = solve([player(1, assetId=100), market_player(2, assetId=100)], challenge(2), {"allowConcept": True})
+    assert result["status_code"] == 3
+
+
+def test_owned_legacy_rows_do_not_require_season_or_quote_provenance():
+    owned = player(1)
+    for field in ("gameYear", "platform", "priceSnapshotAt", "priceFetchedAt", "priceSource"):
+        owned.pop(field)
+    result = solve([owned], challenge(1))
+    assert result["status_code"] == 4
+    assert result["summary"]["purchaseCost"] == 0
+    assert result["shoppingList"] == []
+
+
+def test_cash_limit_can_select_owned_card_when_weighted_cheapest_would_purchase():
+    candidates = [player(1, marketPrice=10000), market_player(2, marketPrice=1000)]
+    unrestricted = solve(candidates, challenge(1), {"allowConcept": True})
+    assert ids(unrestricted) == {"concept:2"}
+    assert unrestricted["summary"]["purchaseCost"] == 1000
+    limited = solve(candidates, challenge(1), {"allowConcept": True, "maxPurchasePrice": 999})
+    assert ids(limited) == {1}
+    assert limited["summary"]["purchaseCost"] == 0
+    assert limited["summary"]["ownedOpportunityCost"] == 10000
+
+
+@pytest.mark.parametrize("policy_key,field,reason", [
+    ("lockedNationIds", "nationId", "lockedNation"),
+    ("lockedTeamIds", "teamId", "lockedTeam"),
+    ("lockedLeagueIds", "leagueId", "lockedLeague"),
+    ("lockedRarityIds", "rarityId", "lockedRarity"),
+])
+def test_category_locks_exclude_owned_and_concepts_before_selection(policy_key, field, reason):
+    blocked = [player(1, isDuplicate=True, **{field: 1}), market_player(2, **{field: 1})]
+    other_value = 0 if field == "rarityId" else 2
+    available = [player(3, **{field: other_value}), market_player(4, **{field: other_value})]
+    policy = {"allowConcept": True, policy_key: ["1"]}
+    result = solve(blocked + available, challenge(2), policy)
+    assert result["status_code"] == 4
+    assert ids(result) == {3, "concept:4"}
+    assert result["diagnostics"]["filteredCounts"][reason] == 2
+    assert [row["definitionId"] for row in result["shoppingList"]] == [4]
+    impossible = solve(blocked, challenge(1), policy)
+    assert impossible["status_code"] == 3
+    assert impossible["shoppingList"] == []

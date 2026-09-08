@@ -17,8 +17,8 @@ import os
 from pathlib import Path
 import sqlite3
 import time
-from datetime import datetime, timezone
-from urllib.parse import urljoin
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -38,7 +38,8 @@ CSV_FIELDS = ['', 'id', 'name', 'cardType', 'assetId', 'definitionId', 'rating',
               'normalizeClubId', 'teamChem.calculationType', 'teamChem.contribution',
               'teamChem.parameterId', 'leagueChem.calculationType',
               'leagueChem.contribution', 'leagueChem.parameterId',
-              'nationChem.calculationType', 'nationChem.contribution', 'nationChem.parameterId']
+              'nationChem.calculationType', 'nationChem.contribution', 'nationChem.parameterId', 'gameYear', 'platform', 'priceGameYear', 'pricePlatform',
+              'priceSnapshotAt', 'priceFetchedAt', 'priceStale']
 
 
 def _now():
@@ -84,8 +85,13 @@ def decode_prices(index, blob):
     return rows
 
 
-def normalize_player(raw):
+def normalize_player(raw, game_year=None, platform=None):
     """Keep sourced chemistry flags as metadata, without fabricating EA rules."""
+    if game_year is not None and raw.get('game') is None:
+        raise ValueError('Provider card is missing its game year; season could not be verified.')
+    source_year = int(raw['game']) if raw.get('game') is not None else game_year
+    if game_year is not None and source_year != game_year:
+        raise ValueError(f'Provider returned FC{source_year} data for an FC{game_year} catalog.')
     definition_id = int(raw['eaId'])
     rating = int(raw['overall'])
     if definition_id <= 0 or not 0 <= rating <= 99:
@@ -106,6 +112,7 @@ def normalize_player(raw):
         image = 'https://game-assets.fut.gg/' + raw['futggCardImagePath'].lstrip('/')
     return {
         'id': f'concept:{definition_id}', 'definitionId': definition_id,
+        'gameYear': source_year, 'platform': platform,
         'assetId': raw.get('basePlayerEaId'), 'name': raw.get('commonName') or raw.get('nickname') or full_name,
         'rating': rating, 'cardType': raw.get('rarityName') or rarity.get('name') or '',
         'teamId': raw.get('uniqueClubEaId') or raw.get('clubEaId', club.get('eaId')),
@@ -132,7 +139,7 @@ class Catalog:
         if platform not in ('ps5', 'pc'):
             raise ValueError('Platform must be ps5 or pc.')
         self.game_year = int(game_year)
-        if not 20 <= self.game_year <= 99:
+        if isinstance(game_year, bool) or float(game_year) != self.game_year or not 20 <= self.game_year <= 99:
             raise ValueError('Invalid FC game year.')
         self.platform = platform
         self.data_dir = Path(data_dir or os.environ.get('AUTOSBC_DATA_DIR') or Path(__file__).resolve().parents[1] / 'data')
@@ -154,6 +161,16 @@ class Catalog:
                     published_at TEXT, fetched_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             ''')
+            expected_scope = {'gameYear': self.game_year, 'platform': self.platform}
+            stored_scope = self._get_meta(db, 'scope')
+            if stored_scope is not None and stored_scope != expected_scope:
+                raise ValueError('Catalog file scope does not match the requested game year/platform.')
+            old_prices = self._get_meta(db, 'prices', {})
+            old_url = old_prices.get('url')
+            if old_url and (not urlsplit(old_url).path.startswith(f'/{self.game_year}/') or
+                            f'player-prices-{self.platform}-' not in urlsplit(old_url).path):
+                raise ValueError('Existing price provenance belongs to a different season/platform.')
+            self._set_meta(db, 'scope', expected_scope)
 
     @contextmanager
     def _connect(self):
@@ -177,8 +194,14 @@ class Catalog:
     def _stale(self, published_at):
         if not published_at:
             return True
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(published_at.replace('Z', '+00:00'))).total_seconds()
-        return age < -300 or age > self.max_price_age_hours * 3600
+        try:
+            parsed = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                return True
+            age = (datetime.now(timezone.utc) - parsed).total_seconds()
+            return age < -300 or age > self.max_price_age_hours * 3600
+        except (TypeError, ValueError, AttributeError):
+            return True
 
     def status(self):
         with self._connect() as db:
@@ -189,12 +212,37 @@ class Catalog:
             priced = db.execute('SELECT COUNT(*) FROM cards JOIN prices USING(definition_id) WHERE market_price IS NOT NULL').fetchone()[0]
             index_count = db.execute('SELECT COUNT(*) FROM prices').fetchone()[0]
             all_priced = db.execute('SELECT COUNT(*) FROM prices WHERE market_price IS NOT NULL').fetchone()[0]
+            available = self._get_meta(db, 'availability', {})
+            now = datetime.now(timezone.utc)
+            fresh_priced = db.execute('''SELECT COUNT(*) FROM cards JOIN prices USING(definition_id)
+                WHERE market_price IS NOT NULL AND julianday(published_at) BETWEEN julianday(?) AND julianday(?)''',
+                ((now - timedelta(hours=self.max_price_age_hours)).isoformat(), (now + timedelta(minutes=5)).isoformat())).fetchone()[0]
+        complete = bool(cursor) and all(value.get('done') for value in cursor.values())
+        count_warnings = [f"Rating band {band}: provider reported {value.get('total', 0)}, returned {value.get('seen', 0)} cards."
+                          for band, value in cursor.items() if value.get('done') and value.get('total', 0) != value.get('seen', 0)]
+        if not count and available.get('available') is False:
+            readiness = 'unavailable'
+        elif not count and not prices and not sync:
+            readiness = 'not_synced'
+        elif not all_priced and (index_count or count):
+            readiness = 'awaiting_market_prices'
+        elif not count:
+            readiness = 'catalog_empty'
+        elif not fresh_priced:
+            readiness = 'stale_prices'
+        else:
+            readiness = 'ready' if complete else 'partial_ready'
         return {'count': count, 'pricedCount': priced, 'priceIndexCount': index_count,
-                'marketPriceCount': all_priced, 'lastSync': sync.get('lastSync'),
+                'marketPriceCount': all_priced, 'freshPricedCount': fresh_priced, 'lastSync': sync.get('lastSync'),
+                'readiness': readiness, 'readyForConcepts': fresh_priced > 0,
+                'sourceCheckedAt': available.get('checkedAt') or prices.get('fetchedAt'),
+                'priceMaxAgeHours': self.max_price_age_hours,
                 'source': SOURCE, 'gameYear': self.game_year, 'platform': self.platform,
-                'complete': bool(cursor) and all(value.get('done') for value in cursor.values()),
+                'complete': complete,
                 'completenessScope': 'All results exposed by the public FUT.GG definition search in rating bands 0–99; private/custom club cards are excluded.',
                 'reportedTotal': sum(value.get('total', 0) for value in cursor.values()) if cursor else None,
+                'observedTotal': sum(value.get('seen', 0) for value in cursor.values()) if cursor else None,
+                'sourceTotalsConsistent': not count_warnings if cursor else None, 'sourceCountWarnings': count_warnings,
                 'pricesPublishedAt': prices.get('publishedAt'), 'pricesFetchedAt': prices.get('fetchedAt'),
                 'pricesStale': self._stale(prices.get('publishedAt')), 'priceSource': prices.get('url'),
                 'lastError': sync.get('lastError'), 'pagesFetched': sync.get('pagesFetched', 0),
@@ -203,7 +251,10 @@ class Catalog:
     def _price_fields(self, row):
         published = row['published_at']
         stale = self._stale(published)
-        return {'marketPrice': row['market_price'], 'futggPrice': row['market_price'],
+        return {'gameYear': self.game_year, 'platform': self.platform,
+                'priceGameYear': self.game_year, 'pricePlatform': self.platform,
+                'quoteReady': row['market_price'] is not None and not stale,
+                'marketPrice': row['market_price'], 'futggPrice': row['market_price'],
                 'price': row['market_price'], 'acquisitionPrice': row['acquisition_price'],
                 'isSbc': row['acquisition_state'] == 1, 'isObjective': row['acquisition_state'] == 2,
                 'priceSource': 'FUT.GG', 'priceUpdatedAt': None,
@@ -232,6 +283,17 @@ class Catalog:
         with self._connect() as db:
             for player in players:
                 item = dict(player)
+                for field in ('gameYear', 'priceGameYear'):
+                    value = player.get(field)
+                    if value is not None and (isinstance(value, bool) or str(value) != str(self.game_year)):
+                        raise ValueError(f'Player {field} differs from FC{self.game_year}; seasons cannot be mixed.')
+                for field in ('platform', 'pricePlatform'):
+                    if player.get(field) is not None and player[field] != self.platform:
+                        raise ValueError(f'Player {field} differs from {self.platform}; market platforms cannot be mixed.')
+                if item.get('gameYear') is None:
+                    item['gameYear'] = self.game_year
+                if item.get('platform') is None:
+                    item['platform'] = self.platform
                 try:
                     definition_id = int(player.get('definitionId'))
                 except (TypeError, ValueError):
@@ -244,7 +306,7 @@ class Catalog:
                     item['catalogMarketPrice'] = fields['marketPrice']
                     if fields['priceStale']:
                         fields['marketPrice'] = fields['futggPrice'] = None
-                    for key in ('marketPrice', 'futggPrice', 'priceSource', 'priceUpdatedAt', 'priceSnapshotAt', 'priceFetchedAt', 'priceStale'):
+                    for key in ('marketPrice', 'futggPrice', 'priceSource', 'priceUpdatedAt', 'priceSnapshotAt', 'priceFetchedAt', 'priceStale', 'priceGameYear', 'pricePlatform', 'quoteReady'):
                         if key not in item or item[key] is None:
                             item[key] = fields[key]
                 enriched.append(item)
@@ -260,7 +322,7 @@ class Catalog:
         # Nearest-rank P60 deliberately avoids treating the cheapest example as universal value.
         return {rating: sorted(values)[math.ceil(len(values) * .6) - 1] for rating, values in grouped.items()}
 
-    def concept_candidates(self, sbc, policy, limit=1500):
+    def concept_candidates(self, sbc, policy, limit=1500, excluded_definition_ids=None):
         """A diverse, explicitly bounded pool from all fresh local market cards.
 
         This is candidate generation, not proof that the global cheapest squad
@@ -272,8 +334,21 @@ class Catalog:
 
         policy = normalize_policy(policy)
         sbc = normalize_sbc(sbc)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 3000:
-            raise ValueError('Concept pool limit must be an integer between 1 and 3000.')
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20000:
+            raise ValueError('Concept pool limit must be an integer between 1 and 20000.')
+        if excluded_definition_ids is not None and not isinstance(excluded_definition_ids, (list, tuple, set, frozenset)):
+            raise ValueError('excluded_definition_ids must be a list of owned definition IDs.')
+        excluded_definitions = set()
+        for value in excluded_definition_ids or []:
+            if isinstance(value, bool):
+                raise ValueError('Owned definition IDs must be positive integers.')
+            try:
+                number = int(value)
+                if number <= 0 or float(value) != number:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('Owned definition IDs must be positive integers.') from None
+            excluded_definitions.add(number)
         exclusions, eligible = Counter(), []
         needs_groups = any(req['requirementKey'] == 'PLAYER_RARITY_GROUP' for req in sbc['constraints'])
         needs_chemistry = any(req['requirementKey'] in CHEMISTRY_KEYS for req in sbc['constraints'])
@@ -286,6 +361,8 @@ class Catalog:
             reason = None
             if not policy['allowConcept']:
                 reason = 'conceptsDisabled'
+            elif player['definitionId'] in excluded_definitions:
+                reason = 'alreadyOwnedDefinition'
             elif player['marketPrice'] is None or player['priceStale']:
                 reason = 'missingOrStaleMarketQuote'
             elif policy['onlyStorage']:
@@ -299,16 +376,20 @@ class Catalog:
             elif any(identifier(player[field]) in policy[f'locked{name}Ids'] for field, name in
                      (('id', 'Item'), ('assetId', 'Asset'), ('definitionId', 'Definition'))):
                 reason = 'lockedIdentity'
+            elif any(identifier(player[field]) in policy.get(key, []) for field, key in
+                     (('nationId', 'lockedNationIds'), ('teamId', 'lockedTeamIds'),
+                      ('leagueId', 'lockedLeagueIds'), ('rarityId', 'lockedRarityIds'))):
+                reason = 'lockedCategory'
             elif any(player['marketPrice'] > policy[key] for key in ('maxPlayerPrice', 'maxTotalPrice') if key in policy):
                 reason = 'priceLimit'
-            elif needs_groups and 'groups' not in player:
+            elif needs_groups and ('groups' not in player or player.get('rarityGroupsKnown') is False):
                 reason = 'unknownRarityGroups'
             elif needs_chemistry and chemistry_profile(player) is None:
                 reason = 'unsupportedChemistryProfile'
             if reason:
                 exclusions[reason] += 1
                 continue
-            player['rarityGroupsKnown'] = 'groups' in player
+            player['rarityGroupsKnown'] = 'groups' in player and player.get('rarityGroupsKnown') is not False
             player['ratingTier'] = 1 if player['rating'] < 65 else 2 if player['rating'] < 75 else 3
             eligible.append(player)
         eligible.sort(key=lambda player: (player['marketPrice'], player['rating'], player['definitionId']))
@@ -407,7 +488,11 @@ class Catalog:
             'limit': limit, 'selection': 'diverse-local-market-pool',
             'priceBasis': 'fresh market quotes only', 'excludedCounts': dict(exclusions),
             'catalogCount': state['count'], 'catalogComplete': state['complete'],
-            'pricesPublishedAt': state['pricesPublishedAt'], 'platform': self.platform,
+            'pricesPublishedAt': state['pricesPublishedAt'], 'pricesFetchedAt': state['pricesFetchedAt'],
+            'gameYear': self.game_year, 'platform': self.platform, 'readiness': state['readiness'],
+            'priceIndexCount': state['priceIndexCount'], 'freshPricedCount': state['freshPricedCount'],
+            'sourceCountWarnings': state['sourceCountWarnings'],
+            'excludedOwnedDefinitionCount': exclusions.get('alreadyOwnedDefinition', 0),
             'requiredIdsNotInConceptPool': unavailable_required,
             'optimalityScope': 'All locally eligible quoted concepts' if complete else 'Selected concept pool only; global cheapest squad is not established',
         }}
@@ -463,6 +548,8 @@ class Catalog:
         try:
             manifest_url = f'https://r2.fut.gg/{self.game_year}/manifest.json'
             manifest = self._fetch(manifest_url)
+            with self._connect() as db:
+                self._set_meta(db, 'availability', {'available': True, 'checkedAt': _now(), 'manifestUrl': manifest_url})
             def cdn(key):
                 version, token = manifest.get('_version'), manifest.get(key)
                 if not isinstance(version, int) or not isinstance(token, str) or not token.isalnum():
@@ -516,7 +603,7 @@ class Catalog:
                             self._set_meta(db, 'cursor', cursor)
                         pages_fetched += 1
                         continue
-                    normalized = [normalize_player(raw) for raw in raw_players]
+                    normalized = [normalize_player(raw, self.game_year, self.platform) for raw in raw_players]
                     if any(not low <= player['rating'] <= high for player in normalized):
                         raise ValueError('Provider did not honor the rating-band filter.')
                     next_page = result.get('next')
@@ -545,6 +632,8 @@ class Catalog:
                 self._set_meta(db, 'sync', {'lastSync': _now(), 'lastError': None, 'pagesFetched': pages_fetched})
         except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as error:
             with self._connect() as db:
+                if isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code == 404:
+                    self._set_meta(db, 'availability', {'available': False, 'checkedAt': _now(), 'status': 404, 'gameYear': self.game_year, 'platform': self.platform})
                 prior = self._get_meta(db, 'sync', {})
                 self._set_meta(db, 'sync', {**prior, 'lastError': str(error), 'pagesFetched': pages_fetched})
             raise

@@ -29,7 +29,9 @@ first. Chrome extension management must be performed by the user:
 1. Open Chrome's extension management page and enable Developer mode.
 2. Choose **Load unpacked** and select `dist/chrome-extension`.
 3. Open the EA FC Web App and sign in. Refresh a tab that was already open.
-4. Open **Auto-SBC Local** at the bottom right, then **SBC listesini yükle**.
+4. Open **Auto-SBC Local** at the bottom right, explicitly choose FC 26 or FC 27
+   and console/PC prices, then choose **SBC listesini yükle**. The selection is
+   saved locally. If EA exposes its season, a conflicting selection is rejected.
 
 Alternatively install the generated userscript with Tampermonkey. It uses page
 context to access EA's adapters and fetches only the localhost server. If EA's CSP
@@ -38,16 +40,30 @@ blocks localhost requests, use the bundled extension. The extension requests onl
 
 ## Review flow
 
-Select a set and challenge. Set the rating ceiling, card budget, total budget,
+Select a set and challenge. Set the rating ceiling, card budget, purchase budget,
+total squad-value budget,
 tradeable/storage/special/evolution preferences, cost weights and optional item
-locks or required item IDs. Defaults protect special/evolution cards, exclude
-concepts, use a rating ceiling of 89, and prefer untradeable duplicates at 10% of
+locks or required item IDs. Defaults protect special/evolution cards, enable
+mixed club-and-market solving, use a rating ceiling of 89, and prefer untradeable duplicates at 10% of
 market cost, other untradeables at 70%, tradeables at 100%.
 
 **Çöz ve önizle** reads club cards, SBC storage, unassigned duplicate references and
-challenge requirements, then creates a local solve job. It performs no inventory
-moves. The result must contain exactly the required number of known, eligible,
-unique athletes and valid squad positions. Error statuses cannot become a squad.
+challenge requirements, then creates a local solve job scoped to the selected
+season and price platform. The server adds actual-priced catalog concepts; the
+browser never invents owned entities or fetches an arbitrary first catalog page.
+An empty eligible club can request a fully priced market squad. The result must
+contain exactly the required number of eligible, unique athletes and valid squad
+positions. Owned cards must exist in the submitted inventory. Selected concepts
+must match separate server catalog proof by card ID, athlete ID, season, platform,
+price, source and timestamps. Error statuses cannot become a squad.
+
+The preview separates club opportunity value from coins needed to buy the missing
+cards. `maxPurchasePrice` limits only actual purchases; `maxTotalPrice` limits all
+selected cards' market opportunity value. Its shopping list shows quantity, card,
+actual quoted price, price-source age, source link, season/platform and purchase
+total. Proof and shopping-list inconsistencies prevent review. No purchase is
+made automatically. Buy any wanted cards yourself, refresh inventory, and solve
+again before applying the resulting owned squad.
 
 **İnceledim · Kadroyu SBC’ye uygula** re-reads inventory and locks, checks the
 challenge still matches, and saves the squad to that challenge. It does not submit
@@ -69,15 +85,21 @@ Corrupt lock data blocks solving. Existing Auto-SBC global/set/challenge
 `excludePlayers` settings are also preserved. This companion never modifies
 Paletools storage and does not replace EA or Paletools prototypes.
 
-Public catalog concepts are a preview-only pool of up to 1,500 eligible, diverse
-candidates, filtered using the active card policy and challenge attributes.
-The panel displays eligible, returned and added coverage; a bounded selection
-does not guarantee the cheapest squad across the entire market. Concepts are
-never represented as owned EA entities, purchased or applied. Stale
+Public catalog concepts form a server-selected, diversified pool filtered using
+the active policy and challenge attributes. The server can expand the candidate
+pool within the request's solve budget. The panel displays coverage; a bounded
+selection does not guarantee the cheapest squad across the entire market.
+Concepts are never represented as owned EA entities, purchased or applied. Stale
 catalog prices are not submitted as current quotes. The backend exposes price
 provenance and conservative fallback estimates. Concept and boosted-card
 chemistry support remains subject to the backend's supported constraint types.
 Missing rarity-group metadata is marked unknown, never invented as group 0.
+Concept quotes require a positive actual market price, matching game and price
+scope, source timestamps, and a fresh provider snapshot (six hours by default).
+Fetch time does not make an old provider quote fresh. SBC/objective acquisition
+costs and estimates cannot become purchase prices. FC 27 catalog metadata alone
+does not mean market quotes are ready: the panel reports unavailable FC 27 prices
+and permits owned-only solutions while refusing substitute FC 26 purchase prices.
 
 ## Verification limits
 
@@ -85,5 +107,7 @@ Node tests cover the pure policy, Paletools formats, malformed/unsafe responses,
 legacy position mapping and a mocked EA adapter workflow. The mock checks that a
 solve is read-only, explicit Apply is the only squad-save path, lock changes after
 review prevent Apply, and cancellation/foreign IDs cannot produce an actionable
-preview. The current user's live EA account was not used to test or save a squad.
+preview. Mixed, market-only and FC 27-without-quotes cases are covered, along with
+cross-season quotes, stale prices, source/identity/shopping-list tampering and the
+separate purchase budget. The current user's live EA account was not used to test or save a squad.
 EA's private adapter APIs may change; unreadable responses fail with diagnostics.

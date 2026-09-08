@@ -9,53 +9,72 @@ import time
 import uuid
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
-from . import logger, setup
+from . import logger, setup, planner
 from .catalog import Catalog
 
-VERSION = "26.2.0-local"
+VERSION = "27.0.0-preview"
 ROOT = Path(__file__).resolve().parent.parent
 EA_ORIGINS = {"https://www.ea.com", "https://www.easports.com"}
 LOCAL_ORIGINS = {"http://127.0.0.1:8000", "http://localhost:8000"}
 MAX_BODY_BYTES = 24 * 1024 * 1024
 
 
-class SolveRequest(BaseModel):
+class MarketScope(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    gameYear: Literal[26, 27] | None = None
+    platform: Literal["ps5", "pc"] | None = None
+
+
+class SolveRequest(MarketScope):
     sbcData: dict[str, Any]
-    clubPlayers: list[dict[str, Any]] = Field(min_length=1, max_length=20000)
+    clubPlayers: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
     maxSolveTime: float = Field(default=15, ge=1, le=120, allow_inf_nan=False)
     solverPolicy: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def require_pool(self):
+        if not self.clubPlayers and self.solverPolicy.get("allowConcept") is not True:
+            raise ValueError("Load club players or enable market concepts.")
+        return self
 
-class SyncRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+
+class SyncRequest(MarketScope):
     maxPages: int = Field(default=10, ge=1, le=1000)
 
 
-class ConceptRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ConceptRequest(MarketScope):
     sbcData: dict[str, Any]
     solverPolicy: dict[str, Any] = Field(default_factory=dict)
-    limit: int = Field(default=1500, ge=1, le=3000)
+    limit: int = Field(default=1500, ge=1, le=20000)
 
 
 def create_app(data_dir=None):
     app = FastAPI(title="Auto-SBC Studio", version=VERSION)
-    catalog = Catalog(data_dir=data_dir, platform=os.environ.get("AUTOSBC_PLATFORM", "ps5"))
+    catalog = Catalog(data_dir=data_dir, game_year=int(os.environ.get("AUTOSBC_GAME_YEAR", "26")),
+                      platform=os.environ.get("AUTOSBC_PLATFORM", "ps5"))
+    catalogs = {(catalog.game_year, catalog.platform): catalog}
+    catalog_lock = Lock()
+    def get_catalog(game_year=None, platform=None):
+        key = (game_year or catalog.game_year, platform or catalog.platform)
+        with catalog_lock:
+            if key not in catalogs:
+                catalogs[key] = Catalog(data_dir=data_dir, game_year=key[0], platform=key[1])
+            return catalogs[key]
     solve_lock = Lock()
     sync_lock = Lock()
     jobs_lock = Lock()
     jobs = {}
     app.state.catalog = catalog
+    app.state.get_catalog = get_catalog
     app.state.solve_lock = solve_lock
     app.state.sync_lock = sync_lock
     allowed_origins = EA_ORIGINS | LOCAL_ORIGINS
@@ -108,24 +127,27 @@ def create_app(data_dir=None):
         return FileResponse(ROOT / "backend/static" / filename)
 
     @app.get("/health")
-    def health():
+    def health(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
         return {"status": "ok", "version": VERSION, "solverBusy": solve_lock.locked(),
-                "database": catalog.status()}
+                "database": get_catalog(gameYear, platform).status()}
 
     @app.get("/api/database/status")
-    def database_status():
-        return {**catalog.status(), "syncing": sync_lock.locked()}
+    def database_status(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        return {**get_catalog(gameYear, platform).status(), "syncing": sync_lock.locked()}
 
     @app.get("/api/players")
     def players(q: str = Query(default="", max_length=120), limit: int = Query(default=50, ge=1, le=1000),
-                offset: int = Query(default=0, ge=0)):
-        return {"players": catalog.search(q, limit=limit, offset=offset),
-                "database": catalog.status(), "total": catalog.count(q), "limit": limit, "offset": offset}
+                offset: int = Query(default=0, ge=0), gameYear: int | None = Query(default=None, ge=26, le=27),
+                platform: Literal["ps5", "pc"] | None = None):
+        selected = get_catalog(gameYear, platform)
+        return {"players": selected.search(q, limit=limit, offset=offset),
+                "database": selected.status(), "total": selected.count(q), "limit": limit, "offset": offset}
 
     @app.post("/api/concepts")
     async def concept_candidates(body: ConceptRequest):
         try:
-            return await run_in_threadpool(catalog.concept_candidates, body.sbcData, body.solverPolicy, body.limit)
+            selected = get_catalog(body.gameYear, body.platform)
+            return await run_in_threadpool(selected.concept_candidates, body.sbcData, body.solverPolicy, body.limit)
         except (ValueError, TypeError, KeyError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -135,7 +157,7 @@ def create_app(data_dir=None):
             raise HTTPException(409, "A database update is already running.")
         def work():
             try:
-                return catalog.sync(max_pages=body.maxPages)
+                return get_catalog(body.gameYear, body.platform).sync(max_pages=body.maxPages)
             except Exception as exc:
                 logging.exception("Public catalog sync failed")
                 raise HTTPException(502, f"Database update failed; existing data was kept. {exc}") from exc
@@ -143,25 +165,10 @@ def create_app(data_dir=None):
                 sync_lock.release()
         return await run_in_threadpool(work)
 
-    def solve_work(body):
+    def solve_work(body, progress=None):
         logger.clear_logs()
         try:
-            policy = dict(body.solverPolicy)
-            policy.setdefault("ratingFallbackPrices", catalog.rating_fallbacks())
-            enriched = catalog.enrich(body.clubPlayers)
-            result = setup.runAutoSBC(body.sbcData, enriched, body.maxSolveTime, policy)
-            payload = json.loads(result.body) if isinstance(result, Response) else result
-            payload["database"] = catalog.status()
-            payload["reviewRequired"] = True
-            diagnostics = payload.setdefault("diagnostics", {})
-            diagnostics["optimalityScope"] = "Provided eligible player pool with supported metadata."
-            coverage = body.sbcData.get("conceptCoverage")
-            if isinstance(coverage, dict):
-                diagnostics["conceptCoverage"] = coverage
-                if not coverage.get("complete", False):
-                    diagnostics.setdefault("warnings", []).append(
-                        "Konsept havuzu sınırlıdır; sonuç veritabanındaki tüm kartlar arasındaki optimumu kanıtlamaz.")
-            return payload
+            return planner.plan(body, get_catalog(body.gameYear, body.platform), progress)
         except (ValueError, TypeError, KeyError) as exc:
             logger.add_log(f"Invalid solve input: {exc}")
             raise HTTPException(422, str(exc)) from exc
@@ -200,7 +207,10 @@ def create_app(data_dir=None):
             jobs[job_id] = {"status": "running", "created": time.monotonic()}
         def work():
             try:
-                result = solve_work(body)
+                def progress(value):
+                    with jobs_lock:
+                        jobs[job_id]["progress"] = value
+                result = solve_work(body, progress)
                 update = {"status": "done", "result": result}
             except HTTPException as exc:
                 update = {"status": "error", "detail": exc.detail, "statusCode": exc.status_code}
@@ -238,8 +248,8 @@ def create_app(data_dir=None):
         return {"status": "success"}
 
     @app.get("/conceptPlayers.csv")
-    def concept_csv():
-        return Response(catalog.csv_text(), media_type="text/csv",
+    def concept_csv(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        return Response(get_catalog(gameYear, platform).csv_text(), media_type="text/csv",
                         headers={"Content-Disposition": "inline; filename=conceptPlayers.csv"})
 
     @app.get("/allPlayers.csv")

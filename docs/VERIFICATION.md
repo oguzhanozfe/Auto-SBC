@@ -28,6 +28,7 @@ The public catalog is a separate path: unauthenticated FUT.GG definition API + v
 | `backend/optimize.py` | Compatibility adapter around the model. |
 | `backend/setup.py` | Legacy plus structured solver response contract. |
 | `backend/catalog.py` | SQLite, public sync, provenance, freshness, CSV compatibility. |
+| `backend/planner.py` | Season-scoped owned + market orchestration, progressive pools, retained quote proofs and coverage. |
 | `backend/main.py` | Local API, request bounds, single active solve, expiring jobs, static dashboard. |
 | `backend/logger.py` | Bounded in-memory diagnostics. |
 | `frontend/policy.js` | Browser-side locks, policy and response validation. |
@@ -66,3 +67,11 @@ No telemetry or automatic inventory dump is enabled. The service retains a bound
 These are synthetic developer benchmarks, not timings from the user's club. The final model retains all admissible candidates; a smaller diverse pool supplies only a feasibility warm start. Equal primary-cost squads prefer more chemistry and in-position players.
 
 Supported profiles include standard chemistry and complete supplied type-1 local contributions/full-chemistry flags. Unknown global/type-2 profile semantics remain unsupported. Full catalog normalization accepted all 28,501 downloaded records: 24,250 base cards had supported standard chemistry; 4,251 specials require additional live profile metadata. Public data does not expose EA rarity-group arrays.
+
+## Club + market verification (2026-09-08)
+
+118 Python regressions currently pass, including separate purchase budgets, strict concept price freshness/source/season,9 owned + 2 concept and11 concept-only chemistry squads, expanding an initially infeasible pool, keeping selected quote proofs when later prices change, and unknown metadata/status correctness. Browser-side tests validate every selected concept against server catalog proof and the complete shopping list before exposing a review.
+
+An actual FC26 public-catalog run with an empty club,75 rating requirement and 15 second limit considered 16,168 eligible market concepts, found an 11-card squad with2,500 coin purchase cost, and finished in 15.2 seconds. It was feasible; minimum cost was not proven. Chrome showed the shopping list, card IDs, quantities, separate 5,000 weighted score and 2,500 actual cash spend. FC27 selection showed 20,710 cards and 0 usable prices without a season fallback. No actual purchases or EA actions were performed.
+
+FC27 source manifest: https://r2.fut.gg/27/manifest.json. Console/PC price indexes both had 20,710 entries with no positive market quotes. Source publication 2026-09-03T08:58:19Z; checked 2026-09-08. Public card source totals sum to 20,696 but source responses contain 20,710 unique definitions; the 90–94 band returns 14 cards while declaring total 0. Local status exposes observed and reported totals plus warnings.

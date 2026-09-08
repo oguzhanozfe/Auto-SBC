@@ -240,3 +240,141 @@ def test_sbc_specific_pool_preserves_required_nationality_and_unknown_groups_sta
     unknown = catalog.concept_candidates(concept_sbc([request]), {'allowConcept': True}, 30)
     assert unknown['players'] == []
     assert unknown['coverage']['excludedCounts']['unknownRarityGroups'] == 100
+
+
+def test_season_and_platform_quotes_never_cross_even_when_definition_ids_match(tmp_path):
+    fc26 = Catalog(tmp_path, game_year=26, platform='ps5')
+    fc27 = Catalog(tmp_path, game_year=27, platform='ps5')
+    pc = Catalog(tmp_path, game_year=26, platform='pc')
+    seed_candidates(fc26, [player(10)], amounts={10: 500})
+    next_season = player(10); next_season['game'] = '27'
+    seed_candidates(fc27, [next_season], amounts={10: None})
+    seed_candidates(pc, [player(10)], amounts={10: 1700})
+    assert fc26.search()[0]['marketPrice'] == 500
+    assert pc.search()[0]['marketPrice'] == 1700
+    future = fc27.search()[0]
+    assert future['marketPrice'] is None and future['quoteReady'] is False
+    assert future['gameYear'] == future['priceGameYear'] == 27
+    assert future['platform'] == future['pricePlatform'] == 'ps5'
+    assert fc27.status()['readiness'] == 'awaiting_market_prices'
+    assert fc27.status()['readyForConcepts'] is False
+    assert fc27.concept_candidates(concept_sbc(), {'allowConcept': True})['players'] == []
+    with pytest.raises(ValueError, match='seasons'):
+        fc26.enrich([{'definitionId': 10, 'gameYear': 27}])
+    with pytest.raises(ValueError, match='platforms'):
+        fc26.enrich([{'definitionId': 10, 'pricePlatform': 'pc'}])
+    with pytest.raises(ValueError, match='seasons'):
+        fc27.enrich([{'definitionId': 10, 'priceGameYear': 26, 'marketPrice': 500}])
+
+
+def test_copied_database_cannot_be_relabelled_as_another_season(tmp_path):
+    import shutil
+    original = Catalog(tmp_path, game_year=26)
+    seed_candidates(original, [player(10)])
+    with original._connect() as db:
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    shutil.copyfile(original.path, tmp_path / 'catalog-fc27-ps5.sqlite3')
+    with pytest.raises(ValueError, match='scope'):
+        Catalog(tmp_path, game_year=27)
+
+
+def test_provider_card_season_is_required_and_verified_before_sync_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr('backend.catalog.time.sleep', lambda seconds: None)
+    session = PublicSession({(80, 1): {'data': [player()], 'total': 1, 'next': None}})
+    catalog = Catalog(tmp_path, game_year=27, session=session)
+    with pytest.raises(ValueError, match='FC26 data for an FC27'):
+        catalog.sync(1)
+    assert catalog.status()['count'] == 0
+    raw = player(); raw.pop('game')
+    with pytest.raises(ValueError, match='missing its game year'):
+        normalize_player(raw, game_year=27, platform='ps5')
+
+
+def test_readiness_distinguishes_unsynced_missing_market_and_stale_quotes(tmp_path):
+    unsynced = Catalog(tmp_path, game_year=27)
+    assert unsynced.status()['readiness'] == 'not_synced'
+    raw = player(10); raw['game'] = '27'
+    seed_candidates(unsynced, [raw], amounts={10: None})
+    assert unsynced.status()['readiness'] == 'awaiting_market_prices'
+    seed_candidates(unsynced, [raw], stale_ids={10})
+    assert unsynced.status()['readiness'] == 'stale_prices'
+    assert unsynced.status()['freshPricedCount'] == 0
+    assert unsynced.concept_candidates(concept_sbc(), {'allowConcept': True})['players'] == []
+    seed_candidates(unsynced, [raw])
+    assert unsynced.status()['readiness'] == 'partial_ready'
+    assert unsynced.status()['freshPricedCount'] == 1
+
+
+def test_large_concept_pool_exact_definition_exclusion_retains_other_versions(tmp_path):
+    catalog = Catalog(tmp_path)
+    raw = [player(i, 50 + i % 45) for i in range(1, 4201)]
+    for item in raw:
+        item['basePlayerEaId'] = item['eaId']
+    raw[1]['basePlayerEaId'] = raw[0]['basePlayerEaId']
+    seed_candidates(catalog, raw)
+    result = catalog.concept_candidates(concept_sbc(), {'allowConcept': True}, limit=12000, excluded_definition_ids=[1])
+    ids = {p['definitionId'] for p in result['players']}
+    assert len(ids) == 4199 and 1 not in ids and 2 in ids
+    assert result['coverage']['complete'] is True
+    assert result['coverage']['excludedOwnedDefinitionCount'] == 1
+    assert result['coverage']['gameYear'] == 26 and result['coverage']['platform'] == 'ps5'
+    assert all(p['gameYear'] == p['priceGameYear'] == 26 for p in result['players'])
+    with pytest.raises(ValueError, match='20000'):
+        catalog.concept_candidates(concept_sbc(), {'allowConcept': True}, limit=20001)
+
+
+def test_future_source_404_is_unavailable_without_falling_back_to_current_season(tmp_path):
+    import requests
+    current = Catalog(tmp_path, game_year=26)
+    seed_candidates(current, [player(10)], amounts={10: 500})
+    class MissingSeason:
+        def get(self, url, **kwargs):
+            response = requests.Response()
+            response.status_code = 404
+            response.url = url
+            response._content = b'Not found'
+            return response
+    future = Catalog(tmp_path, game_year=27, session=MissingSeason())
+    with pytest.raises(requests.HTTPError):
+        future.sync(1)
+    status = future.status()
+    assert status['readiness'] == 'unavailable'
+    assert status['count'] == status['priceIndexCount'] == 0
+    assert future.search() == [] and future.rating_fallbacks() == {}
+    assert current.search()[0]['marketPrice'] == 500
+
+
+def test_csv_preserves_explicit_season_and_platform_quote_provenance(tmp_path):
+    catalog = Catalog(tmp_path, game_year=27, platform='pc')
+    raw = player(10); raw['game'] = '27'
+    seed_candidates(catalog, [raw])
+    row = next(csv.DictReader(io.StringIO(catalog.csv_text())))
+    assert row['gameYear'] == row['priceGameYear'] == '27'
+    assert row['platform'] == row['pricePlatform'] == 'pc'
+    assert row['priceSnapshotAt'] and row['priceFetchedAt']
+
+
+@pytest.mark.parametrize('field,policy_field,target', [
+    ('nationEaId', 'lockedNationIds', 38), ('uniqueClubEaId', 'lockedTeamIds', 111),
+    ('leagueEaId', 'lockedLeagueIds', 13), ('rarityEaId', 'lockedRarityIds', 1),
+])
+def test_concept_pool_honors_paletools_category_protections(tmp_path, field, policy_field, target):
+    catalog = Catalog(tmp_path)
+    first, second = player(10), player(20)
+    first[field] = target
+    second[field] = 0 if field == 'rarityEaId' else target + 1
+    seed_candidates(catalog, [first, second])
+    result = catalog.concept_candidates(concept_sbc(), {'allowConcept': True, policy_field: [str(target)]}, 100)
+    assert [item['definitionId'] for item in result['players']] == [20]
+    assert result['coverage']['excludedCounts']['lockedCategory'] == 1
+
+
+def test_provider_zero_total_with_returned_cards_is_disclosed_not_hidden(tmp_path, monkeypatch):
+    monkeypatch.setattr('backend.catalog.time.sleep', lambda seconds: None)
+    catalog = Catalog(tmp_path, session=PublicSession({(80, 1): {'data': [player(10)], 'total': 0, 'next': None}}))
+    status = catalog.sync(7)
+    assert status['complete'] is True
+    assert status['count'] == status['observedTotal'] == 1
+    assert status['reportedTotal'] == 0
+    assert status['sourceTotalsConsistent'] is False
+    assert len(status['sourceCountWarnings']) == 1

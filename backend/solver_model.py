@@ -277,8 +277,15 @@ def verify_solution(squad, sbc, policy, chemistry_mode):
         actual = {identifier(row[field]) for row in squad}
         if actual & set(policy[f"locked{name}Ids"]) or not set(policy[f"required{name}Ids"]) <= actual:
             raise RuntimeError("Solver violated a protected or required player constraint")
+    for field, name in (("nationId", "Nation"), ("teamId", "Team"), ("leagueId", "League"), ("rarityId", "Rarity")):
+        if {identifier(row[field]) for row in squad} & set(policy[f"locked{name}Ids"]):
+            raise RuntimeError("Solver violated a protected player category")
     if policy.get("maxTotalPrice") is not None and sum(row["marketPrice"] for row in squad) > policy["maxTotalPrice"] + 0.001:
         raise RuntimeError("Solver violated the total market cost budget")
+    if policy.get("maxPurchasePrice") is not None and sum(row["marketPrice"] for row in squad if row["concept"]) > policy["maxPurchasePrice"] + 0.001:
+        raise RuntimeError("Solver violated the purchase coin budget")
+    if any(row["concept"] and not row.get("purchaseQuoteVerified") for row in squad):
+        raise RuntimeError("Solver returned a purchase without a verified market quote")
     if chemistry_mode:
         computed = calculate_chemistry(squad, sbc)
         if computed != [row["Chemistry"] for row in squad]:
@@ -373,6 +380,9 @@ def solve_rows(rows, sbc, policy, max_solve_time, diagnostics, _warm_start=True)
         # Ceiling each player's cents makes the budget conservative.
         costs = [math.ceil(row["marketPrice"] * 100) for row in rows]
         model.Add(sum(cost * var for cost, var in zip(costs, selected)) <= math.floor(policy["maxTotalPrice"] * 100))
+    if policy.get("maxPurchasePrice") is not None:
+        purchase_costs = [math.ceil(row["marketPrice"] * 100) if row["concept"] else 0 for row in rows]
+        model.Add(sum(cost * var for cost, var in zip(purchase_costs, selected)) <= math.floor(policy["maxPurchasePrice"] * 100))
     chemistry_mode = any(req["requirementKey"] in CHEMISTRY_KEYS for req in sbc["constraints"])
     unsupported = []
     unknown_groups = []

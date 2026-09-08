@@ -1,6 +1,8 @@
-# Auto-SBC Studio · FC 26
+# Auto-SBC Studio · Club + Market / FC 26–27
 
 A local SBC maker built from [Oğuzhan Özdemir’s Auto-SBC fork](https://github.com/oguzhanozfe/Auto-SBC), originally [titiroMonkey/Auto-SBC](https://github.com/titiroMonkey/Auto-SBC) (MIT). The original solver and EA adapter work retain their attribution. This update independently implements market-aware costs and duplicate preference described publicly by SBC Monkey; it does not use its paid backend or proprietary code.
+
+Its central workflow combines owned cards with purchasable concept cards and produces a priced shopping list, including for an empty club. It searches a growing market pool within the time budget, keeps the best verified squad and distinguishes cash spend from the value of owned cards.
 
 The project includes a Python constraint solver, a local Turkish dashboard, a SQLite public player/price catalog, and a browser companion generated as a userscript and Chrome extension. **It prepares a reviewable squad. EA submission stays manual.**
 
@@ -24,18 +26,26 @@ Download the userscript from the dashboard’s **Kurulum** page, or load `dist/c
 ## Fetch the database
 
 ```sh
-.venv/bin/python scripts/sync_catalog.py --max-pages 1000
+.venv/bin/python scripts/sync_catalog.py --game-year 26 --max-pages 1000
+.venv/bin/python scripts/sync_catalog.py --game-year 27 --max-pages 1000
+# Refresh only market quotes, without rescanning cards:
+.venv/bin/python scripts/sync_catalog.py --game-year 27 --prices-only
 ```
 
-The sync downloads versioned public FUT.GG market-price snapshots and a resumable, paced card catalog, splitting rating bands to avoid the provider’s result cap. Source publication time, fetch time, price freshness, coverage and errors are visible in the dashboard and `/api/database/status`. Default platform is **PS5/console**; a separate PC cache can be built with the sync script’s `--platform pc` option. Set `AUTOSBC_PLATFORM=pc` to serve and solve against that cache.
+The sync downloads versioned public FUT.GG market-price snapshots and a resumable, paced card catalog, splitting rating bands to avoid the provider’s result cap. Source publication time, fetch time, price freshness, coverage and errors are visible in the dashboard and `/api/database/status`. Default platform is **PS5/console**; a separate PC cache can be built with the sync script’s `--platform pc` option. Select the season and console/PC market in either UI. Requests explicitly carry `gameYear` and `platform`; the service keeps independent caches and rejects cross-season/cross-platform labels. `AUTOSBC_GAME_YEAR` and `AUTOSBC_PLATFORM` only change server defaults.
 
-Public catalog cards are concepts, never owned inventory. Missing prices remain unknown. SBC acquisition cost and objective prices are not used as market quotes. Fresh prices from similarly rated cards provide a conservative P60 estimate when no market quote exists; the estimate is labeled. Stale snapshots are excluded from optimizer quotes after six hours by default, including stale prices in imported JSON.
+Public catalog cards are concepts, never owned inventory. Missing prices remain unknown. SBC acquisition cost and objective prices are not used as market quotes. Fresh prices from similarly rated **owned** cards may provide a labeled P60 opportunity-cost estimate. **A concept requires a positive, sourced, dated and fresh market quote from its selected season/platform; estimates can never enter a shopping list.** Stale snapshots are excluded from optimizer quotes after six hours by default, including stale prices in imported JSON.
 
 The dashboard refresh button processes ten pages and resumes on the next run. The command above completes a full pass when the provider is available. Nothing logs in to an EA account to fetch the public catalog. The proprietary SBC Monkey database is not available to this project.
+
+As checked on 2026-09-08, the FC27 public catalog has **20,710 cards**, but both console and PC price snapshots contain **zero usable market prices**. The UI reports `awaiting_market_prices`, and FC27 purchase suggestions remain unavailable. FC26 prices are never substituted. This is data preparation for FC27, not a claim of live FC27 Web App compatibility.
 
 ## What changed
 
 - Independent cost weights: duplicate untradeable **10%**, other untradeable **70%**, tradeable **100%**, concept **200%** of market value; all configurable.
+- Server-side concept retrieval expands through 750 / 2,500 / 6,000 / 12,000 / 20,000 diversified candidates within the solve budget. Coverage and metadata gaps are reported; a small-pool optimum is not a global market optimum.
+- `maxPurchasePrice` limits cash spend separately from `maxTotalPrice` (owned opportunity value plus purchases). Selected concepts have exact card IDs, quantities, prices, source timestamps and links in `shoppingList`. Buy manually, refresh the club and solve again before applying.
+- Hard nation/team/league/rarity locks from Paletools apply to market cards too.
 - Hard item/athlete/definition locks, required players, loan/evolution/special protection, rating and market budgets, and storage-only selection. Duplicate priority never overrides a lock.
 - Constraint model supports rarity groups, quality/rating/card counts, league/nation/club requirements, alternative positions and supported chemistry profiles. It never quietly ignores unknown requirements.
 - Physical-item and athlete identities stay separate. Multiple versions of one athlete cannot fill a squad together. Rarity-group membership stays intact.

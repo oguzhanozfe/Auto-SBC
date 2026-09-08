@@ -21,3 +21,4 @@ data/
 .env
 coverage.xml
 htmlcov/
+work/

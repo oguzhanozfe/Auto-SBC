@@ -169,5 +169,31 @@ def test_concept_endpoint_validates_and_forwards_sbc_policy(client, monkeypatch)
     assert result.status_code == 200
     assert result.json()['coverage']['complete']
     assert calls[0] == (body['sbcData'], body['solverPolicy'], 200)
-    body['limit'] = 3001
+    body['limit'] = 20001
     assert client.post('/api/concepts', json=body).status_code == 422
+
+
+def test_scope_isolation_and_mismatch_rejected(client):
+    assert client.get('/health?gameYear=27&platform=pc').json()['database']['gameYear'] == 27
+    assert client.get('/health?gameYear=27&platform=pc').json()['database']['platform'] == 'pc'
+    assert client.get('/health').json()['database']['gameYear'] == 26
+    assert client.get('/api/players?gameYear=28').status_code == 422
+    body = payload()
+    body['gameYear'] = 27
+    body['clubPlayers'][0]['gameYear'] = 26
+    response = client.post('/solve', json=body)
+    assert response.status_code == 422
+    assert 'differs' in response.json()['detail']
+    assert not client.get('/health').json()['solverBusy']
+
+
+def test_empty_club_waits_for_selected_market_prices(client):
+    body = payload()
+    body.update(gameYear=27, clubPlayers=[], solverPolicy={'allowConcept': True})
+    response = client.post('/solve', json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data['status_key'] == 'MARKET_UNAVAILABLE'
+    assert data['solution'] == []
+    assert data['database']['gameYear'] == 27
+    assert data['shoppingList'] == []

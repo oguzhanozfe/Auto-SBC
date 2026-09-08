@@ -18,7 +18,7 @@ import webbrowser
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements-lock.txt"
 PYTHON_MIN = (3, 12)
-EXPECTED_VERSION = "26.2.0-local"
+EXPECTED_VERSION = "27.0.0-preview"
 
 
 def normalized_name(name):

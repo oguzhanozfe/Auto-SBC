@@ -41,22 +41,42 @@ def runAutoSBC(sbc, players, maxSolveTime, solverPolicy=None):
         return JSONResponse(content={
             "results": "[]", "solution": [], "status": status,
             "status_code": status_code, "status_key": error.code,
-            "diagnostics": diagnostics,
+            "diagnostics": diagnostics, "shoppingList": [], "summary": None,
         })
     for row in solution:
         row.pop("Original_Idx", None)
         row.pop("solverCost", None)
     add_log(status)
     summary = None
+    shopping_list = []
     if solution:
+        owned = [row for row in solution if not row["concept"]]
+        purchases = [row for row in solution if row["concept"]]
+        purchase_cost = round(sum(row["marketPrice"] for row in purchases), 2)
+        shopping_list = [{
+            "definitionId": row["definitionId"], "assetId": row["assetId"],
+            "name": row["name"], "rating": row["rating"],
+            "position": normalized_sbc["formation"][row["squadPosition"]],
+            "squadPosition": row["squadPosition"], "quantity": 1,
+            "marketPrice": row["marketPrice"],
+            "priceSnapshotAt": row.get("priceSnapshotAt") or row.get("priceUpdatedAt"),
+            "priceFetchedAt": row.get("priceFetchedAt"),
+            "source": row.get("marketPriceSource"), "url": row.get("url"),
+            "gameYear": row.get("gameYear", normalized_sbc.get("gameYear")),
+            "platform": row.get("platform", normalized_sbc.get("platform")),
+        } for row in purchases]
         summary = {
             "playerCount": len(solution),
+            "ownedPlayers": len(owned),
             "estimatedRating": squad_rating([row["rating"] for row in solution]) if len(solution) == 11 else None,
             "chemistry": sum(row["Chemistry"] for row in solution) if all(row["Chemistry"] is not None for row in solution) else None,
             "marketCost": round(sum(row["marketPrice"] for row in solution), 2),
+            "purchaseCost": purchase_cost,
+            "purchaseCoins": purchase_cost,
+            "ownedOpportunityCost": round(sum(row["marketPrice"] for row in owned), 2),
             "weightedCost": round(sum(row["price"] for row in solution), 2),
             "duplicatesUsed": sum(bool(row["isDuplicate"] or row["isStorage"]) for row in solution),
-            "conceptPlayers": sum(row["concept"] for row in solution),
+            "conceptPlayers": len(purchases),
             "requiresPurchase": any(row["concept"] for row in solution),
         }
     return JSONResponse(content={
@@ -64,7 +84,7 @@ def runAutoSBC(sbc, players, maxSolveTime, solverPolicy=None):
         "results": json.dumps(solution, ensure_ascii=False, allow_nan=False),
         "solution": solution, "status": status, "status_code": status_code,
         "status_key": diagnostics.get("code", {0: "UNKNOWN", 1: "MODEL_INVALID", 2: "FEASIBLE", 3: "INFEASIBLE", 4: "OPTIMAL"}[status_code]),
-        "diagnostics": diagnostics, "summary": summary,
+        "diagnostics": diagnostics, "summary": summary, "shoppingList": shopping_list,
     })
 
 

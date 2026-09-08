@@ -26,6 +26,21 @@ class Storage {
   setItem(name,value) { this.data.set(name,String(value)); }
 }
 const observable = data => ({ observe(owner,callback) { queueMicrotask(() => callback(this,{success:true,status:200,data})); }, unobserve() {} });
+function marketCard(id=9999, gameYear=26, platform='ps5') {
+  const timestamp=new Date(Date.now()-60000).toISOString();
+  return {id:`concept:${id}`,definitionId:id,assetId:id+10000,name:'Market base card',rating:82,teamId:18,leagueId:13,nationId:18,rarityId:0,
+    possiblePositions:[14],preferredPosition:14,marketPrice:1500,concept:true,priceStale:false,
+    gameYear,platform,priceGameYear:gameYear,pricePlatform:platform,priceSource:'FUT.GG',catalogSource:'https://www.fut.gg/players/',
+    priceSnapshotAt:timestamp,priceFetchedAt:timestamp,url:`https://www.fut.gg/players/${id}/`};
+}
+function marketResult(input, concepts=[marketCard()], ownedCount=10) {
+  const solution=[...input.clubPlayers.slice(0,ownedCount),...concepts].map((player,i)=>({...player,squadPosition:i,marketPriceSource:player.priceSource}));
+  return {status_code:4,solution,conceptCandidates:concepts,conceptCoverage:{returned:1500,totalEligible:19000,complete:false},
+    database:{priceMaxAgeHours:6},summary:{purchaseCost:concepts.reduce((sum,p)=>sum+p.marketPrice,0)},
+    shoppingList:solution.filter(p=>p.concept).map(p=>({definitionId:p.definitionId,assetId:p.assetId,name:p.name,rating:p.rating,quantity:1,
+      squadPosition:p.squadPosition,marketPrice:p.marketPrice,source:p.priceSource,priceSnapshotAt:p.priceSnapshotAt,priceFetchedAt:p.priceFetchedAt,
+      gameYear:p.gameYear,platform:p.platform,url:p.url}))};
+}
 function harness(overrides = {}) {
   const body = new Element('html');
   const localStorage = new Storage(), sessionStorage = new Storage();
@@ -52,7 +67,7 @@ function harness(overrides = {}) {
     UTSquadChemCalculatorUtils:class {getChemProfileForPlayer(){return {maxChem:false,rules:[{calculationType:1,contribution:1,parameterId:1},{calculationType:1,contribution:1,parameterId:2},{calculationType:1,contribution:1,parameterId:3}]};}normalizeClubId(id){return id;}},
     SBCEligibilityKey:{1:'NUMBER_OF_PLAYERS'},SBCEligibilityScope:{0:'EXACT'},
     fetch: async (url, options) => {
-      let result={status:'ok',database:{count:20000}};
+      let result={status:'ok',database:{count:20000,pricedCount:overrides.noPrices?0:10000,readyForConcepts:!overrides.noPrices,readiness:overrides.noPrices?'awaiting_market_prices':'ready'}};
       if (url.endsWith('/api/concepts')) {
         conceptRequests.push(JSON.parse(options.body));
         result = overrides.concepts || {players:[],coverage:{returned:0,totalEligible:0,complete:true}};
@@ -73,8 +88,8 @@ function harness(overrides = {}) {
   const visit = element => { elements.push(element);element.children.forEach(visit);if(element.shadowRoot)visit(element.shadowRoot);}; visit(body);
   const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
   const selects = elements.filter(element=>element.tag==='select');
-  const refresh = async () => { await button('SBC listesini yükle').click(); selects[0].value='20'; await Promise.all(selects[0].listeners.change.map(callback=>callback())); selects[1].value='10'; };
-  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,localStorage};
+  const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('SBC listesini yükle').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,localStorage,selects};
 }
 test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
   const h=harness(); await h.refresh();
@@ -109,21 +124,18 @@ test('cancelled solve cannot restore an actionable preview', async () => {
   assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
   assert.deepEqual(h.writes,[]);
 });
-test('concept pool uses filtered endpoint and preserves explicit bounded coverage', async () => {
-  const concept={id:'concept:9999',definitionId:9999,assetId:8888,name:'Market base card',rating:82,teamId:18,leagueId:13,nationId:18,rarityId:0,possiblePositions:[14],preferredPosition:14,marketPrice:1500,concept:true};
-  const h=harness({concepts:{players:[concept],coverage:{returned:1,totalEligible:15000,complete:false}},
-    solve:input=>({status_code:4,solution:[...input.clubPlayers.filter(p=>!p.concept).slice(0,10),...input.clubPlayers.filter(p=>p.concept).slice(0,1)].map((player,i)=>({...player,squadPosition:i}))})});
+test('mixed solve validates server-selected concepts and shows a scoped shopping list', async () => {
+  const h=harness({solve:input=>marketResult(input)});
   await h.refresh();
-  const label=h.elements.find(element=>element.tag==='label'&&element.textContent.includes('Konsept kart önerilerini'));
-  label.children.find(element=>element.tag==='input').checked=true;
   await h.button('Çöz ve önizle').click();
-  assert.equal(h.conceptRequests.length,1);
-  assert.equal(h.conceptRequests[0].limit,1500);
-  assert.equal(h.conceptRequests[0].solverPolicy.protectSpecial,true);
-  assert.equal(h.requests[0].clubPlayers.filter(p=>p.concept).length,1);
-  assert.equal(h.requests[0].sbcData.conceptCoverage.totalEligible,15000);
+  assert.equal(h.conceptRequests.length,0);
+  assert.equal(h.requests[0].gameYear,26);
+  assert.equal(h.requests[0].platform,'ps5');
+  assert.equal(h.requests[0].solverPolicy.allowConcept,true);
+  assert.equal(h.requests[0].clubPlayers.filter(p=>p.concept).length,0);
   assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
-  assert.ok(h.elements.some(element=>element.textContent.includes('sınırlı bir aday havuzu')));
+  assert.ok(h.elements.some(element=>element.textContent.includes('Alışveriş listesi')));
+  assert.ok(h.elements.some(element=>element.textContent.includes('Satın alma toplamı: 1,500 coin')));
   assert.deepEqual(h.writes,[]);
 });
 test('missing owned rarity groups remain unknown in exported solve input', async () => {
@@ -133,4 +145,31 @@ test('missing owned rarity groups remain unknown in exported solve input', async
   assert.equal(Object.hasOwn(h.requests[0].clubPlayers[0],'groups'),false);
   assert.equal(h.requests[0].clubPlayers[1].rarityGroupsKnown,false);
   assert.equal(h.requests[0].clubPlayers[2].rarityGroupsKnown,true);
+});
+test('empty club can request a fully priced market squad without inventing ownership', async () => {
+  const concepts=Array.from({length:11},(_,i)=>marketCard(9999+i));
+  const h=harness({solve:input=>marketResult(input,concepts,0)});h.players.length=0;
+  await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].clubPlayers.length,0);
+  assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
+  assert.ok(h.elements.some(element=>element.textContent.includes('0 kulüp kartı + 11 alınacak kart')));
+  assert.deepEqual(h.writes,[]);
+});
+test('FC27 without market prices keeps owned-only solves and reports missing quotes', async () => {
+  const h=harness({gameYear:27,noPrices:true});await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].gameYear,27);
+  assert.ok(h.elements.some(element=>element.textContent.includes('FC 27 / PS5 için güncel piyasa fiyatı henüz hazır değil')));
+  assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,false);
+});
+test('season choice is required before sending club data', async () => {
+  const h=harness();await h.refresh();h.selects[0].value='';await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+});
+test('market purchase limit is separate from owned opportunity cost', async () => {
+  const h=harness({solve:input=>marketResult(input)});await h.refresh();
+  const budget=h.elements.find(element=>element.tag==='label'&&element.textContent.startsWith('Satın alma bütçesi')).children.find(element=>element.tag==='input');
+  budget.value=1000;await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].solverPolicy.maxPurchasePrice,1000);
+  assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
+  assert.ok(h.elements.some(element=>element.textContent.includes('purchase budget')));
 });

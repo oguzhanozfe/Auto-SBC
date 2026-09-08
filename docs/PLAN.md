@@ -1,10 +1,10 @@
 # Auto-SBC Studio development plan
 
-Updated 2026-09-08. Target: the user’s FC 26 Auto-SBC fork working beside Paletools, with independently implemented SBC Monkey-style selection. No OpenSpec dependency.
+Updated 2026-09-08. Target: the user’s Auto-SBC fork working beside Paletools, centered on owned + purchasable concept squads and real prices, including an initially small club during FC27 launch. No OpenSpec dependency.
 
 ## 1. Establish the product behavior — delivered
 
-SBC Monkey is a club-based solver using market values, hard exclusions, chemistry requirements and duplicate preference. Its published monthly $3 plan allows 200 solutions/day. Its solver runs on the provider’s backend; the extension fills a reviewable suggestion and the user submits manually. Our implementation computes locally without using that backend.
+The key requirement is knowledge of unowned concept cards and their purchase prices. SBC Monkey combines this with hard exclusions, chemistry requirements and duplicate preference. Its published monthly $3 plan allows 200 solutions/day. Its solver runs on the provider’s backend; the extension fills a reviewable suggestion and the user submits manually. Our implementation computes locally without using that backend.
 
 The baseline fork had useful EA adapters and a CP-SAT solver, but combined invasive inventory/pack hooks with incomplete data files, discarded cards above 50k, conflated names and athlete identities, exploded overlapping rarity groups, and wrote club datasets into shared CSV files. These were concrete repair targets.
 
@@ -12,7 +12,7 @@ Acceptance: attribution preserved, actual fork identified, source behavior recor
 
 ## 2. Reliable single-SBC engine — delivered with stated coverage
 
-Keep one physical inventory card per candidate. Model alternative formation positions, athlete uniqueness, all supported requirement scopes, required cards and hard exclusions. Apply costs from raw market quotes with distinct configurable weights for duplicate untradeable / untradeable / tradeable / concept cards. Use conservative, labeled rating-based price estimates only when necessary.
+Keep one physical inventory card per candidate. Model alternative formation positions, athlete uniqueness, all supported requirement scopes, required cards and hard exclusions. Apply costs from raw market quotes with distinct configurable weights for duplicate untradeable / untradeable / tradeable / concept cards. Use conservative, labeled rating-based estimates only for owned opportunity values. Concepts require fresh actual market quotes; never estimate a purchase price.
 
 Return structured status and a squad with slot indices, rating estimate, chemistry where modeled, price provenance, filtered counts and warnings. Unknown rules must not become a successful squad. Preserve the original numeric status and serialized result fields for compatibility.
 
@@ -22,7 +22,7 @@ Acceptance: synthetic regression tests for identity, scope boundaries, rarity ov
 
 Use SQLite to separate public card definitions from market-price snapshots. Fetch public versioned price blobs and paced definition pages, partitioning to avoid provider search caps. Keep actual club IDs distinct from normalized chemistry club IDs. Respect source failures and rate limiting, retain prior valid data, and resume incomplete traversals.
 
-Acceptance: actual data downloaded; publication and fetch times distinct; missing market quotes never zero; SBC acquisition costs excluded; completion matched to provider totals; public cards always concepts. No club ownership or private EA account data fabricated.
+Acceptance: actual data downloaded; publication and fetch times distinct; missing market quotes never zero; SBC acquisition costs excluded; observed traversal and provider counts recorded separately, with discrepancies disclosed; public cards always concepts. No club ownership or private EA account data fabricated.
 
 ## 4. Browser companion and local workspace — delivered; live acceptance pending
 
@@ -32,13 +32,21 @@ The local dashboard offers catalog search, progress/freshness, JSON request impo
 
 Acceptance achieved: isolated policy and mocked EA integration tests; local API integration tests; actual Chrome dashboard flow with sample input. Pending: user-installed extension and authenticated EA preview inspection. Chrome extension-management access was blocked in the agent session, so neither installation nor live-account correctness is claimed.
 
-## 5. Next acceptance gate: live FC 26 compatibility
+## 5. Club + market and FC27 preparation — delivered; launch market pending
+
+The server now adds concepts automatically, accepts an empty club in market mode, expands diversified candidate pools up to 20,000 within the requested time and retains its best verified result with the exact quote proof used. Return a shopping list and cash budget independent of owned-card opportunity costs. Category locks also filter purchased concepts.
+
+FC26 and FC27 console/PC caches are isolated. On 2026-09-08, 20,710 actual game27 public cards are downloaded and matched to the source price index, but neither platform has a positive market quote. Report awaiting_market_prices until a subsequent price refresh supplies real quotes. The provider reports 14 fewer cards than it returns; the status exposes this discrepancy. Never relabel FC26 prices or cards.
+
+Acceptance achieved:9 owned + 2 concept and empty club with 11 concepts with 33 chemistry; separate cash-budget tradeoffs; stale/unknown/objective/nonmarket quote rejection; cross-season and scope guards; progressive expansion; selected quote proof retained across a price update; unknown metadata does not produce a false infeasibility proof. Real FC26 catalog test:75 rating,11 purchases,2,500 coin in 15.2 seconds; feasible, not proven globally cheapest.
+
+## 6. Next acceptance gate: live FC 26 and FC27 compatibility
 
 After installing the generated package, capture a real club/SBC request using the panel’s explicit export. Start with a low-risk SBC preview. Confirm position assignment, available items, market values, Paletools locks and the EA requirement indicator. Compare EA’s displayed squad rating with the model around fractional boundaries. No challenge submission is needed to validate the preview.
 
 Build compact, anonymized fixtures from voluntarily exported data. Record current EA adapter shapes, especially special chemistry profiles and gender-linked club IDs. Support additional calculation types only when semantics are verified. This gate determines whether the fork is ready to replace the user’s daily paid-solver workflow.
 
-## 6. Subsequent product improvements
+## 7. Subsequent product improvements
 
 | Capability | Concrete acceptance criterion |
 | --- | --- |
@@ -47,8 +55,8 @@ Build compact, anonymized fixtures from voluntarily exported data. Record curren
 | Rich special chemistry | Real profile fixtures covering each EA calculation type; exact contribution and in-position/full-chemistry checks. |
 | Rating calibration | Captured boundary examples verified against EA; keep unknown cases labeled until evidence supports them. |
 | Stronger performance | Repeatable 1k/3k/5k-club benchmarks across rating-only, chemistry and mixed constraints, reporting feasibility time, objective and proof gap. |
-| Broader concept pool | Constraint-aware candidate retrieval with explicit coverage; current browser preview limits concepts to 1,000 catalog cards. |
-| FC 27 | Separate definitions/price cache and verified adapter fixtures; never silently treat FC 26 data as FC 27. |
+| Market search quality | Compare progressively expanded concept pools against offline full-catalog optimum benchmarks on launch-style chemistry SBCs; report actual purchase cost and proof gap. |
+| FC27 launch readiness | Once public quotes arrive, refresh the FC27 cache and validate live adapter/chemistry fixtures before claiming daily-use compatibility. Season isolation is already implemented. |
 
 Prioritize verified single-SBC use before any batch/grind controls. “Best” must be measured by correctness, protected-card behavior, cost quality and practical solve time against known fixtures, rather than a feature count.
 
