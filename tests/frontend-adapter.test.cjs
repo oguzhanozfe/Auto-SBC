@@ -61,7 +61,7 @@ function harness(overrides = {}) {
     document:{documentElement:body,createElement:tag=>new Element(tag),createTextNode:text=>new Element('#text',text)},
     repositories:{TeamConfig:{}},
     services:{SBC:{requestSets:()=>observable({sets:[set]}),requestChallengesForSet:()=>observable({challenges:[challenge]}),loadChallenge:()=>observable(challenge),saveChallenge:()=>{writes.push('saveChallenge');return observable({});}},
-      Club:{search:()=>observable({items:players,retrievedAll:true})},Item:{searchStorageItems:()=>observable({items:[],endOfList:true}),requestUnassignedItems:()=>observable({items:[]})},
+      Club:{clubDao:{resetStatsCache(){}},getStats:()=>observable({}),search:()=>observable({items:players,retrievedAll:true})},Item:{searchStorageItems:()=>observable({items:[],endOfList:true}),requestUnassignedItems:()=>observable({items:[]})},
       Squad:{requestSquadList:()=>observable({}),getActiveSquadId:()=>7,requestSquadById:()=>observable({squad:{_players:activeSquadPlayers}})},
       Localization:{localize:()=> 'Gold Common'},Chemistry:{}},
     UTBucketedItemSearchViewModel:class {constructor(){this.searchCriteria={};}},
@@ -276,4 +276,26 @@ test('storage rarity fallback is consistent and unknown rarity remains protected
   assert.equal(candidates.find(p=>p.id===104).rarityId,1);
   assert.ok(localized.includes('item.raretype3'));
   assert.equal(localized.includes('item.raretypeundefined'),false);
+});
+test('each inventory read refreshes club cache before traversing cumulative search results',async()=>{
+  const h=harness();let refreshed=false,resets=0,stats=0;const offsets=[];
+  h.ctx.services.Club.clubDao.resetStatsCache=()=>{refreshed=true;resets++;};
+  h.ctx.services.Club.getStats=()=>{stats++;return observable({});};
+  h.ctx.services.Club.search=criteria=>{
+    offsets.push(criteria.offset);
+    if(!refreshed)return observable({items:h.players,retrievedAll:false});
+    if(criteria.offset===0)return observable({items:h.players.slice(0,7),retrievedAll:false});
+    refreshed=false;return observable({items:h.players,retrievedAll:true});
+  };
+  await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].clubPlayers.length,12);
+  await h.button('İnceledim · Kadroyu SBC’ye uygula').click();
+  assert.equal(resets,2);assert.equal(stats,2);assert.deepEqual(offsets,[0,91,0,91]);
+  assert.deepEqual(h.writes,['setPlayers','saveChallenge']);
+});
+test('repeated pages after cache refresh still block with source and count diagnostics',async()=>{
+  const h=harness();h.ctx.services.Club.search=()=>observable({items:h.players,retrievedAll:false});
+  await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Club players: offset=91, rows=12, unique=12, retrievedAll=false, endOfList=missing')));
 });

@@ -406,6 +406,17 @@
     }
   }
   async function pages(storage) {
+    if (!storage) {
+      // The upstream EA adapter refreshes club statistics before every inventory
+      // traversal. Otherwise a second traversal can return the already cached
+      // cumulative item list without advancing its retrieval flags.
+      if (typeof services.Club.clubDao?.resetStatsCache !== 'function' || typeof services.Club.getStats !== 'function') {
+        throw new Error('Club cache refresh: EA adapter unavailable. Nothing was applied.');
+      }
+      services.Club.clubDao.resetStatsCache();
+      const refreshed = services.Club.getStats();
+      if (refreshed && typeof refreshed.observe === 'function') await observe(refreshed, 'Refresh club statistics');
+    }
     const found = new Map();
     for (let offset = 0, page = 0; page < 500; page++, offset += 91) {
       const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
@@ -416,7 +427,7 @@
       response.items.forEach(item => { if (item?.id && (!item.isPlayer || item.isPlayer())) found.set(String(item.id), item); });
       status(`Kulüp okunuyor: ${found.size} ${storage ? 'depo' : 'kulüp'} kartı`);
       if (response.retrievedAll || response.endOfList || response.items.length === 0) return [...found.values()];
-      if (before === found.size) throw new Error('EA pagination stopped advancing. Refresh the Web App and try again.');
+      if (before === found.size) throw new Error(`EA pagination stopped advancing. ${storage ? 'SBC storage' : 'Club players'}: offset=${offset}, rows=${response.items.length}, unique=${found.size}, retrievedAll=${response.retrievedAll ?? 'missing'}, endOfList=${response.endOfList ?? 'missing'}. Refresh the Web App and try again.`);
     }
     throw new Error('Club pagination limit reached.');
   }
