@@ -48,7 +48,43 @@ The public catalog is a separate path: unauthenticated FUT.GG definition API + v
 - Generated script and service-worker syntax; dashboard JavaScript syntax.
 - Actual Chrome local dashboard: synthetic pool loaded, solver run, reviewed 11-card output shown, source prices and catalog search inspected.
 
-These checks do not establish correctness against the user’s currently signed-in EA session. No actual SBC submission, market purchase, pack action or account change was performed. Provider timestamps and completeness describe the downloaded snapshot, not a promise that prices remain current.
+These initial checks used synthetic inputs and mocks. The subsequent live verification is recorded below. Provider timestamps and completeness describe the downloaded snapshot, not a promise that prices remain current.
+
+## Live FC26 verification (2026-09-09)
+
+The user installed extension 27.0.1 from commit `3fec1fe`. Auto-SBC solved and
+saved ten Daily Silver Upgrade squads containing owned club cards. Each native
+exchange and reward claim was verified: lifetime completions 4 to 14, remaining
+daily rights 11 to 1. All ten selected cards were normal 65-rated silvers whose
+zero games were checked in EA's player bio. Coin balance remained 577,251; no
+packs were opened or players purchased. This does not establish automatic
+played-history protection or compatibility with every SBC.
+
+A separate concept-enabled run produced Xavier Dziekoński, definition 256953,
+with a 200-coin FUT.GG quote dated 2026-09-08T20:48:25Z. Native market search
+found no listing at 200 and listings starting at 350. The user clarified that
+the test should place the concept directly in the SBC; no purchase completed.
+Version 27.0.2 implements that placement using EA concept search and retains
+the shopping list. It also adds a separate live EA transfer-search mode. Live
+concept placement and search remain pending extension reload.
+
+The market adapter contract was checked against EA's publicly served
+`ocompiled.js?_=10821` and `compiled_3.js?_=10821`: quality is bronze/silver/gold;
+transfer search uses one-based pages and a 20-item page plus one lookahead item;
+Buy Now prices and remaining time come from the auction entity. Searches clear
+the transfer-market cache between changed criteria. The Paletools public script
+documents `disableOverrides` for read-only price searches; the adapter uses it
+without changing Paletools settings. Search performs no bid or purchase call.
+
+Live-mode price observations are kept in the solve request, joined to exact
+catalog definitions, limited to two minutes and never persisted as FUT.GG quotes.
+Missing live results cannot fall back to a public snapshot. Candidate coverage
+is the bounded set of observed listings, not an exhaustive market optimum.
+
+An earlier storage-card Apply returned EA 500; subsequent owned-card saves
+succeeded. Storage Apply remains unresolved. After repeated exchanges, opening
+the SBC later produced an EA null-squad error; a normal page reload restored
+navigation. Neither result is claimed as a general storage or native-cache fix.
 
 ## Known limitations
 

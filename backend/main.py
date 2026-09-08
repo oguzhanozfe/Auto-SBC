@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import logger, setup, planner
 from .catalog import Catalog
+from .live_market import LiveMarket
 
 VERSION = "27.0.0-preview"
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,9 +40,18 @@ class SolveRequest(MarketScope):
     clubPlayers: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
     maxSolveTime: float = Field(default=15, ge=1, le=120, allow_inf_nan=False)
     solverPolicy: dict[str, Any] = Field(default_factory=dict)
+    liveMarket: LiveMarket | None = None
 
     @model_validator(mode="after")
     def require_pool(self):
+        if self.liveMarket is not None:
+            if self.solverPolicy.get("allowConcept") is not True:
+                raise ValueError("liveMarket requires solverPolicy.allowConcept=true")
+            if self.gameYear is not None and self.gameYear != self.liveMarket.gameYear:
+                raise ValueError("liveMarket.gameYear differs from the selected season")
+            if self.platform is not None and self.platform != self.liveMarket.platform:
+                raise ValueError("liveMarket.platform differs from the selected market")
+            self.gameYear, self.platform = self.liveMarket.gameYear, self.liveMarket.platform
         if not self.clubPlayers and self.solverPolicy.get("allowConcept") is not True:
             raise ValueError("Load club players or enable market concepts.")
         return self

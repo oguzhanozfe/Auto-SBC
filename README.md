@@ -2,7 +2,7 @@
 
 A local SBC maker built from [Oğuzhan Özdemir’s Auto-SBC fork](https://github.com/oguzhanozfe/Auto-SBC), originally [titiroMonkey/Auto-SBC](https://github.com/titiroMonkey/Auto-SBC) (MIT). The original solver and EA adapter work retain their attribution. This update independently implements market-aware costs and duplicate preference described publicly by SBC Monkey; it does not use its paid backend or proprietary code.
 
-Its central workflow combines owned cards with purchasable concept cards and produces a priced shopping list, including for an empty club. It searches a growing market pool within the time budget, keeps the best verified squad and distinguishes cash spend from the value of owned cards.
+Its central workflow combines owned cards with purchasable concept cards and produces a priced shopping list, including for an empty club. Reviewed concepts can be placed directly in the EA SBC squad using EA's concept entities. It searches a growing market pool within the time budget, keeps the best verified squad and distinguishes cash spend from the value of owned cards.
 
 The project includes a Python constraint solver, a local Turkish dashboard, a SQLite public player/price catalog, and a browser companion generated as a userscript and Chrome extension. **It prepares a reviewable squad. EA submission stays manual.**
 
@@ -38,13 +38,14 @@ Public catalog cards are concepts, never owned inventory. Missing prices remain 
 
 The dashboard refresh button processes ten pages and resumes on the next run. The command above completes a full pass when the provider is available. Nothing logs in to an EA account to fetch the public catalog. The proprietary SBC Monkey database is not available to this project.
 
-As checked on 2026-09-08, the FC27 public catalog has **20,710 cards**, but both console and PC price snapshots contain **zero usable market prices**. The UI reports `awaiting_market_prices`, and FC27 purchase suggestions remain unavailable. FC26 prices are never substituted. This is data preparation for FC27, not a claim of live FC27 Web App compatibility.
+As checked on 2026-09-08, the FC27 public catalog has **20,710 cards**, but both console and PC FUT.GG snapshots contain **zero usable market prices**. The database reports `awaiting_market_prices`, so snapshot-based FC27 purchase suggestions remain unavailable. The separate live EA mode requires actual listings from the matching signed-in season. FC26 prices are never substituted. Live FC27 Web App compatibility has not been validated.
 
 ## What changed
 
 - Independent cost weights: duplicate untradeable **10%**, other untradeable **70%**, tradeable **100%**, concept **200%** of market value; all configurable.
 - Server-side concept retrieval expands through 750 / 2,500 / 6,000 / 12,000 / 20,000 diversified candidates within the solve budget. Coverage and metadata gaps are reported; a small-pool optimum is not a global market optimum.
-- `maxPurchasePrice` limits cash spend separately from `maxTotalPrice` (owned opportunity value plus purchases). Selected concepts have exact card IDs, quantities, prices, source timestamps and links in `shoppingList`. Buy manually, refresh the club and solve again before applying.
+- **Anlık piyasadan çöz** uses the signed-in EA Web App's transfer search for current bronze, silver or gold listings. Only observed Buy Now quotes enter this mode's concept pool; old FUT.GG prices cannot replace missing live quotes. The local catalog supplies card metadata, while EA supplies the current price. Live quotes expire after two minutes and are not written to the catalog.
+- `maxPurchasePrice` limits quoted purchase cost separately from `maxTotalPrice` (owned opportunity value plus purchases). Selected concepts have exact card IDs, quantities, prices, source timestamps and links in `shoppingList`. Apply resolves each concept through EA's concept search and places the exact card in the SBC. This does not buy the player or make a concept eligible for submission.
 - Hard nation/team/league/rarity locks from Paletools apply to market cards too.
 - Hard item/athlete/definition locks, required players, loan/evolution/special protection, rating and market budgets, and storage-only selection. Duplicate priority never overrides a lock.
 - Constraint model supports rarity groups, quality/rating/card counts, league/nation/club requirements, alternative positions and supported chemistry profiles. It never quietly ignores unknown requirements.
@@ -68,7 +69,7 @@ Tests use synthetic SBCs and a mocked EA adapter. The previous ad hoc tests, deb
 
 ## Practical limits
 
-The live EA account and installed Paletools/Chrome extension have **not** been validated with this revision. Chrome’s extension-management page was blocked during the development session, so installation remains a user step. EA’s private Web App APIs can change. The native iOS/Android Companion apps are not modified.
+On 2026-09-09, version 27.0.1 completed ten Daily Silver Upgrade solve/Apply flows with the user's owned cards; native exchanges and reward claims were also verified. Each consumed card was a normal 65-rated silver with zero games checked in EA's player bio. The concept preview was verified separately. Version 27.0.2 adds native concept placement; its live validation is pending extension reload. One SBC storage candidate returned EA 500 during Apply and remains unresolved. EA's private Web App APIs can change. The native iOS/Android Companion apps are not modified.
 
 The inherited team-rating correction is modeled with exact integer arithmetic, but EA’s complete current rounding specification is not public; the output labels it as an estimate. Unsupported chemistry calculation types or incomplete card metadata are reported rather than guessed. A time limit is not proof that no solution exists. Large chemistry puzzles may require longer solving time.
 

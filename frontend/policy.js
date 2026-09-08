@@ -104,6 +104,18 @@
         Number(candidate.priceGameYear) !== scope.gameYear || candidate.pricePlatform !== scope.platform) throw new Error('Concept quote belongs to another season or platform.');
     const market = Number(candidate.marketPrice);
     const snapshot = Date.parse(candidate.priceSnapshotAt), fetched = Date.parse(candidate.priceFetchedAt);
+    if (candidate.priceSource === 'EA Transfer Market' || input.liveMarket) {
+      const observation = input.liveMarket;
+      const observed = Date.parse(observation?.observedAt), expiry = Date.parse(candidate.liveQuoteExpiresAt);
+      const quote = list(observation?.quotes).filter(item => key(item.definitionId) === key(candidate.definitionId));
+      if (candidate.priceSource !== 'EA Transfer Market' || Number(observation?.gameYear) !== scope.gameYear || observation?.platform !== scope.platform ||
+          quote.length !== 1 || Number(quote[0].buyNowPrice) !== market || market > Number(observation?.searchMaxBuy) ||
+          !Number.isFinite(observed) || observed !== snapshot || fetched !== observed ||
+          !Number.isFinite(expiry) || expiry <= now || expiry <= observed || expiry > observed + 120000 ||
+          observed > now + 5000 || now - observed > 120000) {
+        throw new Error('EA live quote expired or differs from the observed market search. Run a fresh live search.');
+      }
+    }
     const hours = Number(response.database?.priceMaxAgeHours ?? 6);
     if (!Number.isFinite(hours) || hours <= 0 || hours > 24) throw new Error('Invalid market-price freshness policy.');
     if (candidate.priceStale !== false || !Number.isFinite(market) || market <= 0 ||

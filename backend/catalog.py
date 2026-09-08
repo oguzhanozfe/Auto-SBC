@@ -277,6 +277,17 @@ class Catalog:
             return db.execute("SELECT COUNT(*) FROM cards WHERE name LIKE ? ESCAPE '\\' OR CAST(definition_id AS TEXT)=?",
                               (f'%{escaped}%', str(query))).fetchone()[0]
 
+    def definition_records(self, definition_ids):
+        """Read exact card metadata without joining cached purchase prices."""
+        if not isinstance(definition_ids, list) or len(definition_ids) > 500 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in definition_ids):
+            raise ValueError('Definition lookup accepts at most 500 positive integer IDs.')
+        if not definition_ids:
+            return []
+        ids = list(dict.fromkeys(definition_ids))
+        with self._connect() as db:
+            rows = db.execute('SELECT payload FROM cards WHERE definition_id IN (' + ','.join('?' for _ in ids) + ')', ids).fetchall()
+        return [json.loads(row['payload']) for row in rows]
+
     def enrich(self, players):
         """Copy club rows; add only fresh prices. Never overwrite ownership/locks/IDs."""
         enriched = []

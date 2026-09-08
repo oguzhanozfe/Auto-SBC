@@ -49,8 +49,9 @@ function harness(overrides = {}) {
   let jobResult;
   const players = Array.from({length:12},(_,i) => ({id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`},
     rating:80,teamId:18,leagueId:13,nationId:18,rareflag:0,untradeable:true,loans:-1,preferredPosition:14,possiblePositions:[14],groups:[0],
-    isPlayer:()=>true,isSpecial:()=>false,isTimeLimited:()=>false,getTier:()=>3}));
+    isPlayer:()=>true,isSpecial:()=>false,isTimeLimited:()=>false,getTier:()=>3,compareResourceTo(other){return this.assetId===other.assetId;}}));
   const squad = {_formation:{generalPositions:Array(11).fill(14)},simpleBrickIndices:[],_players:Array.from({length:11},()=>({_item:{}})),
+    removeAllItems(keepManager){assert.equal(keepManager,true);writes.push('removeAllItems');this._players=this._players.map(()=>({_item:{id:0,isPlayer:()=>false}}));},
     setPlayers(items) { writes.push('setPlayers'); this._players=items.map(item=>({_item:item})); }};
   const challenge = {id:10,setId:20,name:'Test challenge',status:'IN_PROGRESS',squad,
     eligibilityRequirements:[{scope:0,count:11,kvPairs:{_collection:{1:[11]}}}]};
@@ -96,7 +97,7 @@ function harness(overrides = {}) {
   const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
   const selects = elements.filter(element=>element.tag==='select');
   const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('SBC listesini yükle').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
-  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,activeSquadPlayers,localStorage,selects,nativeOptions,
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,activeSquadPlayers,localStorage,selects,nativeOptions,
     navigate:id=>{activeChallenge=id===null?null:{...challenge,id};}};
 }
 test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
@@ -107,7 +108,7 @@ test('EA integration: solve only reads; reviewed Apply is the only save', async 
   assert.equal(h.requests[0].clubPlayers.length,11);
   assert.deepEqual(h.writes,[]);
   await h.button('İnceledim · Kadroyu SBC’ye uygula').click();
-  assert.deepEqual(h.writes,['setPlayers','saveChallenge']);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
   assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
 });
 test('Paletools lock added after review stops Apply before any mutation', async () => {
@@ -141,7 +142,7 @@ test('mixed solve validates server-selected concepts and shows a scoped shopping
   assert.equal(h.requests[0].platform,'ps5');
   assert.equal(h.requests[0].solverPolicy.allowConcept,true);
   assert.equal(h.requests[0].clubPlayers.filter(p=>p.concept).length,0);
-  assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
+  assert.equal(h.button('Konseptleri kadroya yerleştir').disabled,false);
   assert.ok(h.elements.some(element=>element.textContent.includes('Alışveriş listesi')));
   assert.ok(h.elements.some(element=>element.textContent.includes('Satın alma toplamı: 1,500 coin')));
   assert.deepEqual(h.writes,[]);
@@ -159,14 +160,14 @@ test('empty club can request a fully priced market squad without inventing owner
   const h=harness({solve:input=>marketResult(input,concepts,0)});h.players.length=0;
   await h.refresh();await h.button('Çöz ve önizle').click();
   assert.equal(h.requests[0].clubPlayers.length,0);
-  assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,true);
+  assert.equal(h.button('Konseptleri kadroya yerleştir').disabled,false);
   assert.ok(h.elements.some(element=>element.textContent.includes('0 kulüp kartı + 11 alınacak kart')));
   assert.deepEqual(h.writes,[]);
 });
 test('FC27 without market prices keeps owned-only solves and reports missing quotes', async () => {
   const h=harness({gameYear:27,noPrices:true});await h.refresh();await h.button('Çöz ve önizle').click();
   assert.equal(h.requests[0].gameYear,27);
-  assert.ok(h.elements.some(element=>element.textContent.includes('FC 27 / PS5 için güncel piyasa fiyatı henüz hazır değil')));
+  assert.ok(h.elements.some(element=>element.textContent.includes('FC 27 / PS5 için FUT.GG fiyatları henüz hazır değil')));
   assert.equal(h.button('İnceledim · Kadroyu SBC’ye uygula').disabled,false);
 });
 test('season choice is required before sending club data', async () => {
@@ -291,11 +292,153 @@ test('each inventory read refreshes club cache before traversing cumulative sear
   assert.equal(h.requests[0].clubPlayers.length,12);
   await h.button('İnceledim · Kadroyu SBC’ye uygula').click();
   assert.equal(resets,2);assert.equal(stats,2);assert.deepEqual(offsets,[0,91,0,91]);
-  assert.deepEqual(h.writes,['setPlayers','saveChallenge']);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
 });
 test('repeated pages after cache refresh still block with source and count diagnostics',async()=>{
   const h=harness();h.ctx.services.Club.search=()=>observable({items:h.players,retrievedAll:false});
   await h.refresh();await h.button('Çöz ve önizle').click();
   assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
   assert.ok(h.elements.some(e=>e.textContent.includes('Club players: offset=91, rows=12, unique=12, retrievedAll=false, endOfList=missing')));
+});
+const eaConcept=player=>({id:0,concept:true,definitionId:player.definitionId,assetId:player.assetId,rating:player.rating,rareflag:player.rarityId,isPlayer:()=>true,compareResourceTo(other){return this.assetId===other.assetId;}});
+test('reviewed mixed Apply uses exact EA concept entities and retains the shopping list without spending',async()=>{
+  const concept=marketCard(), raw=eaConcept(concept), searches=[];
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=criteria=>{searches.push([...criteria.defId]);return observable({items:[raw]});};
+  await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.deepEqual(h.writes,[]);await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(searches,[[concept.definitionId]]);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.equal(h.squad._players[10]._item,raw);assert.equal(h.squad._players[0]._item,h.players[0]);
+  assert.equal(h.squad._players[10]._item.concept,true);
+  assert.equal(h.button('Konseptleri kadroya yerleştir').disabled,true);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Alışveriş listesi')));
+  assert.ok(h.elements.some(e=>e.textContent.includes('Coin harcanmadı')));
+});
+test('missing, duplicate, owned and mismatched EA concept results never mutate a squad',async t=>{
+  const concept=marketCard();
+  for(const [name,items] of [
+    ['missing',[]],['duplicate',[eaConcept(concept),eaConcept(concept)]],
+    ['wrong definition',[{...eaConcept(concept),definitionId:1}]],
+    ['wrong athlete',[{...eaConcept(concept),assetId:1}]],
+    ['wrong rating',[{...eaConcept(concept),rating:99}]],
+    ['wrong rarity',[{...eaConcept(concept),rareflag:3}]],
+    ['explicit owned',[{...eaConcept(concept),concept:false}]],
+    ['missing concept flag',[{...eaConcept(concept),concept:undefined}]],
+    ['missing player method',[{...eaConcept(concept),isPlayer:undefined}]],
+    ['missing EA item id',[{...eaConcept(concept),id:undefined}]],
+    ['owned inventory id',[{...eaConcept(concept),id:1}]],
+    ['nonplayer',[{...eaConcept(concept),isPlayer:()=>false}]],
+    ['EA special protection',[{...eaConcept(concept),isSpecial:()=>true}]],
+    ['EA evolution protection',[{...eaConcept(concept),isEvolution:()=>true}]]
+  ]) await t.test(name,async()=>{
+    const h=harness({solve:input=>marketResult(input,[concept])});
+    h.ctx.services.Item.searchConceptItems=()=>observable({items});
+    await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+    assert.deepEqual(h.writes,[]);
+  });
+});
+test('all concepts must resolve before any owned or concept placement',async()=>{
+  const concepts=[marketCard(),marketCard(10000)];
+  const h=harness({solve:input=>marketResult(input,concepts,9)});
+  h.ctx.services.Item.searchConceptItems=criteria=>observable({items:criteria.defId[0]===9999?[eaConcept(concepts[0])]:[]});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);
+});
+test('locks inserted while EA concepts load are rechecked before mutation',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.localStorage.setItem('paletools:2026:account:lockedItems','[9999]');queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('Paletools lock')));
+});
+test('navigation during EA concept resolution stops Apply before squad changes',async()=>{
+  const concept=marketCard(),h=harness({native:true,solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.navigate(11);queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.nativeOptions.onSolveCurrent(h.nativeOptions.resolveContext());await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('SBC ekranı değişti')));
+});
+test('concept quote freshness is rechecked after EA lookup even within preview lifetime',async()=>{
+  const concept=marketCard(),started=Date.now();concept.priceSnapshotAt=new Date(started-(6*60-1)*60000).toISOString();
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.ctx.Date=class extends Date{static now(){return started+2*60000;}};queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('fresh, positive market quote')));
+});
+test('expired concept preview and a wrong initialized challenge both stop before mutation',async t=>{
+  await t.test('preview expired',async()=>{
+    const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});let searches=0;
+    h.ctx.services.Item.searchConceptItems=()=>{searches++;return observable({items:[eaConcept(concept)]});};
+    await h.refresh();await h.button('Çöz ve önizle').click();const future=Date.now()+6*60000;
+    h.ctx.Date=class extends Date{static now(){return future;}};
+    await h.button('Konseptleri kadroya yerleştir').click();assert.equal(searches,0);assert.deepEqual(h.writes,[]);
+  });
+  await t.test('wrong controller challenge',async()=>{
+    const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+    h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+    await h.refresh();await h.button('Çöz ve önizle').click();
+    h.ctx.UTSBCSquadOverviewViewController=class{initWithSBCSet(){this._squad=h.squad;this._challenge={id:999,setId:20};}};
+    await h.button('Konseptleri kadroya yerleştir').click();assert.deepEqual(h.writes,[]);
+  });
+});
+test('a concept cannot displace a preserved reserve version of the same athlete',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  const reserve={...h.players[11],definitionId:99999,assetId:concept.assetId};h.squad._players.push({_item:reserve});
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);assert.equal(h.squad._players[11]._item,reserve);
+});
+test('EA placement omissions block save and clear newly populated slots during rollback',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  const oldItems=h.squad._players.map(slot=>slot._item),originalSet=h.squad.setPlayers;let calls=0;
+  h.squad.setPlayers=function(items){calls++;originalSet.call(this,items);if(calls===1)this._players[10]={_item:{id:0,isPlayer:()=>false}};};
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','removeAllItems','setPlayers']);
+  oldItems.forEach((item,i)=>assert.equal(h.squad._players[i]._item,item));
+});
+function marketSearchHarness(search){
+  const concept={...marketCard(),rating:65};
+  const h=harness({solve:input=>{
+    const observation=input.liveMarket,quote=observation.quotes.find(q=>q.definitionId===concept.definitionId);
+    const proof={...concept,marketPrice:quote.buyNowPrice,priceSource:'EA Transfer Market',priceSnapshotAt:observation.observedAt,priceFetchedAt:observation.observedAt,liveQuoteExpiresAt:new Date(Date.parse(observation.observedAt)+120000).toISOString()};
+    return marketResult(input,[proof]);
+  }});
+  const calls=[],clears=[];
+  Object.assign(h.ctx,{UTSearchCriteriaDTO:class{constructor(){this.type='player';this.count=20;this.offset=0;}},
+    ItemType:{PLAYER:'player'},ItemSearchFeature:{MARKET:'market'},SearchLevel:{BRONZE:'bronze',SILVER:'silver',GOLD:'gold'},ItemRatingTier:{BRONZE:1,SILVER:2,GOLD:3},
+    UTBucketedItemSearchViewModel:class{constructor(){this.searchCriteria={};this.defaultSearchCriteria={};}updateSearchCriteria(value){Object.assign(this.searchCriteria,value);}}});
+  const listing=(extra={})=>({...eaConcept(concept),concept:false,id:7000,getTier:()=>2,
+    getAuctionData:()=>({buyNowPrice:200,isActiveTrade:()=>true,getSecondsRemaining:()=>90,tradeId:'never-send-this'}),...extra});
+  h.ctx.services.Item.clearTransferMarketCache=()=>clears.push(calls.length);
+  h.ctx.services.Item.searchTransferMarket=(query,page)=>{query.offset=(page-1)*20;query.count=21;calls.push({...query,page});return observable({items:search?search(query,page,listing):query.maxBuy<200?[]:[listing()]});};
+  return {...h,calls,clears,listing,concept};
+}
+test('live market mode searches official EA API, resets changed queries and sends only observed quote fields',async()=>{
+  const h=marketSearchHarness();await h.refresh();await h.button('Anlık piyasadan çöz').click();
+  assert.deepEqual(h.calls.map(c=>[c.maxBuy,c.page]),[[150,1],[200,1]]);assert.deepEqual(h.clears,[0,1]);
+  h.calls.forEach(c=>{assert.equal(c.type,'player');assert.equal(c.level,'silver');assert.equal(c.disableOverrides,true);assert.deepEqual([...c.rarities],[0,1]);});
+  const live=h.requests[0].liveMarket;assert.equal(live.pagesRead,2);assert.equal(live.searchMaxBuy,200);
+  assert.deepEqual(live.quotes,[{definitionId:h.concept.definitionId,buyNowPrice:200}]);
+  assert.equal(JSON.stringify(h.requests[0]).includes('never-send-this'),false);
+  assert.equal(h.button('Konseptleri kadroya yerleştir').disabled,false);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Anlık EA piyasası')));
+});
+test('live market ignores expired, inactive, zero-BIN, wrong-tier and protected listings',async()=>{
+  const h=marketSearchHarness((query,page,listing)=>query.maxBuy<200?[]:[
+    listing({getAuctionData:()=>({buyNowPrice:1,isActiveTrade:()=>false,getSecondsRemaining:()=>90})}),
+    listing({getAuctionData:()=>({buyNowPrice:1,isActiveTrade:()=>true,getSecondsRemaining:()=>0})}),
+    listing({getAuctionData:()=>({buyNowPrice:0,isActiveTrade:()=>true,getSecondsRemaining:()=>90})}),
+    listing({getTier:()=>3}),listing({rareflag:3}),listing()
+  ]);
+  await h.refresh();await h.button('Anlık piyasadan çöz').click();assert.deepEqual(h.requests[0].liveMarket.quotes,[{definitionId:h.concept.definitionId,buyNowPrice:200}]);
+});
+test('market pagination uses EA-mutated count and page argument with a nine-request bound',async t=>{
+  await t.test('lookahead page',async()=>{
+    const h=marketSearchHarness((query,page,listing)=>query.maxBuy===150?(page===1?Array.from({length:21},()=>listing({rareflag:3})):[]):[listing()]);
+    await h.refresh();await h.button('Anlık piyasadan çöz').click();assert.deepEqual(h.calls.map(c=>[c.maxBuy,c.page]),[[150,1],[150,2],[200,1]]);assert.deepEqual(h.clears,[0,2]);
+  });
+  await t.test('bounded full pages',async()=>{
+    const h=marketSearchHarness((query,page,listing)=>Array.from({length:21},()=>listing({rareflag:3})));
+    await h.refresh();await h.button('Anlık piyasadan çöz').click();assert.equal(h.calls.length,9);assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  });
 });

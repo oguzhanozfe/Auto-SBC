@@ -27,10 +27,10 @@ Tarayıcı paketinde piyasa fiyatlarını indiren bir sağlayıcı bağlantısı
 | Günlük son hakkı bitince toplam sayaç kaybolabiliyor | Eksik değer sıfır sayılmıyor. |
 | Özel kartlar oynanmış olsa da seçilebiliyor | Özel/evolution koruması varsayılan açık; aktif kadro ayrıca korunur. |
 
-Konsept içeren Auto-SBC sonucu alışveriş listesi olarak kalır. Tamamı sahip olunan kadro açıkça Uygula seçildiğinde kaydedilir; bu sürüm son teslimi, satın almayı veya paket açmayı otomatik yapmaz.
+27.0.2 sürümünde konsept sonuç, incelemeden sonra **Konseptleri kadroya yerleştir** ile EA SBC ekranına yerleştirilebilir. Her kart tam tanım kimliğiyle EA'nın konsept aramasından alınır; sahte sahiplik oluşturulmaz. Fiyat ve alışveriş listesi panelde kalır. Bu işlem satın alma veya SBC teslimi yapmaz.
 
 ## Doğrulama sınırı
 
-Canlı EA ekranında Monkey davranışları gözlemlendi. Bizim uzantının mevcut hesaba kurulması ve EA veri şeklinin canlı doğrulanması henüz tamamlanmadı. Tarayıcının uzantı yönetimine ajan erişimi engellendiğinden kurulum kullanıcı adımı olarak kaldı.
+Kullanıcının kurduğu 27.0.1 sürümüyle 10 Daily Silver Upgrade çözüldü, uygulandı, EA'dan teslim edildi ve ödüller alındı. Kullanılan kartların her biri 65 reytingli ve sıfır maçlıydı. Konsept önizlemesi ayrıca 65 Xavier Dziekoński için 200 coin kaynak fiyatı üretti; canlı piyasada gözlenen en düşük ilan 350 coindi. Kart satın alınmadı, bakiye 577.251 olarak kaldı. 27.0.2 konsept yerleştirmesinin canlı doğrulaması uzantı yenilenmesini bekliyor. Depodaki bir kartın kaydı EA 500 verdi; bu konu açık.
 
 Oynanmış bütün kartları otomatik tespit etme henüz uygulanmadı. Public Monkey akışında da maç geçmişi alanı bulunmadı. Aktif kadro/özel/evolution/kilit korumaları maç geçmişi korumasının yerine geçtiği iddiasıyla sunulmamalı. Sonraki canlı bağlantıda gerçek EA alanı doğrulanmalı ve oynanmış kartlar fiyat cezası yerine kesin dışlama kuralıyla korunmalı.

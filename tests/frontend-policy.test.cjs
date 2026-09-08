@@ -112,3 +112,21 @@ test('Paletools category locks also protect server-selected market cards', () =>
   const {input,response}=mixedFixture();
   assert.throws(()=>P.validateSolution(response,input,P.normalizePolicy({lockedRarityIds:[0]})),/Locked/);
 });
+function liveFixture(){
+  const f=mixedFixture(),observedAt=new Date(Date.now()-10000).toISOString();
+  Object.assign(f.candidate,{priceSource:'EA Transfer Market',priceSnapshotAt:observedAt,priceFetchedAt:observedAt,liveQuoteExpiresAt:new Date(Date.parse(observedAt)+120000).toISOString()});
+  f.input.liveMarket={gameYear:27,platform:'pc',observedAt,quality:'silver',searchMaxBuy:2000,pagesRead:1,quotes:[{definitionId:f.candidate.definitionId,buyNowPrice:1000}]};
+  f.response.solution[1]={...f.response.solution[1],...f.candidate,marketPriceSource:'EA Transfer Market'};
+  f.response.shoppingList[0]={...f.response.shoppingList[0],...f.candidate,source:'EA Transfer Market'};
+  return f;
+}
+test('EA live concepts require matching browser-observed quotes and expire within 120 seconds',()=>{
+  const f=liveFixture();assert.equal(P.validateSolution(f.response,f.input,P.normalizePolicy())[1].player.priceSource,'EA Transfer Market');
+  for(const alter of [
+    f=>{delete f.input.liveMarket;},f=>{f.input.liveMarket.quotes[0].buyNowPrice=999;},
+    f=>{f.input.liveMarket.searchMaxBuy=999;},f=>{f.input.liveMarket.gameYear=26;},
+    f=>{f.candidate.liveQuoteExpiresAt=new Date(Date.now()-1).toISOString();},
+    f=>{f.candidate.liveQuoteExpiresAt=new Date(Date.parse(f.input.liveMarket.observedAt)+121000).toISOString();},
+    f=>{f.candidate.priceSource='FUT.GG';},f=>{f.candidate.priceFetchedAt=new Date(Date.now()).toISOString();}
+  ]){const fixture=liveFixture();alter(fixture);assert.throws(()=>P.validateSolution(fixture.response,fixture.input,P.normalizePolicy()),/EA live quote/);}
+});

@@ -1,6 +1,6 @@
 # Auto-SBC Studio development plan
 
-Updated 2026-09-08. Target: the user’s Auto-SBC fork working beside Paletools, centered on owned + purchasable concept squads and real prices, including an initially small club during FC27 launch. No OpenSpec dependency.
+Updated 2026-09-09. Target: the user’s Auto-SBC fork working beside Paletools, centered on owned + purchasable concept squads and real prices, including an initially small club during FC27 launch. No OpenSpec dependency.
 
 ## 1. Establish the product behavior — delivered
 
@@ -24,13 +24,13 @@ Use SQLite to separate public card definitions from market-price snapshots. Fetc
 
 Acceptance: actual data downloaded; publication and fetch times distinct; missing market quotes never zero; SBC acquisition costs excluded; observed traversal and provider counts recorded separately, with discrepancies disclosed; public cards always concepts. No club ownership or private EA account data fabricated.
 
-## 4. Browser companion and local workspace — delivered; live acceptance pending
+## 4. Browser companion and local workspace — owned-card live flow verified
 
 Generate userscript and Manifest V3 extension from the same modules. Read saved Paletools locks conservatively without patching its prototypes. Choose SBC, collect a snapshot, calculate a local background job, inspect result and explicitly apply. Before Apply, re-read locks and inventory and check challenge identity. Submission remains in native EA controls.
 
 The local dashboard offers catalog search, progress/freshness, JSON request import, adjustable cost/protection controls, a synthetic demo and solution export. Restrict local API origins and body sizes, allow only one active solve and retain only a few short-lived result snapshots in memory.
 
-Acceptance achieved: isolated policy and mocked EA integration tests; local API integration tests; actual Chrome dashboard flow with sample input. Pending: user-installed extension and authenticated EA preview inspection. Chrome extension-management access was blocked in the agent session, so neither installation nor live-account correctness is claimed.
+Acceptance achieved: isolated policy and mocked EA integration tests; local API integration tests; actual Chrome dashboard flow; ten authenticated Daily Silver solve/Apply flows followed by native exchanges and reward claims. The user installed the extension. Concept preview is also verified. Native concept placement in 27.0.2 requires extension reload and a live check. Storage Apply and automatic played-history detection remain open.
 
 ## 5. Club + market and FC27 preparation — delivered; launch market pending
 

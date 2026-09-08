@@ -8,6 +8,7 @@ from fastapi.responses import Response
 
 from . import setup
 from .solver_policy import flag, identifier, normalize_policy
+from .live_market import plan_live
 
 
 def validate_scope(body, catalog):
@@ -33,6 +34,8 @@ def plan(body, catalog, progress=None):
         raise ValueError("Load club players or enable market concepts.")
     sbc = {**body.sbcData, "gameYear": catalog.game_year, "platform": catalog.platform}
     sbc.pop("conceptCoverage", None)  # Server computes coverage itself.
+    if getattr(body, "liveMarket", None) is not None:
+        return plan_live(body, catalog, owned, policy, sbc, progress)
     limits = (750, 2500, 6000, 12000, 20000) if policy.get("allowConcept") else (0,)
     candidates, stages = {}, []
     best, last, best_coverage = None, None, None

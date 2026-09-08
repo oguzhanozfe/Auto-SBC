@@ -105,6 +105,18 @@
         Number(candidate.priceGameYear) !== scope.gameYear || candidate.pricePlatform !== scope.platform) throw new Error('Concept quote belongs to another season or platform.');
     const market = Number(candidate.marketPrice);
     const snapshot = Date.parse(candidate.priceSnapshotAt), fetched = Date.parse(candidate.priceFetchedAt);
+    if (candidate.priceSource === 'EA Transfer Market' || input.liveMarket) {
+      const observation = input.liveMarket;
+      const observed = Date.parse(observation?.observedAt), expiry = Date.parse(candidate.liveQuoteExpiresAt);
+      const quote = list(observation?.quotes).filter(item => key(item.definitionId) === key(candidate.definitionId));
+      if (candidate.priceSource !== 'EA Transfer Market' || Number(observation?.gameYear) !== scope.gameYear || observation?.platform !== scope.platform ||
+          quote.length !== 1 || Number(quote[0].buyNowPrice) !== market || market > Number(observation?.searchMaxBuy) ||
+          !Number.isFinite(observed) || observed !== snapshot || fetched !== observed ||
+          !Number.isFinite(expiry) || expiry <= now || expiry <= observed || expiry > observed + 120000 ||
+          observed > now + 5000 || now - observed > 120000) {
+        throw new Error('EA live quote expired or differs from the observed market search. Run a fresh live search.');
+      }
+    }
     const hours = Number(response.database?.priceMaxAgeHours ?? 6);
     if (!Number.isFinite(hours) || hours <= 0 || hours > 24) throw new Error('Invalid market-price freshness policy.');
     if (candidate.priceStale !== false || !Number.isFinite(market) || market <= 0 ||
@@ -495,6 +507,72 @@
     util.chemService = services.Chemistry; util.teamConfigRepo = repositories.TeamConfig;
     return util;
   }
+  async function liveMarketQuotes(selectedScope, currentPolicy, pale, assertCurrent) {
+    if (!currentPolicy.allowConcept || currentPolicy.onlyStorage) throw new Error('Anlık piyasa için konseptleri açın ve yalnızca depo seçeneğini kapatın.');
+    if (typeof UTSearchCriteriaDTO === 'undefined' || typeof ItemSearchFeature === 'undefined' || typeof ItemType === 'undefined' ||
+        typeof SearchLevel === 'undefined' || typeof ItemRatingTier === 'undefined' ||
+        typeof services.Item.searchTransferMarket !== 'function' || typeof services.Item.clearTransferMarketCache !== 'function') {
+      throw new Error('EA anlık piyasa araması henüz hazır değil.');
+    }
+    const quality = ui.marketQuality.value, qualityKey = quality.toUpperCase();
+    if (!['bronze','silver','gold'].includes(quality) || SearchLevel[qualityKey] === undefined || ItemRatingTier[qualityKey] === undefined) throw new Error('Piyasa kart kalitesini seçin.');
+    const requestedCeiling = Number(ui.marketCeiling.value);
+    if (!Number.isSafeInteger(requestedCeiling) || requestedCeiling < 1 || requestedCeiling > 15000000) throw new Error('Anlık arama fiyat tavanı 1–15.000.000 arasında tam sayı olmalı.');
+    const limits = [currentPolicy.maxPlayerPrice,currentPolicy.maxPurchasePrice,currentPolicy.maxTotalPrice].filter(value => value > 0);
+    const ceiling = Math.min(requestedCeiling,...limits);
+    if (!Number.isSafeInteger(ceiling) || ceiling < 1) throw new Error('Piyasa fiyat limiti pozitif bir tam sayı olmalı.');
+    const thresholds = [...new Set([150,200,250,300,400,600,1000,1500,ceiling].filter(value => value <= ceiling))].sort((a,b)=>a-b);
+    let pagesRead = 0, observedAt = null, searchedMaxBuy = 0;
+    const quotes = new Map();
+    search: for (const maxBuy of thresholds) {
+      assertCurrent();
+      // Official EA service cache is indexed by page: reset it when the query changes.
+      services.Item.clearTransferMarketCache();
+      for (let page = 1; pagesRead < 9; page++) {
+        assertCurrent();
+        const criteria = new UTSearchCriteriaDTO();
+        criteria.type = ItemType.PLAYER; criteria.level = SearchLevel[qualityKey]; criteria.maxBuy = maxBuy;
+        if (currentPolicy.protectSpecial) criteria.rarities = [0,1];
+        const model = new UTBucketedItemSearchViewModel();
+        model.searchFeature = ItemSearchFeature.MARKET;
+        model.defaultSearchCriteria.type = criteria.type;
+        model.updateSearchCriteria(criteria);
+        const query = model.searchCriteria;
+        query.disableOverrides = true; // Paletools' documented read-only lookup path.
+        status(`EA anlık piyasa: ${quality} · en fazla ${maxBuy.toLocaleString()} coin · arama ${pagesRead + 1}/9`);
+        const response = await observe(services.Item.searchTransferMarket(query, page), 'EA anlık piyasa');
+        const receivedAt = new Date().toISOString();
+        pagesRead++; searchedMaxBuy = maxBuy; assertCurrent();
+        if (!Array.isArray(response.items)) throw new Error('EA piyasa yanıtı okunamadı.');
+        for (const item of response.items) {
+          if (typeof item?.getTier !== 'function' || item.getTier() !== ItemRatingTier[qualityKey] || typeof item.getAuctionData !== 'function') continue;
+          const auction = item.getAuctionData();
+          if (!auction || typeof auction.isActiveTrade !== 'function' || !auction.isActiveTrade() ||
+              typeof auction.getSecondsRemaining !== 'function' || !(auction.getSecondsRemaining() > 0)) continue;
+          const price = Number(auction.buyNowPrice), definitionId = Number(item.definitionId);
+          if (!Number.isSafeInteger(price) || price <= 0 || price > maxBuy || !Number.isSafeInteger(definitionId) || definitionId <= 0) continue;
+          const rawRarity = item.rareflag ?? item._rareflag;
+          const rarity = rawRarity != null && rawRarity !== '' && Number.isInteger(Number(rawRarity)) ? Number(rawRarity) : undefined;
+          const special = typeof item.isSpecial === 'function' ? item.isSpecial() : undefined;
+          const candidate = {id:`concept:${definitionId}`,definitionId,concept:true,assetId:item._metaData?.id ?? item.assetId,
+            rating:item.rating,teamId:item.teamId,leagueId:item.leagueId,nationId:item.nationId,rarityId:rarity,marketPrice:price,
+            isSpecial:special === true || (rarity === undefined ? special !== false : rarity > 1),
+            isEvolution:Boolean(item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution()),
+            isLoan:typeof item.isLimitedUse === 'function' && item.isLimitedUse()};
+          if (!Number.isFinite(Number(candidate.rating)) || P.blockedReason(candidate,currentPolicy,pale)) continue;
+          if (!observedAt) observedAt = receivedAt;
+          const prior = quotes.get(definitionId);
+          if (!prior || price < prior.buyNowPrice) quotes.set(definitionId,{definitionId,buyNowPrice:price});
+        }
+        // This is a bounded observed pool, not a claim about every market listing.
+        if (quotes.size) break search;
+        if (response.items.length === 0 || Number.isInteger(query.count) && response.items.length < query.count) break;
+      }
+      if (pagesRead >= 9) break;
+    }
+    if (!quotes.size) throw new Error('Taranan EA ilanlarında politikaya uygun fiyatlı kart bulunamadı. Fiyat limiti veya kart kalitesini değiştirin.');
+    return {...selectedScope,observedAt,quality,searchMaxBuy:searchedMaxBuy,pagesRead,quotes:[...quotes.values()]};
+  }
   async function challengeData(challenge, set) {
     await observe(services.SBC.loadChallenge(challenge), 'Load SBC');
     const squad = challenge.squad;
@@ -551,9 +629,9 @@
   async function action(callback) {
     if (state.busy) return;
     state.busy = true;
-    [ui.refresh,ui.solve,ui.apply].forEach(button => { button.disabled = true; });
+    [ui.refresh,ui.solve,ui.liveSolve,ui.apply].forEach(button => { button.disabled = true; });
     try { await callback(); } catch (error) { fail(error); }
-    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.apply.disabled = !state.preview || state.preview.rows.some(row => row.player.concept); }
+    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.liveSolve.disabled = false; ui.apply.disabled = !state.preview; }
   }
   function invalidate() { state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true; ui.review.replaceChildren(); ui.poolInfo.textContent = ''; }
   function scope(required = true) {
@@ -575,7 +653,7 @@
       state.backendScope = result.status === 'ok' && selected ? `${selected.gameYear}:${selected.platform}` : null;
       const db = result.database || {};
       ui.health.textContent = selected ? `Sunucu bağlı · FC ${selected.gameYear} / ${selected.platform.toUpperCase()} · ${db.count ?? '?'} kart · ${db.pricedCount ?? '?'} piyasa fiyatı${result.solverBusy ? ' · çözücü meşgul' : ''}` : 'Sunucu bağlı. Sezon ve platform seçimini yapın.';
-      if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} için güncel piyasa fiyatı henüz hazır değil. Konsept alım önerisi üretilmez; kulüp kartlarıyla çözüm aranabilir. Diğer sezonun fiyatları kullanılmaz.`;
+      if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} için FUT.GG fiyatları henüz hazır değil. Veri tabanı modunda fiyatlı konsept önerilmez; Anlık piyasadan çöz açık EA ilanlarını ayrı arar. Diğer sezonun fiyatları kullanılmaz.`;
       else ui.marketNotice.textContent = selected ? `Fiyatlar yalnızca FC ${selected.gameYear} / ${selected.platform.toUpperCase()} kaynağından alınır.` : '';
       return result;
     } catch (error) { state.backendScope = null; ui.health.textContent = 'Yerel sunucuya bağlanılamadı'; throw error; }
@@ -597,7 +675,7 @@
     options(ui.challenge, state.challenges);
     status(`${state.challenges.length} görev hazır. Kart politikalarını kontrol edip çözebilirsiniz.`);
   }
-  async function solve(nativeContext = null) {
+  async function solve(nativeContext = null, liveMode = false) {
     invalidate();
     state.nativeActive = nativeContext;
     const version = state.cancel;
@@ -649,8 +727,12 @@
     const maxSolveTime = Number(ui.time.value);
     if (!Number.isFinite(maxSolveTime) || maxSolveTime < 1 || maxSolveTime > 120) throw new Error('Çözüm süresi 1–120 saniye olmalı.');
     state.input = { clubPlayers: players, sbcData, maxSolveTime, solverPolicy: currentPolicy, ...selectedScope };
+    if (liveMode) state.input.liveMarket = await liveMarketQuotes(selectedScope,currentPolicy,pale,() => {
+      if (version !== state.cancel) throw new Error('Piyasa araması iptal edildi.');
+      assertNativeContext(nativeContext);
+    });
     ui.export.disabled = false;
-    status(`${players.length} kulüp adayı; ${inv.items.length - players.length} korunan kart. ${currentPolicy.allowConcept ? 'Aynı sezonun fiyatlı piyasa kartları sunucuda ekleniyor. ' : ''}Çözüm aranıyor…`);
+    status(`${players.length} kulüp adayı; ${inv.items.length - players.length} korunan kart. ${liveMode ? `${state.input.liveMarket.quotes.length} anlık EA fiyatı. ` : currentPolicy.allowConcept ? 'FUT.GG veri tabanından fiyatlı piyasa adayları ekleniyor. ' : ''}Çözüm aranıyor…`);
     // Short polling requests keep Chrome MV3's worker alive even for long solves.
     // Never retry the creation POST: a lost response must not launch two jobs.
     if (version !== state.cancel) { status('İptal edildi. Yeni çözüm işi başlatılmadı.'); return; }
@@ -682,43 +764,112 @@
     const preview = state.preview;
     const version = state.cancel;
     if (!preview) throw new Error('Önce bir çözüm oluşturun.');
-    assertNativeContext(preview.nativeContext);
-    if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('Önizleme 5 dakikadan eski. Kulübü yeniden okuyup çözün.'); }
-    if (preview.rows.some(row => row.player.concept)) throw new Error('Konsept çözümü yalnızca önizlenebilir.');
+    const assertCurrent = () => {
+      if (version !== state.cancel) throw new Error('Uygulama iptal edildi.');
+      assertNativeContext(preview.nativeContext);
+      if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('Önizleme 5 dakikadan eski. Kulübü yeniden okuyup çözün.'); }
+      const selected = scope();
+      if (selected.gameYear !== preview.input.gameYear || selected.platform !== preview.input.platform) throw new Error('Sezon veya platform değişti. Yeniden çözün.');
+    };
+    assertCurrent();
     const pale = readPaletools();
     if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
-    const inv = await inventory(), chem = chemistry();
-    const currentItems = new Map(inv.items.map(item => [String(item.id), item]));
-    const currentPolicy = policy();
-    for (const row of preview.rows) {
-      const item = currentItems.get(String(row.id));
-      if (!item) throw new Error(`${row.player.name} kulüpte artık yok. Yeniden çözün.`);
-      const reason = P.blockedReason(card(item, inv, chem), currentPolicy, pale);
-      if (reason) throw new Error(`${row.player.name}: ${reason}. Yeniden çözün.`);
+    P.validateSolution(preview.result, preview.input, policy(), pale);
+    const concepts = preview.rows.filter(row => row.player.concept), resolvedConcepts = new Map();
+    for (const row of concepts) {
+      const definitionId = Number(row.player.definitionId);
+      if (!Number.isSafeInteger(definitionId) || definitionId <= 0 || typeof services.Item.searchConceptItems !== 'function') throw new Error('EA konsept kart araması kullanılamıyor. Kadro değiştirilmedi.');
+      const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
+      criteria.defId = [definitionId];
+      const response = await observe(services.Item.searchConceptItems(criteria), 'EA konsept kartı');
+      assertCurrent();
+      if (!Array.isArray(response.items)) throw new Error('EA konsept kart yanıtı okunamadı. Kadro değiştirilmedi.');
+      const matches = response.items.filter(item => String(item?.definitionId) === String(definitionId));
+      if (matches.length !== 1) throw new Error(`${row.player.name}: EA tam olarak bir eşleşen konsept kart döndürmedi. Kadro değiştirilmedi.`);
+      const item = matches[0];
+      // Keep the actual EA search entity. Never turn catalog JSON into an item,
+      // mark an owned card as a concept, or substitute another card version.
+      const assetId = item._metaData?.id ?? item.assetId ?? item._staticData?.id;
+      const rarity = item.rareflag ?? item._rareflag;
+      if (item.concept !== true || item.id == null || typeof item.isPlayer !== 'function' || item.isPlayer() !== true ||
+          assetId != null && String(assetId) !== String(row.player.assetId) ||
+          item.rating != null && Number(item.rating) !== Number(row.player.rating) ||
+          rarity != null && Number(rarity) !== Number(row.player.rarityId)) {
+        throw new Error(`${row.player.name}: EA konsept kart kimliği uyuşmuyor. Kadro değiştirilmedi.`);
+      }
+      resolvedConcepts.set(String(row.id), item);
     }
+    const inv = await inventory(), chem = chemistry();
+    assertCurrent();
+    const currentItems = new Map(inv.items.map(item => [String(item.id), item]));
     const fresh = await challengeData(preview.challenge, preview.set);
     if (JSON.stringify(fresh.constraints) !== JSON.stringify(preview.input.sbcData.constraints) ||
         JSON.stringify(fresh.formation) !== JSON.stringify(preview.input.sbcData.formation)) throw new Error('SBC koşulları değişti. Yeniden çözün.');
     const controller = new UTSBCSquadOverviewViewController();
     controller.initWithSBCSet(preview.set, preview.challenge.id);
     const { _squad, _challenge } = controller;
-    if (!_squad || !_challenge) throw new Error('EA squad adapter changed. Nothing was applied.');
-    if (version !== state.cancel) throw new Error('Uygulama iptal edildi.');
-    assertNativeContext(preview.nativeContext);
+    if (!_squad || !_challenge || String(_challenge.id) !== String(preview.challenge.id) || String(_challenge.setId) !== String(preview.set.id)) throw new Error('EA squad adapter changed. Nothing was applied.');
+    assertCurrent();
+    const currentPolicy = policy(), currentLocks = readPaletools();
+    if (currentLocks.warnings.length) throw new Error(currentLocks.warnings.join(' '));
+    P.validateSolution(preview.result, preview.input, currentPolicy, currentLocks);
+    for (const row of preview.rows) {
+      if (row.player.concept) {
+        const item = resolvedConcepts.get(String(row.id));
+        if (currentItems.has(String(item.id)) || inv.items.includes(item)) throw new Error(`${row.player.name}: EA konsept araması bir kulüp kartı döndürdü. Kadro değiştirilmedi.`);
+        if (currentPolicy.protectSpecial && typeof item.isSpecial === 'function' && item.isSpecial() === true ||
+            currentPolicy.protectEvolutions && (item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution() === true)) {
+          throw new Error(`${row.player.name}: EA kart koruması bu konsepti engelliyor. Kadro değiştirilmedi.`);
+        }
+      } else {
+        const item = currentItems.get(String(row.id));
+        if (!item) throw new Error(`${row.player.name} kulüpte artık yok. Yeniden çözün.`);
+        const current = card(item, inv, chem);
+        if (String(current.definitionId) !== String(row.player.definitionId) || String(current.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: kulüp kartı değişti. Yeniden çözün.`);
+        const reason = P.blockedReason(current, currentPolicy, currentLocks);
+        if (reason) throw new Error(`${row.player.name}: ${reason}. Yeniden çözün.`);
+      }
+    }
     const oldItems = (_squad._players || []).map(slot => slot?._item);
     const squad = Array.from({ length: 11 }, () => new UTItemEntity());
-    preview.rows.forEach(row => { squad[row.squadPosition] = currentItems.get(String(row.id)); });
+    preview.rows.forEach(row => { squad[row.squadPosition] = row.player.concept ? resolvedConcepts.get(String(row.id)) : currentItems.get(String(row.id)); });
     squad.push(...oldItems.slice(11));
-    _squad.setPlayers(squad, true);
-    try { await observe(services.SBC.saveChallenge(_challenge), 'Save SBC squad'); }
-    catch (error) { _squad.setPlayers(oldItems, true); throw error; }
-    invalidate();
+    const reserves = oldItems.slice(11).filter(item => typeof item?.isPlayer === 'function' && item.isPlayer());
+    for (const row of preview.rows) {
+      const selected = squad[row.squadPosition];
+      for (const reserve of reserves) {
+        if (typeof selected.compareResourceTo !== 'function' || selected.compareResourceTo(reserve)) throw new Error('Seçilen kart yedekteki korunan oyuncuyla çakışıyor veya karşılaştırılamıyor. Kadro değiştirilmedi.');
+      }
+    }
+    if (typeof _squad.removeAllItems !== 'function') throw new Error('EA kadro temizleme yöntemi kullanılamıyor. Kadro değiştirilmedi.');
+    const sameItem = (expected, actual) => {
+      const expectedPlayer = typeof expected?.isPlayer === 'function' && expected.isPlayer();
+      const actualPlayer = typeof actual?.isPlayer === 'function' && actual.isPlayer();
+      return !expectedPlayer && !actualPlayer || expectedPlayer && actualPlayer && String(expected.id) === String(actual.id) &&
+        String(expected.definitionId) === String(actual.definitionId) && Boolean(expected.concept) === Boolean(actual.concept);
+    };
+    try {
+      // EA setPlayers does not empty incoming blank slots, and can omit variants
+      // of an existing reserve. Clear players explicitly while keeping manager.
+      _squad.removeAllItems(true);
+      _squad.setPlayers(squad, true);
+      if (!squad.every((item,index) => sameItem(item,_squad._players?.[index]?._item))) throw new Error('EA kadroyu beklenen kartlarla dolduramadı; kayıt gönderilmedi.');
+      await observe(services.SBC.saveChallenge(_challenge), 'Save SBC squad');
+    } catch (error) {
+      _squad.removeAllItems(true);
+      _squad.setPlayers(oldItems, true);
+      throw error;
+    }
+    if (concepts.length) {
+      // Keep the reviewed shopping list visible without leaving Apply actionable.
+      state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true;
+    } else invalidate();
     try {
       const view = new UTSBCSquadSplitViewController(); view.initWithSBCSet(preview.set, preview.challenge.id);
       const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
       current.rootController.getRootNavigationController().pushViewController(view);
     } catch { /* The saved squad remains accessible via EA's own SBC screen. */ }
-    status('Kadronuz SBC’ye kaydedildi. EA ekranında koşulları kontrol edip isterseniz kendiniz gönderin.');
+    status(concepts.length ? 'Konseptler SBC kadrosuna yerleştirildi. Coin harcanmadı. Konseptler gerçek kartlarla değiştirilmeden kadro teslim edilemez.' : 'Kadronuz SBC’ye kaydedildi. EA ekranında koşulları kontrol edip isterseniz kendiniz gönderin.');
   }
 
   function el(tag, text, parent) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (parent) parent.append(node); return node; }
@@ -727,11 +878,12 @@
     ui.review.replaceChildren();
     el('h3', preview.input.sbcData.challengeName, ui.review);
     el('p', `FC ${preview.input.gameYear} · ${preview.input.platform.toUpperCase()} · Kulüp + piyasa kadrosu`, ui.review).className = 'muted';
+    if (preview.input.liveMarket) el('p', `Anlık EA piyasası · ${preview.input.liveMarket.pagesRead} aramada gözlenen ${preview.input.liveMarket.quotes.length} fiyat. Yalnızca taranan ilanlar karşılaştırıldı; tüm piyasadaki en ucuz kart garantisi yok. Fiyatlar en fazla 120 saniye geçerlidir.`, ui.review);
     const table = el('table', undefined, ui.review), head = el('tr', undefined, table);
     ['Slot','Oyuncu','RTG','Tür','Fiyat'].forEach(label => el('th', label, head));
     for (const row of preview.rows) {
       const tr = el('tr', undefined, table);
-      const type = row.player.concept ? 'Alınacak' : row.player.tradeabilityKnown === false ? 'Kulüp · satış durumu bilinmiyor' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
+      const type = row.player.concept ? 'Konsept' : row.player.tradeabilityKnown === false ? 'Kulüp · satış durumu bilinmiyor' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
       const price = Number(row.marketPrice ?? row.futggPrice ?? row.player.marketPrice);
       [row.squadPosition + 1, row.player.name, row.player.rating, type, price > 0 ? Math.round(price).toLocaleString() : 'Tahmini'].forEach(value => el('td', String(value), tr));
     }
@@ -751,11 +903,11 @@
         try {
           const url = new URL(item.url);
           if (url.protocol === 'https:' && ['www.fut.gg','fut.gg'].includes(url.hostname)) {
-            const link = el('a', 'Kart ve fiyat kaynağını aç ↗', box); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+            const link = el('a', preview.input.liveMarket ? 'Kart bilgilerini aç ↗' : 'Kart ve fiyat kaynağını aç ↗', box); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
           }
         } catch { /* A missing source link never becomes an arbitrary navigation. */ }
       }
-      el('p', 'Bu kartları kendiniz satın aldıktan sonra kulübü yeniden okuyup çözün. Konsept içeren kadro otomatik satın alınmaz veya SBC’ye uygulanmaz.', ui.review);
+      el('p', 'Konseptleri kadroya yerleştir düğmesi gerçek EA konsept kartlarını SBC’ye kaydeder. Bu işlem coin harcamaz. Konseptler gerçek kartlarla değiştirilmeden kadro teslim edilemez; alışveriş listesi yalnızca fiyat bilgisidir.', ui.review);
     } else el('p', 'Alınacak kart yok; çözüm kulübünüzdeki kartlardan oluşuyor.', ui.review);
     if (preview.conceptCoverage) el('p', `Piyasa havuzu: ${preview.conceptCoverage.returned ?? preview.conceptCoverage.addedToPool ?? '?'} / ${preview.conceptCoverage.totalEligible ?? '?'} uygun aday. ${preview.conceptCoverage.complete ? 'Politikaya uygun katalog adayları tarandı.' : 'Sınırlı aday seçimi: tüm piyasadaki en ucuz çözüm garantisi değildir.'}`, ui.review);
     if (preview.result.summary) {
@@ -769,7 +921,8 @@
     el('pre', JSON.stringify(preview.rejected, null, 2), details);
     el('p', 'Aktif kadrodaki kartlar korunur ve Uygula öncesi yeniden okunur. Bu kontrol geçmişte oynanmış tüm kartları tespit etmez. Satış bilgisi bilinmeyen kartlar satılabilir kart politikasıyla değerlendirilir.', details);
     el('p', 'Paletools kayıtlı kart/ülke/takım/lig/nadirlik kilitleri okunur. Farklı hesapların kayıtlı kilitleri de korunur. Paletools ayarları değiştirilmez.', details);
-    ui.apply.disabled = preview.rows.some(row => row.player.concept);
+    ui.apply.textContent = shopping.length ? 'Konseptleri kadroya yerleştir' : 'İnceledim · Kadroyu SBC’ye uygula';
+    ui.apply.disabled = false;
   }
 
   const host = document.createElement('div'); host.id = 'autosbc-local-panel'; document.documentElement.append(host);
@@ -799,6 +952,10 @@
   const check = el('button', 'Sunucuyu kontrol et', top); check.addEventListener('click', () => health().catch(fail));
   ui.set = el('select', undefined, el('label', 'SBC seti', panel));
   ui.challenge = el('select', undefined, el('label', 'Görev', panel));
+  ui.marketQuality = el('select', undefined, el('label', 'Anlık piyasada kart kalitesi', panel));
+  options(ui.marketQuality,[{id:'bronze',name:'Bronz'},{id:'silver',name:'Gümüş'},{id:'gold',name:'Altın'}]); ui.marketQuality.value = 'silver';
+  ui.marketCeiling = el('input', undefined, el('label','Anlık arama fiyat tavanı (coin)',panel));
+  ui.marketCeiling.type='number'; ui.marketCeiling.min=1; ui.marketCeiling.max=15000000; ui.marketCeiling.value=2000;
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(STORAGE) || '{}'); } catch { /* Use safe defaults. */ }
   const settings = { ...P.defaults, ...saved, weights: { ...P.defaults.weights, ...saved.weights } };
@@ -819,6 +976,8 @@
   const timeLabel = el('label', 'En fazla çözüm süresi (saniye)', panel); ui.time = el('input', undefined, timeLabel); ui.time.type = 'number'; ui.time.min = 1; ui.time.max = 120; ui.time.value = 30;
   const controls = el('div', undefined, panel); controls.className = 'row';
   ui.solve = el('button', 'Çöz ve önizle', controls); ui.solve.className = 'launch';
+  ui.liveSolve = el('button', 'Anlık piyasadan çöz', controls);
+  el('p','Çöz ve önizle: FUT.GG veri tabanı. Anlık piyasadan çöz: EA’nın açık ilanları; arama tavanı, kart ve toplam bütçe limitlerinin en düşüğü kullanılır.',panel).className='muted';
   const cancel = el('button', 'İptal', controls); cancel.addEventListener('click', () => { invalidate(); status('İptal edildi. Bekleyen sonuç uygulanmayacak.'); });
   ui.export = el('button', 'İsteği dışa aktar', controls); ui.export.disabled = true;
   ui.export.addEventListener('click', () => {
@@ -836,8 +995,9 @@
   ui.challenge.addEventListener('change', invalidate);
   for (const select of [ui.season,ui.platform]) select.addEventListener('change', () => { invalidate(); health().catch(fail); });
   ui.solve.addEventListener('click', () => action(solve));
+  ui.liveSolve.addEventListener('click', () => action(() => solve(activeChallengeContext(),true)));
   ui.apply.addEventListener('click', () => action(apply));
-  for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time]) input.addEventListener('change', invalidate);
+  for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling]) input.addEventListener('change', invalidate);
   if (window.AutoSBCNative) {
     window.AutoSBCNative.install({
       document,

@@ -77,8 +77,20 @@ cards. `maxPurchasePrice` limits only actual purchases; `maxTotalPrice` limits a
 selected cards' market opportunity value. Its shopping list shows quantity, card,
 actual quoted price, price-source age, source link, season/platform and purchase
 total. Proof and shopping-list inconsistencies prevent review. No purchase is
-made automatically. Buy any wanted cards yourself, refresh inventory, and solve
-again before applying the resulting owned squad.
+made automatically. Concept Apply resolves exact definition IDs through EA's
+concept search and places the returned concept entities directly into the SBC.
+The quoted cost is a reference: an available listing can have a different price.
+
+**Anlık piyasadan çöz** queries the signed-in EA transfer market for the chosen
+bronze/silver/gold quality within the configured price ceiling. Search is bounded
+and reports the observed pool; it does not claim an exhaustive market scan. The
+request sends only card definitions, observed Buy Now prices, scope and search
+time to the local solver. Credentials, auction IDs and owned auction entities
+are not used as concept proof. The server joins the definitions to its card
+catalog and uses those live prices exclusively for concepts. No FUT.GG quote
+fallback is allowed in this mode, including when live search returns no cards.
+Live prices expire after two minutes and must be refreshed before Apply if stale.
+The regular solve button retains the clearly identified FUT.GG snapshot mode.
 
 **İnceledim · Kadroyu SBC’ye uygula** re-reads inventory and locks, checks the
 challenge still matches, and saves the squad to that challenge. It does not submit
@@ -123,7 +135,8 @@ Public catalog concepts form a server-selected, diversified pool filtered using
 the active policy and challenge attributes. The server can expand the candidate
 pool within the request's solve budget. The panel displays coverage; a bounded
 selection does not guarantee the cheapest squad across the entire market.
-Concepts are never represented as owned EA entities, purchased or applied. Stale
+Concepts are never represented as owned EA entities or purchased automatically.
+After review they can be placed in the SBC as real EA concept entities. Stale
 catalog prices are not submitted as current quotes. The backend exposes price
 provenance and conservative fallback estimates. Concept and boosted-card
 chemistry support remains subject to the backend's supported constraint types.
@@ -146,7 +159,10 @@ cross-season quotes, stale prices, source/identity/shopping-list tampering and t
 separate purchase budget. Native-entry tests cover original initializer semantics,
 handler binding before mount, repeated rendering, missing/late challenge data,
 rapid clicks, challenge identity changes and result cancellation on navigation.
-The native integration has not yet been installed and validated against the user's
-live EA account. EA's own UI was observed separately; the tests' EA object shapes
-still come from the upstream adapter and controlled fixtures.
+The installed 27.0.1 extension completed ten owned-card Daily Silver solve/Apply
+flows on 2026-09-09; native exchanges and reward claims were verified separately.
+The concept preview also produced an exact 65-rated Xavier Dziekoński quote.
+Native concept placement in 27.0.2 still requires extension reload and live
+verification. The tests' EA object shapes come from the public adapter and
+controlled fixtures; a mock pass is not live concept validation.
 EA's private adapter APIs may change; unreadable responses fail with diagnostics.
