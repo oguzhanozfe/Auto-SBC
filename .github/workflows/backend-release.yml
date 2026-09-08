@@ -1,92 +1,38 @@
-name: Backend EXE Release (Minimal)
-
+name: Validate and package Auto-SBC Studio
 on:
   push:
-    tags:
-      - "v*" # e.g. v1.0.0
-
+  pull_request:
+  workflow_dispatch:
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  build-release:
-    runs-on: windows-latest
-    timeout-minutes: 20
+  test-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Detect prerelease
-        id: pre
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          # If tag contains a hyphen (v1.2.3-rc1, v1.2.3-beta, etc.) treat as prerelease
-          if [[ "$TAG" == *-* ]]; then
-            echo "is_prerelease=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_prerelease=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
           cache: pip
-
-      - name: Install dependencies
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements-lock.txt
+      - name: Test solver, catalog and local API
+        run: python -m pytest -q
+      - name: Build and test browser companion
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Show versions
-        run: |
-          python --version
-          pip list
-
-      - name: Build EXE
-        shell: cmd
-        run: |
-          if exist dist rd /s /q dist
-          if exist build rd /s /q build
-          pyinstaller --noconfirm --onefile --name AutoSBCBackend ^
-            --additional-hooks-dir hooks ^
-            --collect-all ortools ^
-            backend\main.py
-          if not exist dist\AutoSBCBackend.exe (
-            echo Build failed: EXE missing
-            dir dist
-            exit /b 1
-          )
-
-      - name: Compute checksum
-        id: sums
-        shell: bash
-        run: |
-          echo "sha256=$(sha256sum dist/AutoSBCBackend.exe | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-
-      - name: Upload artifact
+          node frontend/build.mjs
+          node --test tests/frontend*.cjs
+          node --check tampermonkey-ai-sbc.user.js
+          node --check backend/static/app.js
+      - name: Upload browser extension and userscript
         uses: actions/upload-artifact@v4
         with:
-          name: AutoSBCBackend-${{ github.ref_name }}
-          path: dist/AutoSBCBackend.exe
-          retention-days: 7
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: AutoSBC Backend ${{ github.ref_name }}
-          body: |
-            AutoSBC Backend release ${{ github.ref_name }}
-            SHA256: `${{ steps.sums.outputs.sha256 }}`
-            Notes:
-            - Built via PyInstaller.
-            - Run: AutoSBCBackend.exe (binds to port 8000).
-            - Set AUTOSBC_ENABLE_FILE_LOGS=1 to enable file logging in packaged mode.
-          prerelease: ${{ steps.pre.outputs.is_prerelease }}
-          files: |
-            dist/AutoSBCBackend.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: auto-sbc-studio-browser
+          path: |
+            dist/chrome-extension/
+            tampermonkey-ai-sbc.user.js
+          retention-days: 14
