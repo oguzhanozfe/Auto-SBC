@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto-SBC Local
 // @namespace    https://github.com/TitiroMonkey/Auto-SBC
-// @version      27.0.4
-// @description  Local EA FC SBC solver with protected cards, Paletools locks and mandatory squad review.
+// @version      27.0.5
+// @description  Local EA FC solver with protected cards, Paletools locks, previews and explicit finite SBC batches.
 // @author       TitiroMonkey; Auto-SBC Local contributors
 // @license      MIT
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
@@ -350,8 +350,284 @@
   return { install, contextKey, BUTTON_ID };
 });
 
+/* Auto-SBC Local — finite batch state and guards; no EA, network, or DOM calls. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.AutoSBCBatchPolicy = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const MAX_SETS = 20;
+  const copy = value => JSON.parse(JSON.stringify(value));
+  function id(value) {
+    if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) throw new Error('Invalid SBC ID.');
+    return String(value);
+  }
+  function batchPolicy(input = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Batch policy must be an object.');
+    return {...input, protectPlayed:true, protectEvolutions:true, allowConcept:false, maxPurchasePrice:0};
+  }
+  function assertBatchPlayers(players) {
+    if (!Array.isArray(players) || players.length < 1 || players.length > 11) throw new Error('Batch needs 1–11 owned players.');
+    const itemIds = players.map(player => {
+      if (!player || !/^[1-9]\d*$/.test(String(player.id)) || !Number.isSafeInteger(Number(player.id)) || player.concept !== false) throw new Error('Batch cannot use concepts or purchase players.');
+      if (player.gamesPlayed !== 0 || !Number.isSafeInteger(player.gamesPlayed)) throw new Error('Batch protects played cards and unknown match history.');
+      if (player.isEvolution !== false) throw new Error('Batch protects evolved cards and unknown evolution status.');
+      return String(player.id);
+    });
+    if (new Set(itemIds).size !== itemIds.length) throw new Error('Duplicate owned item in batch squad.');
+    return itemIds;
+  }
+  function availabilityReason(value) {
+    if (!value || typeof value.completed !== 'boolean' || typeof value.repeatable !== 'boolean' ||
+        value.remaining != null && (!Number.isSafeInteger(value.remaining) || value.remaining < 0)) throw new Error('SBC completion or remaining rights are unreadable.');
+    if (value.remaining === 0) return 'rights-exhausted';
+    if (value.completed) {
+      if (!value.repeatable) return 'already-completed';
+      if (value.remaining == null) throw new Error('Remaining repeat rights are unknown.');
+    }
+    return null;
+  }
+  function createBatch(setIds, inputPolicy = {}) {
+    if (!Array.isArray(setIds) || !setIds.length || setIds.length > MAX_SETS) throw new Error(`Select 1–${MAX_SETS} SBC sets.`);
+    const queue = [...new Set(setIds.map(id))].map(setId => ({setId,status:'queued',steps:[]}));
+    const policy = batchPolicy(copy(inputPolicy));
+    const ledger = [];
+    let status = 'running', current = null, activeEffect = null, sequence = 0;
+    const assertRunning = () => { if (status !== 'running') throw new Error(`Batch is ${status}; no new effects are allowed.`); };
+    const step = () => current?.steps.at(-1);
+    const record = (event, extra = {}) => ledger.push({event,...(current ? {setId:current.setId} : {}),...extra});
+    const activeStep = () => {
+      assertRunning();
+      if (!current || current.status !== 'running' || !step()) throw new Error('No active batch challenge.');
+      return step();
+    };
+    const snapshot = () => copy({status,policy,queue,ledger,currentSetId:current?.setId ?? null,
+      progress:{total:queue.length,completed:queue.filter(entry=>entry.status==='completed').length,
+        skipped:queue.filter(entry=>entry.status==='skipped').length,
+        confirmedChallenges:queue.reduce((sum,entry)=>sum+entry.steps.filter(item=>item.status==='completed').length,0)}});
+    const nextSet = () => status === 'running' && !current ? queue.find(entry=>entry.status==='queued')?.setId ?? null : null;
+    function startSet(setId, availability) {
+      assertRunning();
+      setId = id(setId);
+      if (current || nextSet() !== setId) throw new Error('SBC is not the next selected set.');
+      const reason = availabilityReason(availability);
+      const entry = queue.find(item=>item.setId===setId);
+      if (reason) {
+        entry.status='skipped'; entry.reason=reason; record('set-skipped',{setId,reason});
+        if (!queue.some(item=>item.status==='queued')) status='completed';
+        return false;
+      }
+      entry.status='running'; current=entry; record('set-started');
+      return true;
+    }
+    function beginStep(challengeId) {
+      assertRunning();
+      challengeId=id(challengeId);
+      if (!current || current.status!=='running' || step() && step().status!=='completed') throw new Error('Previous batch challenge is not complete.');
+      if (current.steps.some(item=>item.challengeId===challengeId)) throw new Error('This batch challenge was already processed.');
+      current.steps.push({challengeId,status:'planning',itemIds:[]});
+      record('challenge-started',{challengeId});
+    }
+    function readyStep(players) {
+      const entry=activeStep();
+      if (entry.status!=='planning') throw new Error('Batch challenge is not awaiting a squad.');
+      entry.itemIds=assertBatchPlayers(players); entry.status='ready';
+      record('squad-ready',{challengeId:entry.challengeId});
+    }
+    function beginEffect(action, freshPlayers) {
+      const entry=activeStep();
+      const prior={save:'ready',submit:'saved',claim:'submitted'};
+      if (!Object.hasOwn(prior,action) || entry.status!==prior[action] || activeEffect) throw new Error('Duplicate or out-of-order batch effect.');
+      if (action!=='claim') {
+        const freshIds=assertBatchPlayers(freshPlayers);
+        if (freshIds.length!==entry.itemIds.length || freshIds.some((itemId,index)=>itemId!==entry.itemIds[index])) throw new Error('Reviewed batch squad changed.');
+      }
+      // Record before the caller sends anything to EA. An unresolved attempt
+      // cannot be retried, even if its response was lost.
+      const token=Object.freeze({setId:current.setId,challengeId:entry.challengeId,action,sequence:++sequence});
+      activeEffect={token,entry}; entry.status=`${action}-pending`;
+      record('effect-started',token);
+      return token;
+    }
+    function resolveEffect(token, error) {
+      if (!activeEffect || activeEffect.token!==token) throw new Error('Stale or already resolved batch effect.');
+      const {entry}=activeEffect; activeEffect=null;
+      if (error != null) {
+        entry.status='uncertain'; entry.reason=String(error); current.status='blocked';
+        if (status!=='stopped') status='blocked';
+        record('effect-uncertain',{...token,reason:entry.reason});
+      } else {
+        entry.status={save:'saved',submit:'submitted',claim:'completed'}[token.action];
+        record('effect-confirmed',token);
+      }
+    }
+    function completeSet() {
+      assertRunning();
+      if (!current || !step() || step().status!=='completed' || activeEffect) throw new Error('Set has an unconfirmed challenge.');
+      current.status='completed'; record('set-completed'); current=null;
+      if (!queue.some(entry=>entry.status==='queued')) status='completed';
+    }
+    function failStep(reason) {
+      const entry=activeStep();
+      if (activeEffect) throw new Error('Resolve the pending effect as uncertain first.');
+      const message=String(reason || 'Batch challenge failed.');
+      // A later bookkeeping failure cannot undo a confirmed exchange/reward.
+      if (entry.status!=='completed') { entry.status='blocked'; entry.reason=message; }
+      current.status='blocked'; current.reason=message; status='blocked';
+      record('challenge-blocked',{challengeId:entry.challengeId,reason:message});
+    }
+    function stop() {
+      if (status==='completed' || status==='stopped') return;
+      status='stopped'; record('batch-stopped');
+    }
+    return Object.freeze({snapshot,nextSet,startSet,beginStep,readyStep,beginEffect,
+      confirmEffect:token=>resolveEffect(token,null),
+      failEffect:(token,reason)=>resolveEffect(token,String(reason || 'EA response is uncertain.')),
+      completeSet,failStep,stop});
+  }
+  return Object.freeze({MAX_SETS,batchPolicy,assertBatchPlayers,availabilityReason,createBatch});
+});
+
+/* Auto-SBC Local — finite batch orchestration; adapters own all EA interactions. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.AutoSBCBatchRunner = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const started = new WeakSet();
+  const sameId = (left, right) => left != null && right != null && String(left) === String(right);
+  const validId = value => /^[1-9]\d*$/.test(String(value)) && Number.isSafeInteger(Number(value));
+  const message = error => error?.message || String(error);
+
+  // Adapter contract:
+  // snapshotSet(setId) -> {setId,completed,repeatable,remaining,challenges:[{challengeId,completed}]}
+  // solve(step) -> {players:[normalized owned cards], ...opaque}
+  // freshPlayers(step,solution,'save'|'submit',applyReceipt|null) -> normalized cards in reviewed order
+  // apply(step,solution) -> {setId,challengeId,saved:true, ...opaque}
+  // submit(step,solution,applyReceipt) -> {setId,challengeId,completed:true,setCompleted,rewardsGranted,...opaque}
+  // verifyRewards(step,submitReceipt) -> {setId,challengeId,rewardsGranted:true,setCompleted}
+  // verifyRewards is read-only bookkeeping for rewards granted by submit, never a second claim write.
+  async function run({controller, adapter, onProgress} = {}) {
+    if (!controller || typeof controller !== 'object' || typeof controller.snapshot !== 'function') throw new Error('A batch controller is required.');
+    if (started.has(controller)) throw new Error('This batch runner has already started; unresolved writes are never retried.');
+    for (const name of ['snapshotSet','solve','freshPlayers','apply','submit','verifyRewards']) {
+      if (typeof adapter?.[name] !== 'function') throw new Error(`Missing batch adapter: ${name}.`);
+    }
+    started.add(controller);
+    let step = null;
+    const running = () => controller.snapshot().status === 'running';
+    // The observer persists the detached journal. A pending effect must reach
+    // durable storage before dispatch; rendering/persistence failures halt.
+    const progress = async phase => onProgress?.({phase,step:step && {...step},snapshot:controller.snapshot()});
+    const identity = (receipt, label) => {
+      if (!receipt || !sameId(receipt.setId,step.setId) || !sameId(receipt.challengeId,step.challengeId)) throw new Error(`${label} receipt does not match the selected SBC challenge.`);
+    };
+    async function effect(action, players, invoke, validate) {
+      if (!running()) return null;
+      const token = controller.beginEffect(action,players);
+      let receipt;
+      try {
+        await progress(action);
+        if (!running()) {
+          controller.failEffect(token,'Stopped before dispatch; no EA request was sent.');
+          return null;
+        }
+        receipt = await invoke();
+        validate(receipt);
+      } catch (error) {
+        controller.failEffect(token,message(error));
+        throw error;
+      }
+      // Stop may have arrived while EA was handling the request. Record the
+      // observed outcome, but the caller must not start the next effect.
+      controller.confirmEffect(token);
+      await progress(`${action}-confirmed`);
+      return receipt;
+    }
+    try {
+      while (running()) {
+        const setId = controller.nextSet();
+        if (setId == null) break;
+        step = null;
+        await progress('snapshot');
+        if (!running()) break;
+        const availability = await adapter.snapshotSet(setId);
+        if (!running()) break;
+        if (!availability || !sameId(availability.setId,setId)) throw new Error('SBC availability belongs to another set.');
+        if (!controller.startSet(setId,availability)) { await progress('set-skipped'); continue; }
+        if (!Array.isArray(availability.challenges) || !availability.challenges.length) throw new Error('SBC challenge snapshot is empty or unreadable.');
+        const seen = new Set();
+        const pending = [];
+        for (const challenge of availability.challenges) {
+          if (!challenge || !validId(challenge.challengeId) || typeof challenge.completed !== 'boolean') throw new Error('SBC challenge completion is unreadable.');
+          const challengeId = String(challenge.challengeId);
+          if (seen.has(challengeId)) throw new Error('SBC challenge snapshot contains duplicate IDs.');
+          seen.add(challengeId);
+          if (!challenge.completed) pending.push(Object.freeze({setId:String(setId),challengeId}));
+        }
+        if (!pending.length) throw new Error('No unfinished challenge is available in the selected SBC snapshot.');
+        let setCompleted = false;
+        // Freeze this finite work list. A repeatable set can reset its native
+        // status immediately after submit; it must not enter the queue again.
+        for (const selected of pending) {
+          if (!running()) break;
+          step = selected;
+          controller.beginStep(step.challengeId);
+          await progress('solve');
+          if (!running()) break;
+          const solution = await adapter.solve(step);
+          if (!running()) break;
+          controller.readyStep(solution?.players);
+          const beforeSave = await adapter.freshPlayers(step,solution,'save',null);
+          if (!running()) break;
+          const saved = await effect('save',beforeSave,() => adapter.apply(step,solution), receipt => {
+            identity(receipt,'Save');
+            if (receipt.saved !== true) throw new Error('SBC squad save was not confirmed.');
+          });
+          if (!running()) break;
+          const beforeSubmit = await adapter.freshPlayers(step,solution,'submit',saved);
+          if (!running()) break;
+          const submitted = await effect('submit',beforeSubmit,() => adapter.submit(step,solution,saved), receipt => {
+            identity(receipt,'Submit');
+            if (receipt.completed !== true || typeof receipt.setCompleted !== 'boolean' || typeof receipt.rewardsGranted !== 'boolean') throw new Error('SBC submission receipt is incomplete.');
+          });
+          if (!running()) break;
+          if (submitted.rewardsGranted !== true) throw new Error('SBC submission did not confirm granted rewards; batch stopped for reconciliation.');
+          const claimed = await effect('claim',undefined,() => adapter.verifyRewards(step,submitted), receipt => {
+            identity(receipt,'Reward');
+            if (receipt.rewardsGranted !== true || typeof receipt.setCompleted !== 'boolean' || receipt.setCompleted !== submitted.setCompleted) throw new Error('SBC reward receipt is incomplete or disagrees with submission.');
+          });
+          if (!running()) break;
+          if (claimed.setCompleted) {
+            controller.completeSet();
+            setCompleted = true;
+            await progress('set-completed');
+            break;
+          }
+        }
+        if (running() && !setCompleted) throw new Error('All snapshotted challenges were processed, but EA did not confirm set completion.');
+      }
+      await progress('finished');
+      return controller.snapshot();
+    } catch (error) {
+      if (running()) {
+        const snapshot = controller.snapshot();
+        const current = snapshot.queue.find(entry => entry.setId === snapshot.currentSetId);
+        if (current?.steps?.length) controller.failStep(message(error));
+        else controller.stop();
+      }
+      try { await progress('failed'); } catch { /* Preserve the original failure if journaling also fails. */ }
+      throw error;
+    }
+  }
+  return Object.freeze({run});
+});
+
 /* Auto-SBC Local. EA adapter adapted from TitiroMonkey's MIT Auto-SBC.
- * This panel makes no submissions, purchases, pack or inventory-move requests.
+ * Single previews save only. Explicit finite batch runs may submit owned squads;
+ * neither mode purchases players, opens packs, or chooses player-pick rewards.
  */
 (function () {
   'use strict';
@@ -361,7 +637,9 @@
   const BASE = 'http://127.0.0.1:8000';
   const STORAGE = 'autosbc.local.policy.v1';
   const SCOPE_STORAGE = 'autosbc.local.scope.v1';
+  const BATCH_STORAGE = 'autosbc.local.batch.v1';
   const state = { busy: false, sets: [], challenges: [], preview: null, input: null, cancel: 0, backendScope: null, nativeActive: null };
+  state.batchQueue = []; state.batchRun = null; state.batchReport = null;
 
   function http(path, method = 'GET', data, timeout = 15000) {
     if (!['/health','/api/solve/jobs'].includes(path.split('?')[0]) && !/^\/api\/solve\/jobs\/[a-zA-Z0-9-]+$/.test(path)) throw new Error('Unsupported local endpoint.');
@@ -667,9 +945,9 @@
   async function action(callback) {
     if (state.busy) return;
     state.busy = true;
-    [ui.refresh,ui.solve,ui.liveSolve,ui.apply].forEach(button => { button.disabled = true; });
+    [ui.refresh,ui.solve,ui.liveSolve,ui.apply,ui.batchAdd,ui.batchStart,ui.batchClear].filter(Boolean).forEach(button => { button.disabled = true; });
     try { await callback(); } catch (error) { fail(error); }
-    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.liveSolve.disabled = false; ui.apply.disabled = !state.preview; }
+    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.liveSolve.disabled = false; ui.apply.disabled = !state.preview; renderBatch(); }
   }
   function invalidate() { state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true; ui.review.replaceChildren(); ui.poolInfo.textContent = ''; }
   function scope(required = true) {
@@ -798,11 +1076,12 @@
     renderReview(state.preview);
     status('Çözüm hazır. Listeyi inceleyin; Uygula yalnızca SBC kadrosunu kaydeder. Gönderme işlemi EA ekranında size aittir.');
   }
-  async function apply() {
+  async function apply(batchGuard = null) {
     const preview = state.preview;
     const version = state.cancel;
     if (!preview) throw new Error('Önce bir çözüm oluşturun.');
     const assertCurrent = () => {
+      if (batchGuard) batchGuard();
       if (version !== state.cancel) throw new Error('Uygulama iptal edildi.');
       assertNativeContext(preview.nativeContext);
       if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('Önizleme 5 dakikadan eski. Kulübü yeniden okuyup çözün.'); }
@@ -900,6 +1179,7 @@
       _squad.removeAllItems(true);
       _squad.setPlayers(squad, true);
       if (!squad.every((item,index) => sameItem(item,_squad._players?.[index]?._item))) throw new Error('EA kadroyu beklenen kartlarla dolduramadı; kayıt gönderilmedi.');
+      assertCurrent();
       await observe(services.SBC.saveChallenge(_challenge), 'Save SBC squad');
     } catch (error) {
       _squad.removeAllItems(true);
@@ -910,16 +1190,199 @@
       // Keep the reviewed shopping list visible without leaving Apply actionable.
       state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true;
     } else invalidate();
-    try {
+    try { if (!batchGuard) {
       const view = new UTSBCSquadSplitViewController(); view.initWithSBCSet(preview.set, preview.challenge.id);
       const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
       current.rootController.getRootNavigationController().pushViewController(view);
-    } catch { /* The saved squad remains accessible via EA's own SBC screen. */ }
+    } } catch { /* The saved squad remains accessible via EA's own SBC screen. */ }
     status(concepts.length ? 'Konseptler SBC kadrosuna yerleştirildi. Coin harcanmadı. Konseptler gerçek kartlarla değiştirilmeden kadro teslim edilemez.' : 'Kadronuz SBC’ye kaydedildi. EA ekranında koşulları kontrol edip isterseniz kendiniz gönderin.');
+    return {setId:preview.set.id,challengeId:preview.challenge.id,saved:true,preview,challenge:_challenge,squad:_squad};
+  }
+
+  function assertSubmitAllowed(challenge, set) {
+    if (typeof challenge.canSubmit !== 'function' || challenge.canSubmit() !== true) throw new Error('EA kadronun teslim koşullarını onaylamadı. Sıra durduruldu.');
+    if (typeof UTEventTokenUtils === 'undefined' || typeof UTEventTokenUtils.hasEventTokenReward !== 'function' ||
+        typeof services.EventToken?.isEventTokenEarningDisabled !== 'function' ||
+        typeof services.Configuration?.getFeatureSetting !== 'function' ||
+        typeof UTServerSettingsRepository === 'undefined' || !UTServerSettingsRepository.KEY?.SBC_ALLOW_UNTRADEABLE ||
+        typeof challenge.hasUntradeableItems !== 'function') throw new Error('EA teslim güvenlik kontrolleri kullanılamıyor.');
+    if ((UTEventTokenUtils.hasEventTokenReward(set.awards) || UTEventTokenUtils.hasEventTokenReward(challenge.awards)) && services.EventToken.isEventTokenEarningDisabled()) throw new Error('EA etkinlik ödüllerini geçici olarak kapattı.');
+    if (!services.Configuration.getFeatureSetting(UTServerSettingsRepository.KEY.SBC_ALLOW_UNTRADEABLE) && challenge.hasUntradeableItems()) throw new Error('EA satılamaz kart teslimini geçici olarak kapattı.');
+  }
+  function hasUncertainBatch(report) {
+    return Boolean(report?.snapshot?.queue?.some(set => set.steps?.some(step => ['save-pending','submit-pending','uncertain'].includes(step.status))));
+  }
+  async function runBatch() {
+    const B = window.AutoSBCBatchPolicy, R = window.AutoSBCBatchRunner;
+    if (!B || !R) throw new Error('Otomatik sıra modülü yüklenmedi. Uzantıyı ve EA sayfasını yenileyin.');
+    if (!ui.batchConsent.checked || !state.batchQueue.length) throw new Error('Teslim edilecek setleri sıraya ekleyip otomatik teslim seçimini işaretleyin.');
+    if (hasUncertainBatch(state.batchReport)) throw new Error('Önceki çalışmada sonucu belirsiz bir EA isteği var. Aynı teslim otomatik tekrarlanmayacak; önce EA tamamlanma kaydını kontrol edin.');
+    if (!ready() || typeof services.SBC.reset !== 'function' || typeof services.SBC.submitChallenge !== 'function' || typeof services.Chemistry?.isFeatureEnabled !== 'function') throw new Error('EA otomatik teslim servisi hazır değil.');
+    // Batch permission is scoped to owned cards and these mandatory protections.
+    ui.settings.protectPlayed.checked = true; ui.settings.protectEvolutions.checked = true; ui.settings.allowConcept.checked = false;
+    const selectedScope = scope(), selectedQueue = state.batchQueue.map(entry => ({...entry}));
+    const batchPolicy = B.batchPolicy(policy());
+    const controller = B.createBatch(selectedQueue.map(entry => entry.id), batchPolicy);
+    const run = {controller,stopped:false,contexts:new Map(),checks:new Map(),receipts:[],runId:crypto.randomUUID()};
+    state.batchRun = run;
+    const config = [ui.set,ui.challenge,ui.season,ui.platform,...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling];
+    config.forEach(control => { control.disabled = true; });
+    ui.batchStop.disabled = false;
+    const guard = () => {
+      if (state.batchRun !== run || run.stopped || controller.snapshot().status !== 'running') throw new Error('Otomatik sıra durduruldu; yeni işlem başlatılmadı.');
+      if (!ui.batchConsent.checked || !ui.settings.protectPlayed.checked || !ui.settings.protectEvolutions.checked || ui.settings.allowConcept.checked) throw new Error('Otomatik sıra kart koruması değişti.');
+      const current = scope();
+      if (current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Otomatik sıra sezonu veya platformu değişti.');
+    };
+    const record = phase => {
+      const report = {runId:run.runId,scope:selectedScope,selectedSets:selectedQueue,updatedAt:new Date().toISOString(),phase,snapshot:controller.snapshot(),receipts:run.receipts};
+      // Persist before every external write; storage failures stop dispatch.
+      localStorage.setItem(BATCH_STORAGE,JSON.stringify(report)); state.batchReport = report;
+      const p = report.snapshot.progress;
+      const labels = {snapshot:'Set kontrol ediliyor',solve:'Kadro çözülüyor',save:'Kadro kaydediliyor','save-confirmed':'Kadro kaydedildi',submit:'Kadro teslim ediliyor','submit-confirmed':'Teslim doğrulandı',claim:'Ödül ve sayaç kontrol ediliyor','claim-confirmed':'Ödül doğrulandı','set-completed':'Set tamamlandı','set-skipped':'Tamamlanan veya hakkı biten set atlandı',finished:'Sıra sona erdi',failed:'Sıra durdu'};
+      const active = selectedQueue.find(entry => String(entry.id) === report.snapshot.currentSetId);
+      ui.batchStatus.textContent = `${p.completed}/${p.total} set tamamlandı · ${p.confirmedChallenges} parça teslim edildi${active ? `\n${active.name}` : ''}\n${labels[phase] || phase}`;
+      ui.batchExport.disabled = false;
+    };
+    const freshSet = async setId => {
+      guard(); services.SBC.reset();
+      const data = await observe(services.SBC.requestSets(), 'Sıradaki SBC setleri'); guard();
+      if (!Array.isArray(data.sets)) throw new Error('EA set listesi okunamadı.');
+      const set = data.sets.find(item => String(item.id) === String(setId));
+      if (!set) throw new Error(`SBC seti ${setId} artık mevcut değil.`);
+      const data2 = await observe(services.SBC.requestChallengesForSet(set), 'Sıradaki SBC parçaları'); guard();
+      if (!Array.isArray(data2.challenges)) throw new Error('EA görev listesi okunamadı.');
+      const context = {set,challenges:data2.challenges,sets:data.sets}; run.contexts.set(String(setId),context); return context;
+    };
+    const choose = (step, context) => {
+      const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
+      if (!challenge || challenge.status === 'COMPLETED') throw new Error('Sıradaki görev değişti veya zaten tamamlandı.');
+      state.sets = context.sets; state.challenges = context.challenges.filter(item => item.status !== 'COMPLETED');
+      options(ui.set,state.sets); ui.set.value = step.setId;
+      options(ui.challenge,state.challenges); ui.challenge.value = step.challengeId;
+      return challenge;
+    };
+    const checkPlayersNow = (solution,inv,chem) => {
+      const players = new Map(inv.items.map(item => [String(item.id),card(item,inv,chem)]));
+      const currentPolicy = policy(), pale = readPaletools();
+      if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
+      P.validateSolution(solution.preview.result,solution.preview.input,currentPolicy,pale);
+      const fresh = solution.preview.rows.map(row => {
+        const player = players.get(String(row.id));
+        if (!player || String(player.definitionId) !== String(row.player.definitionId) || String(player.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: envanter kartı değişti.`);
+        const reason = P.blockedReason(player,currentPolicy,pale); if (reason) throw new Error(`${player.name}: ${reason}`);
+        return player;
+      });
+      B.assertBatchPlayers(fresh); return fresh;
+    };
+    const verifyPlayers = async (step, solution, phase) => {
+      guard(); let submissionCheck;
+      if (phase === 'submit') {
+        const context = await freshSet(step.setId), challenge = choose(step,context);
+        const data = await challengeData(challenge,context.set); guard();
+        if (JSON.stringify(data.constraints) !== JSON.stringify(solution.preview.input.sbcData.constraints) || JSON.stringify(data.formation) !== JSON.stringify(solution.preview.input.sbcData.formation)) throw new Error('Teslim öncesinde SBC koşulları değişti.');
+        const slots = challenge.squad?._players;
+        if (!Array.isArray(slots)) throw new Error('EA kaydedilmiş kadroyu döndürmedi.');
+        const expected = new Map(solution.preview.rows.map(row => [row.squadPosition,row.player]));
+        for (let index=0;index<11;index++) {
+          const item = slots[index]?._item, wanted = expected.get(index);
+          if (wanted ? !item || String(item.id) !== String(wanted.id) || String(item.definitionId) !== String(wanted.definitionId) || item.concept : typeof item?.isPlayer === 'function' && item.isPlayer()) throw new Error('EA’daki kaydedilmiş kadro çözümle aynı değil; teslim durduruldu.');
+        }
+        assertSubmitAllowed(challenge,context.set);
+        if (!Number.isSafeInteger(challenge.timesCompleted) || !Number.isSafeInteger(context.set.timesCompleted)) throw new Error('EA tamamlanma sayacı okunamadı.');
+        submissionCheck = {...context,challenge,beforeChallenge:challenge.timesCompleted,beforeSet:context.set.timesCompleted};
+      }
+      // Read inventory/active squad after all challenge-loading awaits. Keep its
+      // live entities so getters and locks can be rechecked at dispatch too.
+      const inv = await inventory(), chem = chemistry(); guard();
+      const fresh = checkPlayersNow(solution,inv,chem);
+      if (submissionCheck) run.checks.set(String(step.challengeId),{...submissionCheck,inv,chem});
+      guard(); return fresh;
+    };
+    try {
+      invalidate(); record('Başlatıldı');
+      await R.run({controller,onProgress:event => record(event.phase),adapter:{
+        snapshotSet:async setId => {
+          const {set,challenges} = await freshSet(setId);
+          if (typeof set.isComplete !== 'function' || typeof set.isRepeatable !== 'boolean' || typeof set.isLimitedRepeatable !== 'boolean') throw new Error('EA tekrar hakkı okunamadı.');
+          const remaining = set.isLimitedRepeatable ? set.getRepeatsRemaining() : null;
+          return {setId:String(set.id),completed:set.isComplete(),repeatable:set.isRepeatable,remaining,
+            challenges:challenges.map(challenge => ({challengeId:String(challenge.id),completed:challenge.status === 'COMPLETED'}))};
+        },
+        solve:async step => {
+          const context = await freshSet(step.setId); choose(step,context); guard();
+          await solve(); guard(); const preview = state.preview;
+          if (!preview || String(preview.set.id) !== String(step.setId) || String(preview.challenge.id) !== String(step.challengeId)) throw new Error('Sıradaki görev için yeni çözüm oluşmadı.');
+          B.assertBatchPlayers(preview.rows.map(row => row.player));
+          return {players:preview.rows.map(row => row.player),preview};
+        },
+        freshPlayers:verifyPlayers,
+        apply:async (step,solution) => {
+          guard(); if (state.preview !== solution.preview) throw new Error('Sıra önizlemesi değişti.');
+          const receipt = await apply(guard); return receipt;
+        },
+        submit:async (step,solution) => {
+          guard(); const check = run.checks.get(String(step.challengeId));
+          if (!check || String(check.set.id) !== String(step.setId)) throw new Error('Teslim öncesi doğrulama eksik.');
+          checkPlayersNow(solution,check.inv,check.chem);
+          for (const row of solution.preview.rows) {
+            const item = check.challenge.squad?._players?.[row.squadPosition]?._item;
+            if (!item || item.concept || String(item.id) !== String(row.id) || String(item.definitionId) !== String(row.player.definitionId)) throw new Error('Teslim anında kadro değişti.');
+          }
+          assertSubmitAllowed(check.challenge,check.set);
+          const response = await observe(services.SBC.submitChallenge(check.challenge,check.set,false,services.Chemistry.isFeatureEnabled()), 'Otomatik SBC teslimi');
+          // Validate the response, not resettable local challenge.status.
+          if (String(response.challengeId) !== String(step.challengeId) || String(response.setId) !== String(step.setId) || typeof response.setCompleted !== 'boolean' || !Array.isArray(response.grantedChallengeAwards)) throw new Error('EA teslim yanıtı doğrulanamadı; aynı kadro tekrar gönderilmeyecek.');
+          const receipt = {setId:String(step.setId),challengeId:String(step.challengeId),completed:true,setCompleted:response.setCompleted,rewardsGranted:true,
+            at:new Date().toISOString(),beforeChallenge:check.beforeChallenge,beforeSet:check.beforeSet,
+            cardIds:solution.players.map(player => String(player.id)),zeroGames:solution.players.every(player => player.gamesPlayed === 0),
+            coinSpent:0,grantedChallengeAwards:response.grantedChallengeAwards};
+          run.receipts.push(receipt); record('EA teslim yanıtı alındı'); return receipt;
+        },
+        verifyRewards:async (step,receipt) => {
+          // Rewards are granted by submitChallenge. This read verifies counters;
+          // there is no separate claim, purchase, pack-open, or pick-selection call.
+          const context = await freshSet(step.setId);
+          const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
+          if (!challenge || !Number.isSafeInteger(challenge.timesCompleted) || challenge.timesCompleted <= receipt.beforeChallenge ||
+              receipt.setCompleted && (!Number.isSafeInteger(context.set.timesCompleted) || context.set.timesCompleted <= receipt.beforeSet)) throw new Error('EA tamamlanma sayacı teslim yanıtını henüz doğrulamadı. Sıra durdu.');
+          if (typeof repositories.Item?.setDirty === 'function' && typeof ItemPile !== 'undefined') repositories.Item.setDirty(ItemPile.PURCHASED);
+          return {setId:receipt.setId,challengeId:receipt.challengeId,rewardsGranted:true,setCompleted:receipt.setCompleted};
+        }
+      }});
+      record(controller.snapshot().status === 'completed' ? 'Seçili sıra tamamlandı' : 'Durduruldu');
+      status('Otomatik sıra sona erdi. Teslim edilen parçalar çalışma kaydında; ödül paketleri açılmadı.');
+    } catch (error) { record(`Durdu: ${error.message || error}`); throw error; }
+    finally {
+      state.batchRun = null; config.forEach(control => { control.disabled = false; });
+      ui.batchConsent.checked = false; invalidate(); renderBatch();
+    }
   }
 
   function el(tag, text, parent) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (parent) parent.append(node); return node; }
   function options(select, entries) { select.replaceChildren(); entries.forEach(entry => { const option = el('option', entry.name, select); option.value = entry.id; }); }
+  function renderBatch() {
+    if (!ui.batchList) return;
+    ui.batchList.replaceChildren();
+    for (const entry of state.batchQueue) el('li', entry.name, ui.batchList);
+    if (!state.batchQueue.length) el('li', 'Henüz set eklenmedi.', ui.batchList);
+    ui.batchAdd.disabled = state.busy;
+    ui.batchClear.disabled = state.busy || !state.batchQueue.length;
+    ui.batchStart.disabled = state.busy || !state.batchQueue.length || !ui.batchConsent.checked;
+    ui.batchStop.disabled = !state.batchRun;
+    ui.batchExport.disabled = !state.batchReport;
+  }
+  function stopBatch() {
+    if (state.batchRun) { state.batchRun.stopped = true; state.batchRun.controller.stop(); }
+    invalidate();
+    status('Durduruldu. Başlatılan kadronun teslimi EA’da tamamlanabilir; sonraki kadroya geçilmeyecek.');
+  }
+  function settingsChanged() { if (state.batchRun) stopBatch(); else invalidate(); }
+  function downloadJSON(value, filename) {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(value,null,2)], {type:'application/json'}));
+    const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url),1000);
+  }
   function renderReview(preview) {
     ui.review.replaceChildren();
     el('h3', preview.input.sbcData.challengeName, ui.review);
@@ -1025,7 +1488,7 @@
   ui.solve = el('button', 'Çöz ve önizle', controls); ui.solve.className = 'launch';
   ui.liveSolve = el('button', 'Anlık piyasadan çöz', controls);
   el('p','Çöz ve önizle: FUT.GG veri tabanı. Anlık piyasadan çöz: EA’nın açık ilanları; arama tavanı, kart ve toplam bütçe limitlerinin en düşüğü kullanılır.',panel).className='muted';
-  const cancel = el('button', 'İptal', controls); cancel.addEventListener('click', () => { invalidate(); status('İptal edildi. Bekleyen sonuç uygulanmayacak.'); });
+  const cancel = el('button', 'İptal', controls); cancel.addEventListener('click', () => { if (state.batchRun) stopBatch(); else { invalidate(); status('İptal edildi. Bekleyen sonuç uygulanmayacak.'); } });
   ui.export = el('button', 'İsteği dışa aktar', controls); ui.export.disabled = true;
   ui.export.addEventListener('click', () => {
     if (!state.input) return;
@@ -1036,15 +1499,47 @@
   ui.poolInfo = el('p', '', panel); ui.poolInfo.className = 'muted';
   ui.review = el('div', undefined, panel);
   ui.apply = el('button', 'İnceledim · Kadroyu SBC’ye uygula', panel); ui.apply.className = 'apply'; ui.apply.disabled = true;
-  el('p', 'Gönderme, satın alma ve paket açma otomasyonu içermez. TitiroMonkey Auto-SBC tabanlı · MIT.', panel).className = 'muted';
+  const batchSection = el('section', undefined, panel);
+  el('h3', 'Otomatik SBC sırası', batchSection);
+  el('p', 'Seçtiğiniz her setin kalan parçalarını bir kez çözer, uygular ve teslim eder. Oynanmış, evolution ve aktif kadro kartları korunur. Coin harcamaz; paket açmaz ve oyuncu seçimi yapmaz. Durdur, sonraki kadroları engeller; EA’ya başlatılmış teslim tamamlanabilir.', batchSection).className = 'muted';
+  ui.batchList = el('ol', undefined, batchSection);
+  const batchControls = el('div', undefined, batchSection); batchControls.className = 'row';
+  ui.batchAdd = el('button', 'Seçili seti sıraya ekle', batchControls);
+  ui.batchClear = el('button', 'Sırayı temizle', batchControls);
+  const consentLabel = el('label', undefined, batchSection);
+  ui.batchConsent = el('input', undefined, consentLabel); ui.batchConsent.type = 'checkbox'; ui.batchConsent.checked = false;
+  consentLabel.append(document.createTextNode('Bu sıradaki kadroları otomatik teslim et; kullanılan kartlar kulübümden silinecek.'));
+  const batchRunControls = el('div', undefined, batchSection); batchRunControls.className = 'row';
+  ui.batchStart = el('button', 'Sırayı otomatik tamamla', batchRunControls); ui.batchStart.className = 'launch';
+  ui.batchStop = el('button', 'Sırayı durdur', batchRunControls);
+  ui.batchExport = el('button', 'Çalışma kaydını indir', batchRunControls);
+  ui.batchStatus = el('p', 'Sıra çalışmıyor.', batchSection); ui.batchStatus.className = 'status';
+  try {
+    const previous = JSON.parse(localStorage.getItem(BATCH_STORAGE) || 'null');
+    if (previous?.runId) { state.batchReport = previous; ui.batchStatus.textContent = 'Önceki çalışma kaydı mevcut. Sayfa yenilendiğinde otomatik devam edilmez; kaydı ve EA’daki tamamlanma durumunu kontrol edin.'; }
+  } catch { ui.batchStatus.textContent = 'Önceki çalışma kaydı okunamadı. Otomatik devam kapalı.'; }
+  ui.batchAdd.addEventListener('click', () => {
+    if (state.busy) return;
+    const selected = state.sets.find(set => String(set.id) === ui.set.value);
+    if (!selected) { fail(new Error('Önce SBC listesini yükleyip bir set seçin.')); return; }
+    if (!state.batchQueue.some(entry => String(entry.id) === String(selected.id))) state.batchQueue.push({id:String(selected.id),name:selected.name});
+    ui.batchConsent.checked = false; renderBatch();
+  });
+  ui.batchClear.addEventListener('click', () => { if (!state.busy) { state.batchQueue = []; ui.batchConsent.checked = false; renderBatch(); } });
+  ui.batchConsent.addEventListener('change', () => { if (state.batchRun && !ui.batchConsent.checked) stopBatch(); renderBatch(); });
+  ui.batchStart.addEventListener('click', () => action(runBatch));
+  ui.batchStop.addEventListener('click', stopBatch);
+  ui.batchExport.addEventListener('click', () => { if (state.batchReport) downloadJSON(state.batchReport, 'autosbc-batch-report.json'); });
+  renderBatch();
+  el('p', 'Tekli önizleme yalnızca kadroyu kaydeder. Otomatik sıra yalnızca açıkça seçilen setleri teslim eder. TitiroMonkey Auto-SBC tabanlı · MIT.', panel).className = 'muted';
   ui.refresh.addEventListener('click', () => action(loadSets));
   ui.set.addEventListener('change', () => action(loadChallenges));
-  ui.challenge.addEventListener('change', invalidate);
-  for (const select of [ui.season,ui.platform]) select.addEventListener('change', () => { invalidate(); health().catch(fail); });
+  ui.challenge.addEventListener('change', settingsChanged);
+  for (const select of [ui.season,ui.platform]) select.addEventListener('change', () => { settingsChanged(); health().catch(fail); });
   ui.solve.addEventListener('click', () => action(solve));
   ui.liveSolve.addEventListener('click', () => action(() => solve(activeChallengeContext(),true)));
   ui.apply.addEventListener('click', () => action(apply));
-  for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling]) input.addEventListener('change', invalidate);
+  for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling]) input.addEventListener('change', settingsChanged);
   if (window.AutoSBCNative) {
     window.AutoSBCNative.install({
       document,

@@ -11,10 +11,11 @@ EA Web App + Paletools saved locks
    -> fresh public-market enrichment + selection policy
    -> constraint solver
    -> structured result + slot mapping + diagnostics
-   -> user review
+   -> individual user review OR explicit finite-queue start
    -> re-read live inventory/locks
-   -> explicit squad Apply
-   -> native EA manual submission
+   -> guarded squad Apply
+   -> individual native submission OR guarded batch submission
+   -> verify exact receipt and rewards before advancing a batch
 ```
 
 The public catalog is a separate path: unauthenticated FUT.GG definition API + versioned public price CDN -> SQLite under `data/`. It is not a copy of the private SBC Monkey database or the user’s club.
@@ -32,6 +33,8 @@ The public catalog is a separate path: unauthenticated FUT.GG definition API + v
 | `backend/main.py` | Local API, request bounds, single active solve, expiring jobs, static dashboard. |
 | `backend/logger.py` | Bounded in-memory diagnostics. |
 | `frontend/policy.js` | Browser-side locks, policy and response validation. |
+| `frontend/batch-policy.js` | Finite set/part state, mandatory owned-card protection and effect receipts. |
+| `frontend/batch-runner.js` | Solve/save/submit/reward sequencing, stop checks and no automatic write retries. |
 | `frontend/companion.js` | EA adapter, snapshots, UI and reviewed Apply. |
 | `frontend/extension-*.js` | Narrow localhost transport bridge. |
 | `frontend/build.mjs` | One-source userscript/extension generation. |
@@ -44,7 +47,7 @@ The public catalog is a separate path: unauthenticated FUT.GG definition API + v
 - Origin, host, input size/time and endpoint restrictions; removal of arbitrary relay and implicit club CSV exposure.
 - Solver identity/scope/rarity/rating/chemistry/missing-price protections and status regressions.
 - Catalog decoding, stale/null/nonmarket values, preservation on provider failure, normalized positions and club ownership separation, bounded/resumed traversal.
-- Browser policy and mock adapter: solve makes no writes; explicit Apply is the only save path; changed locks, cancelled previews and unknown IDs block Apply.
+- Browser policy and mock adapter: solve makes no writes; individual Apply and explicit batches share the guarded save path; changed locks, cancelled previews and unknown IDs block Apply.
 - Generated script and service-worker syntax; dashboard JavaScript syntax.
 - Actual Chrome local dashboard: synthetic pool loaded, solver run, reviewed 11-card output shown, source prices and catalog search inspected.
 
@@ -66,13 +69,30 @@ counts, and rechecks fresh inventory before Apply. Preview rows show the count.
 The backend enforces `protectPlayed` when supplied; its legacy API default stays
 off for older uploaded inventories without those fields. EA can initialize absent
 raw stats arrays to zero, so this follows EA Bio's authority and does not prove
-raw payload presence. Live validation of this new gate is recorded separately.
+raw payload presence. The 11-player live run below verified that the Companion
+protection was enabled and every selected row showed zero matches.
 
 The first 11-player 10x 85+ request also exposed EA's `count=-1` sentinel on a
 squad-wide TEAM_RATING condition (minimum 84). Version 27.0.4 normalizes that
 sentinel only for verified squad-wide keys. Counted player/group rules still
 reject negative counts; the accompanying rarity-group 83 minimum of one remains
 enforced. The regression fixture contains these constraints without club data.
+
+In the subsequent live 27.0.4 run, Auto-SBC solved and applied 10x 85+
+(challenge 3874) using ten SBC-storage cards and one normal club card. The
+"Oynanmış kartları koru" checkbox was on and all eleven preview rows showed
+"Maç = 0". Native EA displayed squad rating 84 with all three requirements
+satisfied (3/3). Exchange, Claim Rewards, and the confirmation that the pack
+was sent to My Packs were verified. The pack remained unopened and the coin
+balance remained 577,251.
+
+Two 91-rated parts of the 98+ FOF/FUTTIES Pick subsequently completed through
+Auto-SBC solve/Apply followed by native submission. The current five-group task
+therefore stands at **1/5 groups and 3/17 segments**: 10x 85+ is complete and the
+pick has 2/7 parts complete. Its other five parts, Yan Diomande, Provisions, and
+Ultimate Rewind remain pending. These completions predate the new batch runner.
+The successful storage-containing save is evidence for that run, not proof that
+every storage Apply is reliable.
 
 A separate concept-enabled run produced Xavier Dziekoński, definition 256953,
 with a 200-coin FUT.GG quote dated 2026-09-08T20:48:25Z. Native market search
@@ -127,10 +147,46 @@ catalog definitions, limited to two minutes and never persisted as FUT.GG quotes
 Missing live results cannot fall back to a public snapshot. Candidate coverage
 is the bounded set of observed listings, not an exhaustive market optimum.
 
-An earlier storage-card Apply returned EA 500; subsequent owned-card saves
-succeeded. Storage Apply remains unresolved. After repeated exchanges, opening
-the SBC later produced an EA null-squad error; a normal page reload restored
-navigation. Neither result is claimed as a general storage or native-cache fix.
+An earlier storage-card Apply returned EA 500; subsequent owned-card saves and
+the 27.0.4 10x 85+ save containing ten storage cards succeeded. Storage Apply
+therefore has an observed intermittent failure, not a universal failure or a
+verified universal fix; the earlier 500 remains unexplained. After repeated
+exchanges, opening the SBC later produced an EA null-squad error; a normal page
+reload restored navigation. This is not claimed as a general native-cache fix.
+
+## Explicit batch implementation (27.0.5; live test pending)
+
+The user can explicitly select a finite queue and authorize automatic submission.
+The runner snapshots each set's remaining parts, skips completed parts/exhausted
+rights, and processes one cycle per selected set. It solves and saves each squad,
+rechecks current owned cards and native submission eligibility, submits once,
+verifies the receipt and rewards, and then advances. Batch mode requires zero
+EA-reported matches, non-evolved owned cards, existing locks and active-squad
+protection. It excludes concepts and makes no purchase, pack-opening or
+player-pick selection call.
+
+The adapter follows EA's
+[native submission controller](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_4.js?_=10821),
+[SBC service and response DTO](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_2.js?_=10821),
+and [reward controller](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_3.js?_=10821).
+EA's successful `submitChallenge` response grants awards. The runner's claim
+stage is bookkeeping: it validates granted-award evidence and refreshed completion
+counters without another claim request. Exact set/challenge IDs and the returned
+`setCompleted` flag matter because repeatable challenge status can reset after a
+successful submission.
+
+The local journal records a pending effect before dispatch. Persistence failure
+blocks the request; timeout or mismatched evidence halts the queue without retry.
+Stop prevents later writes but cannot undo a request already sent. Page reload
+never resumes automatically. The local report preserves queue progress and
+receipts for reconciliation; it is not a full club-inventory dump.
+
+Mocked policy, runner and adapter integration tests exercise stop during awaited
+work, guarded fresh cards, finite repeatables, exact receipts, a failing second
+part, persistence failures and prevention of duplicate submission. Final counts
+are recorded in the release report. **The 27.0.5 batch itself has not completed a
+live account run yet; extension reload and live validation remain pending.** The
+current live task count stays at 1/5 groups and 3/17 segments.
 
 ## Known limitations
 

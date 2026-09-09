@@ -93,13 +93,15 @@ function harness(overrides = {}) {
   ctx.window = ctx;
   const context = vm.createContext(ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/policy.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-policy.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-runner.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/companion.js'),'utf8'),context);
   const elements = [];
   const visit = element => { elements.push(element);element.children.forEach(visit);if(element.shadowRoot)visit(element.shadowRoot);}; visit(body);
   const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
   const selects = elements.filter(element=>element.tag==='select');
   const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('SBC listesini yükle').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
-  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,activeSquadPlayers,localStorage,selects,nativeOptions,
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,localStorage,selects,nativeOptions,
     navigate:id=>{activeChallenge=id===null?null:{...challenge,id};}};
 }
 test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
@@ -517,5 +519,93 @@ test('market pagination uses EA-mutated count and page argument with a nine-requ
   await t.test('bounded full pages',async()=>{
     const h=marketSearchHarness((query,page,listing)=>Array.from({length:21},()=>listing({rareflag:3})));
     await h.refresh();await h.button('Anlık piyasadan çöz').click();assert.equal(h.calls.length,9);assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  });
+});
+
+function batchHarness(overrides={}) {
+  const h=harness(overrides);
+  Object.assign(h.set,{isRepeatable:false,isLimitedRepeatable:false,timesCompleted:0,awards:[]});
+  Object.assign(h.challenge,{timesCompleted:0,awards:[],canSubmit:()=>true,hasUntradeableItems:()=>true});
+  h.ctx.UTEventTokenUtils={hasEventTokenReward:()=>false};
+  h.ctx.UTServerSettingsRepository={KEY:{SBC_ALLOW_UNTRADEABLE:'allow-untradeable'}};
+  h.ctx.services.EventToken={isEventTokenEarningDisabled:()=>false};
+  h.ctx.services.Configuration={getFeatureSetting:()=>true};
+  h.ctx.services.Chemistry.isFeatureEnabled=()=>true;
+  h.ctx.services.SBC.reset=()=>{};
+  h.ctx.services.SBC.submitChallenge=(challenge,set,skip,chem)=>{
+    assert.equal(skip,false);assert.equal(chem,true);h.writes.push('submitChallenge');
+    challenge.timesCompleted++;set.timesCompleted++;challenge.status='COMPLETED';
+    return observable({setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]});
+  };
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Bu sıradaki kadroları')).children[0];
+  h.prepare=async()=>{await h.refresh();await h.button('Seçili seti sıraya ekle').click();consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));};
+  h.report=()=>JSON.parse(h.localStorage.getItem('autosbc.local.batch.v1'));
+  return h;
+}
+test('explicit batch solves, saves, submits, verifies reward counters and completes one selected set',async()=>{
+  const h=batchHarness();await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge','submitChallenge']);
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].solverPolicy.allowConcept,false);
+  assert.equal(h.requests[0].solverPolicy.protectPlayed,true);assert.equal(h.requests[0].solverPolicy.protectEvolutions,true);
+  assert.equal(h.report().snapshot.status,'completed');assert.equal(h.report().snapshot.progress.confirmedChallenges,1);
+  assert.equal(h.report().receipts[0].coinSpent,0);assert.equal(h.report().receipts[0].rewardsGranted,true);
+});
+test('batch checks native eligibility and service untradeable gate before submit',async t=>{
+  for(const name of ['eligibility','untradeable','event-token']) await t.test(name,async()=>{
+    const h=batchHarness();
+    if(name==='eligibility')h.challenge.canSubmit=()=>false;
+    if(name==='untradeable')h.ctx.services.Configuration.getFeatureSetting=()=>false;
+    if(name==='event-token'){h.ctx.UTEventTokenUtils.hasEventTokenReward=()=>true;h.ctx.services.EventToken.isEventTokenEarningDisabled=()=>true;}
+    await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.equal(h.report().snapshot.status,'blocked');
+  });
+});
+test('batch stops if played history or an active squad lock changes after save',async t=>{
+  for(const name of ['played','active'])await t.test(name,async()=>{
+    const h=batchHarness();h.ctx.services.SBC.saveChallenge=()=>{
+      h.writes.push('saveChallenge');
+      if(name==='played')h.players[0].getStats=()=>[1,0,0,0,0];
+      else h.activeSquadPlayers.push({_item:h.players[0]});
+      return observable({});
+    };
+    await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.equal(h.report().snapshot.status,'blocked');
+  });
+});
+test('batch rejects a changed saved squad and does not submit or consume another card',async()=>{
+  const h=batchHarness();let loads=0;
+  h.ctx.services.SBC.loadChallenge=()=>{loads++;if(loads===3)h.squad._players[0]._item=h.players[11];return observable(h.challenge);};
+  await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/kaydedilmiş kadro/);
+});
+test('batch validates submit identity and never retries an uncertain submission',async()=>{
+  const h=batchHarness();h.ctx.services.SBC.submitChallenge=()=>{h.writes.push('submitChallenge');return observable({setId:999,challengeId:10,setCompleted:true,grantedChallengeAwards:[]});};
+  await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'blocked');
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Bu sıradaki kadroları')).children[0];
+  consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);
+});
+test('batch stop while native submit internally saves records the in-flight result and starts no next step',async()=>{
+  const h=batchHarness();let release,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>({observe(owner,callback){h.writes.push('submitChallenge');started();release=()=>{challenge.timesCompleted++;set.timesCompleted++;callback(this,{success:true,status:200,data:{setId:20,challengeId:10,setCompleted:true,grantedChallengeAwards:[]}});};},unobserve(){}});
+  await h.prepare();const pending=h.button('Sırayı otomatik tamamla').click();await entered;
+  await h.button('Sırayı durdur').click();release();await pending;
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'stopped');
+  assert.equal(h.report().receipts.length,1);assert.equal(h.report().receipts[0].completed,true);
+});
+test('batch cannot dispatch save when durable pending journal fails',async()=>{
+  const h=batchHarness();await h.prepare();const save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.batch.v1'&&JSON.parse(value).phase==='save')throw new Error('Storage full');save(key,value);};
+  await h.button('Sırayı otomatik tamamla').click();assert.deepEqual(h.writes,[]);
+});
+test('batch rechecks Paletools locks added while loading the saved challenge and at dispatch journaling',async t=>{
+  for(const phase of ['load','dispatch'])await t.test(phase,async()=>{
+    const h=batchHarness();let loads=0;
+    if(phase==='load')h.ctx.services.SBC.loadChallenge=()=>{loads++;if(loads===3)h.localStorage.setItem('paletools:2026:account:lockedItems','[1000]');return observable(h.challenge);};
+    else {const save=h.localStorage.setItem.bind(h.localStorage);h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.batch.v1'&&JSON.parse(value).phase==='submit')save('paletools:2026:account:lockedItems','[1000]');};}
+    await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/Paletools lock/);
   });
 });

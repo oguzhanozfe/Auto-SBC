@@ -3,7 +3,8 @@
 This is an independently implemented local companion built on the MIT-licensed
 TitiroMonkey Auto-SBC repository and its EA service adapters. It does not contain
 SBC Monkey or Paletools proprietary code. Both installation formats are generated
-from `policy.js`, `native-entry.js` and `companion.js`; do not edit the generated files.
+from `policy.js`, `native-entry.js`, `batch-policy.js`, `batch-runner.js` and
+`companion.js`; do not edit the generated files.
 
 ## Build and test
 
@@ -51,14 +52,15 @@ the floating Auto-SBC panel provides the scope and backend controls.
 The native entry resolves the current challenge through the MIT upstream EA
 controller adapter and uses the same solve-and-review pipeline as the floating
 panel. It reads current IDs again on click. Leaving the challenge discards a
-pending result and prevents applying its preview. **Apply remains an explicit
-second action**, and native **Exchange Players remains manual**. Requirements for
+pending result and prevents applying its preview. In this individual review flow,
+**Apply remains an explicit second action**, and native **Exchange Players remains
+manual**. Requirements for
 special cards never weaken the selected protection policy automatically.
 
 Select a set and challenge. Set the rating ceiling, card budget, purchase budget,
 total squad-value budget,
-tradeable/storage/special/evolution preferences, cost weights and optional item
-locks or required item IDs. Defaults protect special/evolution cards, enable
+tradeable/storage/special/evolution/played-card preferences, cost weights and optional item
+locks or required item IDs. Defaults protect special/evolution/played cards, enable
 mixed club-and-market solving, use a rating ceiling of 89, and prefer untradeable duplicates at 10% of
 market cost, other untradeables at 70%, tradeables at 100%.
 
@@ -94,11 +96,46 @@ The regular solve button retains the clearly identified FUT.GG snapshot mode.
 
 **İnceledim · Kadroyu SBC’ye uygula** re-reads inventory and locks, checks the
 challenge still matches, and saves the squad to that challenge. It does not submit
-the challenge. The preview expires after five minutes. Native EA submission
-remains manual. There are no pack, player-pick, market, discard, repeat, login
-automation, or keyboard shortcut hooks. Closing the panel does not cancel a job;
+the challenge. The preview expires after five minutes. Submission in this
+individual review flow remains manual. Closing the panel does not cancel a job;
 the explicit **İptal** button discards its result. The backend may finish the
 current job before accepting another request.
+
+## Explicit finite batch (27.0.5)
+
+In **Otomatik SBC sırası**, choose a set and use **Seçili seti sıraya ekle** for
+each desired set. Confirm the checkbox explaining that submitted cards leave
+the club, then choose **Sırayı otomatik tamamla**. This separate action authorizes
+the selected finite queue to solve, save, submit, verify rewards and continue to
+the next unfinished part without a click for every squad. Each selected set is
+processed for one cycle only, including repeatable sets; completed parts and
+exhausted rights are skipped. The work list is fixed before processing each set.
+
+Batch mode forces played-card and evolution protection on and concepts off.
+It uses only existing owned club/storage cards. Before saving and submitting,
+the adapter rechecks inventory identities, EA-reported match history, active
+squad and Paletools locks, saved squad slots, current requirements and EA's
+submission checks. Configuration changes stop the run. A successful EA
+`submitChallenge` response grants the rewards; the following reward stage verifies
+its exact set/challenge receipt and refreshed completion counters. There is no
+second reward-claim request, pack opening or player-pick selection.
+
+**Sırayı durdur** prevents new effects; an EA request already dispatched can still
+finish. The local progress journal is written before dispatch, and a failed
+journal write prevents that request. A timeout, mismatched receipt or uncertain
+write halts the queue without automatic retry. **Çalışma kaydını indir** exports
+the local journal and receipts. Page reload never resumes a run automatically;
+the report remains for reconciliation with EA's actual completion state.
+Neither batch nor individual review purchases players, opens packs, selects
+player-pick rewards, logs in, or discards inventory.
+
+The integration follows EA's publicly served
+[submission controller](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_4.js?_=10821),
+[SBC service and response DTO](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_2.js?_=10821),
+and [reward presentation controller](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_3.js?_=10821).
+These private interfaces can change. Version 27.0.5 batch behavior is covered by
+mocked lifecycle and integration tests; its account-level live test is pending
+extension reload and execution.
 
 ## Paletools compatibility scope
 
@@ -118,7 +155,9 @@ player entities, submission methods or Paletools behavior.
 The active squad is read through EA's squad service on both solve and Apply.
 Its owned inventory IDs are hard locks, including any substitutes present in the
 returned roster. An unreadable active roster blocks the action. This protects the
-current squad; it does not establish which other cards have been played before.
+current squad. The separate played-card gate uses the same getters as EA Player
+Bio and blocks positive or unreadable counts when enabled. EA can initialize
+missing raw statistics to zero, so this is not an independent history database.
 Current EA boolean `tradable` and legacy boolean `untradeable` are supported.
 Missing, nonboolean or conflicting values use the full tradeable cost policy and
 are excluded when tradeable cards are disallowed; review labels them as unknown.
@@ -126,9 +165,10 @@ are excluded when tradeable cards are disallowed; review labels them as unknown.
 Sanitized observed UI fixtures are recorded in
 `fixtures/native-ui-observations.json`. Lifetime **COMPLETED**, current **Repeatable**
 remaining and the challenge fraction are distinct values. On an exhausted daily,
-COMPLETED can disappear while Repeatable explicitly shows zero. This version does
-not invent or display a daily counter from private field guesses. A concrete
-rendered DOM anchor is still needed before adding a counter reader. Menu entries
+COMPLETED can disappear while Repeatable explicitly shows zero. Batch availability
+uses the verified EA set methods and remaining-rights fields; submission receipts
+and refreshed `timesCompleted` counters confirm progress. It does not equate a
+repeatable challenge's reset status with an unsuccessful submission. Menu entries
 such as **Remove Last Evolution** do not establish that a selected card is evolved.
 
 Public catalog concepts form a server-selected, diversified pool filtered using
@@ -152,7 +192,8 @@ and permits owned-only solutions while refusing substitute FC 26 purchase prices
 
 Node tests cover the pure policy, Paletools formats, malformed/unsafe responses,
 legacy position mapping and a mocked EA adapter workflow. The mock checks that a
-solve is read-only, explicit Apply is the only squad-save path, lock changes after
+solve is read-only, individual Apply and the explicit batch use the guarded
+squad-save path, lock changes after
 review prevent Apply, and cancellation/foreign IDs cannot produce an actionable
 preview. Mixed, market-only and FC 27-without-quotes cases are covered, along with
 cross-season quotes, stale prices, source/identity/shopping-list tampering and the
@@ -161,8 +202,15 @@ handler binding before mount, repeated rendering, missing/late challenge data,
 rapid clicks, challenge identity changes and result cancellation on navigation.
 The installed 27.0.1 extension completed ten owned-card Daily Silver solve/Apply
 flows on 2026-09-09; native exchanges and reward claims were verified separately.
-The concept preview also produced an exact 65-rated Xavier Dziekoński quote.
-Native concept placement in 27.0.2 still requires extension reload and live
-verification. The tests' EA object shapes come from the public adapter and
-controlled fixtures; a mock pass is not live concept validation.
+Native live-price concept placement passed in 27.0.3: Mason Toye, 65-rated, at a
+200-coin observed EA price, with no purchase or submission. In the current
+27.0.4 task, 10x 85+ and two 91-rated parts of the 98+ FOF/FUTTIES Pick have
+completed using Auto-SBC solve/Apply followed by native submission: **1/5 groups,
+3/17 parts**. These are not results of the new batch runner. The other parts and
+groups remain pending, and batch live validation still awaits the 27.0.5 reload.
+Batch tests cover finite queues, completed-part skipping, mandatory owned-card
+guards, second-part failure, stop during awaited operations, repeatable status
+reset, exact receipts, persistence failure and prevention of duplicate submits.
+The tests' EA object shapes come from the public adapter and controlled fixtures;
+a mock pass is not account-level live validation.
 EA's private adapter APIs may change; unreadable responses fail with diagnostics.
