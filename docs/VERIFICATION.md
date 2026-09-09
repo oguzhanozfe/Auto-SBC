@@ -65,8 +65,22 @@ with a 200-coin FUT.GG quote dated 2026-09-08T20:48:25Z. Native market search
 found no listing at 200 and listings starting at 350. The user clarified that
 the test should place the concept directly in the SBC; no purchase completed.
 Version 27.0.2 implements that placement using EA concept search and retains
-the shopping list. It also adds a separate live EA transfer-search mode. Live
-concept placement and search remain pending extension reload.
+the shopping list. It also adds a separate live EA transfer-search mode.
+
+At 2026-09-09T08:58:29.760Z, the live EA mode actually read two search responses
+and 21 distinct quotes, with a final Buy Now ceiling of 200 coins. It selected
+Bertuğ Yıldırım, rating 69, definition 50599553 / asset 267905, at 200 coins for
+Daily Silver Upgrade. The preview identified EA Transfer Market as its source.
+Apply then stopped at its concept identity guard before changing the squad.
+This confirms live price search but does not yet confirm native concept save.
+Balance remained 577,251 and the SBC remained empty, with one daily right.
+
+Version 27.0.3 separates EA's full `definitionId` (the exact card revision) from
+`databaseId` (the athlete identity). EA's public `UTItemEntity` getter computes
+the latter using `ItemIdMask.DATABASE`; `PlayerMeta.id` can instead identify the
+full revision. The concept guard still requires the exact definition, athlete,
+concept entity, rating and rarity. Mismatches now identify the failed public
+card fields in the UI. The corrected native save still requires a live rerun.
 
 The market adapter contract was checked against EA's publicly served
 `ocompiled.js?_=10821` and `compiled_3.js?_=10821`: quality is bronze/silver/gold;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto-SBC Local
 // @namespace    https://github.com/TitiroMonkey/Auto-SBC
-// @version      27.0.2
+// @version      27.0.3
 // @description  Local EA FC SBC solver with protected cards, Paletools locks and mandatory squad review.
 // @author       TitiroMonkey; Auto-SBC Local contributors
 // @license      MIT
@@ -480,6 +480,12 @@
     const activeSquadIds = new Set(slots.map(slot => String(slot._item.id)).filter(id => id !== '0' && id !== ''));
     return { items: [...unique.values()], storageIds, duplicates, activeSquadIds };
   }
+  function athleteId(item) {
+    // EA databaseId is the athlete ID (definitionId & ItemIdMask.DATABASE).
+    // PlayerMeta may be keyed by a full card revision; getAssetId() instead
+    // returns cardassetid, which is not a player identity.
+    return item?.databaseId ?? item?.assetId ?? item?._metaData?.id ?? item?._staticData?.id;
+  }
   function card(item, inventoryState, chem) {
     const rawRarity = item.rareflag ?? item._rareflag;
     const rarity = (typeof rawRarity === 'number' || typeof rawRarity === 'string' && /^\d+$/.test(rawRarity)) &&
@@ -496,7 +502,7 @@
     const conflicting = typeof item.tradable === 'boolean' && typeof item.untradeable === 'boolean' && item.tradable === item.untradeable;
     const tradeabilityKnown = tradable !== null && !conflicting;
     return {
-      id: item.id, definitionId: item.definitionId, assetId: item._metaData?.id ?? item.assetId ?? item._staticData?.id,
+      id: item.id, definitionId: item.definitionId, assetId: athleteId(item),
       name: item._staticData?.name ?? item.name ?? String(item.definitionId), cardType,
       rating: item.rating, teamId: item.teamId, leagueId: item.leagueId, nationId: item.nationId,
       rarityId: rarity, ratingTier: tier, isUntradeable: tradeabilityKnown && !tradable, tradeabilityKnown,
@@ -567,7 +573,7 @@
           const rawRarity = item.rareflag ?? item._rareflag;
           const rarity = rawRarity != null && rawRarity !== '' && Number.isInteger(Number(rawRarity)) ? Number(rawRarity) : undefined;
           const special = typeof item.isSpecial === 'function' ? item.isSpecial() : undefined;
-          const candidate = {id:`concept:${definitionId}`,definitionId,concept:true,assetId:item._metaData?.id ?? item.assetId,
+          const candidate = {id:`concept:${definitionId}`,definitionId,concept:true,assetId:athleteId(item),
             rating:item.rating,teamId:item.teamId,leagueId:item.leagueId,nationId:item.nationId,rarityId:rarity,marketPrice:price,
             isSpecial:special === true || (rarity === undefined ? special !== false : rarity > 1),
             isEvolution:Boolean(item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution()),
@@ -603,7 +609,7 @@
     const brickIndices = squad.simpleBrickIndices || [];
     return { constraints, formation: squad._formation.generalPositions.map((value,index) => brickIndices.includes(index) ? -1 : value),
       challengeId: challenge.id, setId: set.id, brickIndices, sbcName: set.name, challengeName: challenge.name,
-      currentSolution: (squad._players || []).slice(0,11).map(slot => slot?._item?._metaData?.id || 0),
+      currentSolution: (squad._players || []).slice(0,11).map(slot => athleteId(slot?._item) || 0),
       subs: (squad._players || []).slice(11).map(slot => slot?._item?.definitionId).filter(Boolean) };
   }
   function readPaletools() {
@@ -802,13 +808,21 @@
       const item = matches[0];
       // Keep the actual EA search entity. Never turn catalog JSON into an item,
       // mark an owned card as a concept, or substitute another card version.
-      const assetId = item._metaData?.id ?? item.assetId ?? item._staticData?.id;
+      const assetId = athleteId(item);
       const rarity = item.rareflag ?? item._rareflag;
-      if (item.concept !== true || item.id == null || typeof item.isPlayer !== 'function' || item.isPlayer() !== true ||
-          assetId != null && String(assetId) !== String(row.player.assetId) ||
-          item.rating != null && Number(item.rating) !== Number(row.player.rating) ||
-          rarity != null && Number(rarity) !== Number(row.player.rarityId)) {
-        throw new Error(`${row.player.name}: EA konsept kart kimliği uyuşmuyor. Kadro değiştirilmedi.`);
+      const mismatches = [];
+      const describe = value => value == null ? 'yok' : typeof value === 'boolean' ? String(value) :
+        typeof value === 'number' || typeof value === 'string' ? String(value).slice(0,60) : 'geçersiz';
+      const mismatch = (field, expected, actual) => mismatches.push(`${field}: beklenen ${describe(expected)}, gelen ${describe(actual)}`);
+      if (item.concept !== true) mismatch('konsept', true, item.concept);
+      if (item.id == null) mismatch('EA kart kimliği', 'mevcut', item.id);
+      const isPlayer = typeof item.isPlayer === 'function' ? item.isPlayer() : undefined;
+      if (isPlayer !== true) mismatch('oyuncu kartı', true, isPlayer);
+      if (!Number.isSafeInteger(Number(assetId)) || Number(assetId) <= 0 || String(assetId) !== String(row.player.assetId)) mismatch('oyuncu kimliği', row.player.assetId, assetId);
+      if (item.rating != null && Number(item.rating) !== Number(row.player.rating)) mismatch('reyting', row.player.rating, item.rating);
+      if (rarity != null && Number(rarity) !== Number(row.player.rarityId)) mismatch('nadirlik', row.player.rarityId, rarity);
+      if (mismatches.length) {
+        throw new Error(`${row.player.name}: EA konsept kart kimliği uyuşmuyor (${mismatches.join('; ')}). Kadro değiştirilmedi.`);
       }
       resolvedConcepts.set(String(row.id), item);
     }

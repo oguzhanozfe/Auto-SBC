@@ -315,12 +315,44 @@ test('reviewed mixed Apply uses exact EA concept entities and retains the shoppi
   assert.ok(h.elements.some(e=>e.textContent.includes('Alışveriş listesi')));
   assert.ok(h.elements.some(e=>e.textContent.includes('Coin harcanmadı')));
 });
+test('EA revision metadata uses native databaseId for athlete identity in owned and concept cards',async()=>{
+  const concept={...marketCard(50599553),assetId:267905,rating:69,name:'Bertuğ Yıldırım'};
+  const raw={...eaConcept(concept),_metaData:{id:50599553},get databaseId(){return this.definitionId & 0xFFFFFF;},getAssetId:()=>0};
+  delete raw.assetId;
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  const owned=h.players[0];
+  owned.definitionId=50599554;owned._metaData.id=50599554;delete owned.assetId;
+  Object.defineProperty(owned,'databaseId',{get(){return this.definitionId & 0xFFFFFF;}});
+  h.squad._players[0]={_item:owned};
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[raw]});
+  await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].clubPlayers[0].assetId,267906);
+  assert.equal(h.requests[0].sbcData.currentSolution[0],267906);
+  await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.equal(h.squad._players[10]._item,raw);
+  assert.equal(h.squad._players[10]._item.definitionId,50599553);
+});
+test('native databaseId mismatch remains blocked and reports only failed metadata fields',async()=>{
+  const concept={...marketCard(50599553),assetId:267905,rating:69};
+  const raw={...eaConcept(concept),databaseId:267906,_metaData:{id:50599553}};
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[raw]});
+  await h.refresh();await h.button('Çöz ve önizle').click();await h.button('Konseptleri kadroya yerleştir').click();
+  assert.deepEqual(h.writes,[]);
+  const status=h.elements.find(e=>e.tag==='p'&&e.textContent.includes('EA konsept kart kimliği uyuşmuyor'));
+  assert.ok(status);
+  assert.match(status.textContent,/oyuncu kimliği: beklenen 267905, gelen 267906/);
+  assert.doesNotMatch(status.textContent,/reyting:|nadirlik:|konsept:/);
+});
 test('missing, duplicate, owned and mismatched EA concept results never mutate a squad',async t=>{
   const concept=marketCard();
   for(const [name,items] of [
     ['missing',[]],['duplicate',[eaConcept(concept),eaConcept(concept)]],
     ['wrong definition',[{...eaConcept(concept),definitionId:1}]],
+    ['different revision of same athlete',[{...eaConcept(concept),definitionId:concept.definitionId+0x1000000}]],
     ['wrong athlete',[{...eaConcept(concept),assetId:1}]],
+    ['missing athlete',[{...eaConcept(concept),assetId:undefined}]],
     ['wrong rating',[{...eaConcept(concept),rating:99}]],
     ['wrong rarity',[{...eaConcept(concept),rareflag:3}]],
     ['explicit owned',[{...eaConcept(concept),concept:false}]],
