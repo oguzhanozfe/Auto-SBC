@@ -72,7 +72,7 @@ and 21 distinct quotes, with a final Buy Now ceiling of 200 coins. It selected
 Bertuğ Yıldırım, rating 69, definition 50599553 / asset 267905, at 200 coins for
 Daily Silver Upgrade. The preview identified EA Transfer Market as its source.
 Apply then stopped at its concept identity guard before changing the squad.
-This confirms live price search but does not yet confirm native concept save.
+That 27.0.2 run confirmed live price search but did not confirm native concept save.
 Balance remained 577,251 and the SBC remained empty, with one daily right.
 
 Version 27.0.3 separates EA's full `definitionId` (the exact card revision) from
@@ -80,7 +80,25 @@ Version 27.0.3 separates EA's full `definitionId` (the exact card revision) from
 the latter using `ItemIdMask.DATABASE`; `PlayerMeta.id` can instead identify the
 full revision. The concept guard still requires the exact definition, athlete,
 concept entity, rating and rarity. Mismatches now identify the failed public
-card fields in the UI. The corrected native save still requires a live rerun.
+card fields in the UI.
+
+The live rerun passed with version 27.0.3, commit `aff5fe4`, at
+2026-09-09T09:24:25.793Z. Auto-SBC read two EA search responses containing 17
+distinct quotes, with a final Buy Now ceiling of 200 coins. It selected Mason
+Toye, rating 65, exact definition 50573901 / athlete 242253, at 200 coins for
+Daily Silver Upgrade. The UI confirmed: "Konseptler SBC kadrosuna yerleştirildi.
+Coin harcanmadı." Native EA showed the blue 65 ST concept in the challenge's
+only open GK slot, with both requirements satisfied (2/2). Player Bio confirmed
+Mason Toye, FC Ingolstadt 04, 3. Liga, Silver Common. Exchange and Submit remained
+disabled while the concept was present.
+
+Balance before and after this concept-only test was 577,251. No owned cards were
+used, no players were purchased and no exchange or reward claim occurred. One
+daily right was shown before the test; the concept placement was not another
+SBC completion. Temporary demo cost weights were restored to 0.1 / 0.7 / 1 / 2;
+the maximum rating remained 74 and the budget 2,000 coins. This run verifies the
+live EA price-to-native-concept path for this one-card SBC, without establishing
+whole-market optimality or compatibility with every challenge.
 
 The market adapter contract was checked against EA's publicly served
 `ocompiled.js?_=10821` and `compiled_3.js?_=10821`: quality is bronze/silver/gold;
