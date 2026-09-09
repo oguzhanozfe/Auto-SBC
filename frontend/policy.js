@@ -12,7 +12,7 @@
   const bool = value => value === true || value === 'true' || value === 1;
   const defaults = Object.freeze({
     allowTradeable: true, allowConcept: true, protectSpecial: true,
-    protectEvolutions: true, prioritizeDuplicates: true, onlyStorage: false,
+    protectEvolutions: true, protectPlayed: true, prioritizeDuplicates: true, onlyStorage: false,
     maxRating: 89, maxPlayerPrice: 100000, maxTotalPrice: 0, maxPurchasePrice: 0,
     weights: { duplicateUntradeable: 0.1, untradeable: 0.7, tradeable: 1, concept: 2 },
     lockedItemIds: [], lockedAssetIds: [], lockedDefinitionIds: [],
@@ -48,6 +48,10 @@
         has(pale.leagueIds, player.leagueId) || has(pale.rarityIds, player.rarityId)) return 'Paletools lock';
     if (bool(player.isLoan) || bool(player.isTimeLimited)) return 'Loan or time-limited player';
     if (bool(player.concept) && !policy.allowConcept) return 'Concept player';
+    if (!bool(player.concept) && policy.protectPlayed !== false) {
+      if (!Number.isSafeInteger(player.gamesPlayed) || player.gamesPlayed < 0) return 'Games played unknown';
+      if (player.gamesPlayed > 0) return 'Protected played card';
+    }
     if (bool(player.isEvolution) && policy.protectEvolutions) return 'Protected evolution';
     if (bool(player.isSpecial) && policy.protectSpecial) return 'Protected special card';
     if (!bool(player.concept) && !bool(player.isUntradeable) && !policy.allowTradeable) return 'Tradeable player';

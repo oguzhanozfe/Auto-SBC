@@ -138,6 +138,20 @@
     // returns cardassetid, which is not a player identity.
     return item?.databaseId ?? item?.assetId ?? item?._metaData?.id ?? item?._staticData?.id;
   }
+  function gamesPlayed(item) {
+    if (item.concept) return null;
+    // Follow the same EA getters as Player Bio. EA initializes missing stats
+    // to zero, so this is EA-reported history, not independent proof that raw
+    // stats were present in a server response. Missing/malformed getters fail closed.
+    try {
+      if (typeof item.getTotalGamesPlayed !== 'function' || typeof item.getLifetimeStats !== 'function' || typeof item.getStats !== 'function') return null;
+      const total = item.getTotalGamesPlayed(), lifetime = item.getLifetimeStats(), current = item.getStats();
+      const validCount = value => Number.isSafeInteger(value) && value >= 0;
+      const validStats = values => Array.isArray(values) && values.length >= 5 && [0,1,2,3,4].every(index => validCount(values[index]));
+      if (!validCount(total) || !validStats(lifetime) || !validStats(current) || total !== lifetime[0]) return null;
+      return Math.max(total, current[0]);
+    } catch { return null; }
+  }
   function card(item, inventoryState, chem) {
     const rawRarity = item.rareflag ?? item._rareflag;
     const rarity = (typeof rawRarity === 'number' || typeof rawRarity === 'string' && /^\d+$/.test(rawRarity)) &&
@@ -158,6 +172,7 @@
       name: item._staticData?.name ?? item.name ?? String(item.definitionId), cardType,
       rating: item.rating, teamId: item.teamId, leagueId: item.leagueId, nationId: item.nationId,
       rarityId: rarity, ratingTier: tier, isUntradeable: tradeabilityKnown && !tradable, tradeabilityKnown,
+      gamesPlayed: gamesPlayed(item),
       isLocked: inventoryState.activeSquadIds.has(String(item.id)),
       isDuplicate: inventoryState.duplicates.has(String(item.id)), isStorage: inventoryState.storageIds.has(String(item.id)),
       isLoan: !Number.isFinite(Number(item.loans)) || Number(item.loans) >= 0, isTimeLimited: Boolean(item.isTimeLimited?.()),
@@ -559,12 +574,13 @@
     el('p', `FC ${preview.input.gameYear} · ${preview.input.platform.toUpperCase()} · Kulüp + piyasa kadrosu`, ui.review).className = 'muted';
     if (preview.input.liveMarket) el('p', `Anlık EA piyasası · ${preview.input.liveMarket.pagesRead} aramada gözlenen ${preview.input.liveMarket.quotes.length} fiyat. Yalnızca taranan ilanlar karşılaştırıldı; tüm piyasadaki en ucuz kart garantisi yok. Fiyatlar en fazla 120 saniye geçerlidir.`, ui.review);
     const table = el('table', undefined, ui.review), head = el('tr', undefined, table);
-    ['Slot','Oyuncu','RTG','Tür','Fiyat'].forEach(label => el('th', label, head));
+    ['Slot','Oyuncu','RTG','Maç','Tür','Fiyat'].forEach(label => el('th', label, head));
     for (const row of preview.rows) {
       const tr = el('tr', undefined, table);
       const type = row.player.concept ? 'Konsept' : row.player.tradeabilityKnown === false ? 'Kulüp · satış durumu bilinmiyor' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
       const price = Number(row.marketPrice ?? row.futggPrice ?? row.player.marketPrice);
-      [row.squadPosition + 1, row.player.name, row.player.rating, type, price > 0 ? Math.round(price).toLocaleString() : 'Tahmini'].forEach(value => el('td', String(value), tr));
+      const played = row.player.concept ? '—' : Number.isSafeInteger(row.player.gamesPlayed) && row.player.gamesPlayed >= 0 ? row.player.gamesPlayed : 'Bilinmiyor';
+      [row.squadPosition + 1, row.player.name, row.player.rating, played, type, price > 0 ? Math.round(price).toLocaleString() : 'Tahmini'].forEach(value => el('td', String(value), tr));
     }
     const shopping = preview.result.shoppingList || [];
     const purchase = shopping.reduce((sum,item) => sum + Number(item.marketPrice) * Number(item.quantity), 0);
@@ -598,7 +614,7 @@
     if (diagnostics && (Array.isArray(diagnostics) ? diagnostics.length : true)) el('pre', JSON.stringify(diagnostics, null, 2), ui.review);
     const details = el('details', undefined, ui.review); el('summary', 'Korunan kartlar ve Paletools', details);
     el('pre', JSON.stringify(preview.rejected, null, 2), details);
-    el('p', 'Aktif kadrodaki kartlar korunur ve Uygula öncesi yeniden okunur. Bu kontrol geçmişte oynanmış tüm kartları tespit etmez. Satış bilgisi bilinmeyen kartlar satılabilir kart politikasıyla değerlendirilir.', details);
+    el('p', 'Aktif kadrodaki kartlar korunur. Maç sayısı EA Oyuncu Bilgileri ekranının kullandığı veriden okunur; EA’nın sıfır gösterdiği kayıtlar bağımsız olarak doğrulanmaz. Oynanmış kart koruması açıkken maç sayısı pozitif veya okunamayan kulüp kartları kullanılmaz. Uygula öncesi kartlar yeniden okunur. Satış bilgisi bilinmeyen kartlar satılabilir kart politikasıyla değerlendirilir.', details);
     el('p', 'Paletools kayıtlı kart/ülke/takım/lig/nadirlik kilitleri okunur. Farklı hesapların kayıtlı kilitleri de korunur. Paletools ayarları değiştirilmez.', details);
     ui.apply.textContent = shopping.length ? 'Konseptleri kadroya yerleştir' : 'İnceledim · Kadroyu SBC’ye uygula';
     ui.apply.disabled = false;
@@ -639,7 +655,7 @@
   try { saved = JSON.parse(localStorage.getItem(STORAGE) || '{}'); } catch { /* Use safe defaults. */ }
   const settings = { ...P.defaults, ...saved, weights: { ...P.defaults.weights, ...saved.weights } };
   const policySection = el('details', undefined, panel); policySection.open = true; el('summary', 'Kart politikası', policySection);
-  for (const [name,label] of [['prioritizeDuplicates','Dupe ve satılamaz kartlara öncelik ver'],['onlyStorage','Yalnızca SBC deposu'],['allowTradeable','Satılabilir kartlara izin ver'],['protectSpecial','Özel kartları koru'],['protectEvolutions','Evolution kartlarını koru'],['allowConcept','Eksik yerleri fiyatlı piyasa kartlarıyla tamamla']]) {
+  for (const [name,label] of [['prioritizeDuplicates','Dupe ve satılamaz kartlara öncelik ver'],['onlyStorage','Yalnızca SBC deposu'],['allowTradeable','Satılabilir kartlara izin ver'],['protectSpecial','Özel kartları koru'],['protectEvolutions','Evolution kartlarını koru'],['protectPlayed','Oynanmış kartları koru'],['allowConcept','Eksik yerleri fiyatlı piyasa kartlarıyla tamamla']]) {
     const row = el('label', undefined, policySection), input = el('input', undefined, row); input.type = 'checkbox'; input.checked = Boolean(settings[name]); row.append(document.createTextNode(label)); ui.settings[name] = input;
   }
   for (const [name,label,max] of [['maxRating','En yüksek oyuncu reytingi',99],['maxPlayerPrice','Kart başına değer limiti (0 = limitsiz)',15000000],['maxPurchasePrice','Satın alma bütçesi (0 = limitsiz)',165000000],['maxTotalPrice','Toplam kadro değeri limiti (0 = limitsiz)',165000000]]) {

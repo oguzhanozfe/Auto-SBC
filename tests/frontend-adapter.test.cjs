@@ -49,7 +49,9 @@ function harness(overrides = {}) {
   let jobResult;
   const players = Array.from({length:12},(_,i) => ({id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`},
     rating:80,teamId:18,leagueId:13,nationId:18,rareflag:0,untradeable:true,loans:-1,preferredPosition:14,possiblePositions:[14],groups:[0],
-    isPlayer:()=>true,isSpecial:()=>false,isTimeLimited:()=>false,getTier:()=>3,compareResourceTo(other){return this.assetId===other.assetId;}}));
+    isPlayer:()=>true,isSpecial:()=>false,isTimeLimited:()=>false,getTier:()=>3,
+    getTotalGamesPlayed:()=>0,getLifetimeStats:()=>[0,0,0,0,0],getStats:()=>[0,0,0,0,0],
+    compareResourceTo(other){return this.assetId===other.assetId;}}));
   const squad = {_formation:{generalPositions:Array(11).fill(14)},simpleBrickIndices:[],_players:Array.from({length:11},()=>({_item:{}})),
     removeAllItems(keepManager){assert.equal(keepManager,true);writes.push('removeAllItems');this._players=this._players.map(()=>({_item:{id:0,isPlayer:()=>false}}));},
     setPlayers(items) { writes.push('setPlayers'); this._players=items.map(item=>({_item:item})); }};
@@ -252,6 +254,49 @@ test('active squad membership is read again before reviewed Apply',async()=>{
   h.activeSquadPlayers.push({_item:h.players[0]});
   await h.button('İnceledim · Kadroyu SBC’ye uygula').click();
   assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('Locked player')));
+});
+test('EA Bio zero-game getters allow owned cards and display their match count in review',async()=>{
+  const h=harness();await h.refresh();await h.button('Çöz ve önizle').click();
+  assert.equal(h.requests[0].solverPolicy.protectPlayed,true);
+  assert.ok(h.requests[0].clubPlayers.every(p=>p.gamesPlayed===0));
+  const checkbox=h.elements.find(e=>e.tag==='label'&&e.textContent.includes('Oynanmış kartları koru')).children.find(e=>e.tag==='input');
+  assert.equal(checkbox.checked,true);
+  const all=[];const visit=e=>{all.push(e);e.children.forEach(visit);if(e.shadowRoot)visit(e.shadowRoot);};visit(h.ctx.document.documentElement);
+  const table=all.find(e=>e.tag==='table');
+  assert.equal(table.children[0].children[3].textContent,'Maç');
+  assert.equal(table.children[1].children[3].textContent,'0');
+  assert.ok(all.some(e=>e.textContent.includes('EA’nın sıfır gösterdiği kayıtlar bağımsız olarak doğrulanmaz')));
+});
+test('played and malformed EA Bio stats are excluded from the solve inventory',async()=>{
+  const changes=[
+    p=>{p.getTotalGamesPlayed=()=>505;p.getLifetimeStats=()=>[505,0,0,0,0];},
+    p=>{p.getStats=()=>[1,0,0,0,0];},
+    p=>{delete p.getTotalGamesPlayed;},p=>{delete p.getLifetimeStats;},p=>{delete p.getStats;},
+    p=>{p.getTotalGamesPlayed=()=>NaN;},p=>{p.getTotalGamesPlayed=()=>Infinity;},
+    p=>{p.getTotalGamesPlayed=()=>0.5;},p=>{p.getTotalGamesPlayed=()=>-1;},
+    p=>{p.getTotalGamesPlayed=()=>'0';},p=>{p.getLifetimeStats=()=>[1,0,0,0,0];},
+    p=>{p.getLifetimeStats=()=>[0];},p=>{p.getStats=()=>null;},p=>{p.getStats=()=>[0,,,,];},
+    p=>{p.getStats=()=>[0,0,0,0,NaN];},p=>{p.getStats=()=>{throw new Error('Unavailable');};}
+  ];
+  for (const change of changes) {
+    const h=harness();change(h.players[0]);await h.refresh();await h.button('Çöz ve önizle').click();
+    assert.equal(h.requests[0].clubPlayers.length,11);
+    assert.equal(h.requests[0].clubPlayers.some(p=>p.id===1),false);
+    assert.deepEqual(h.writes,[]);
+  }
+});
+test('played or unknown stats discovered during Apply re-read stop all squad mutation',async()=>{
+  for(const change of [
+    p=>{p.getTotalGamesPlayed=()=>1;p.getLifetimeStats=()=>[1,0,0,0,0];},
+    p=>{p.getStats=()=>[2,0,0,0,0];},
+    p=>{delete p.getTotalGamesPlayed;},
+    p=>{p.getStats=()=>[NaN,0,0,0,0];}
+  ]) {
+    const h=harness();await h.refresh();await h.button('Çöz ve önizle').click();
+    change(h.players[0]);await h.button('İnceledim · Kadroyu SBC’ye uygula').click();
+    assert.deepEqual(h.writes,[]);
+    assert.ok(h.elements.some(e=>/Protected played card|Games played unknown/.test(e.textContent)));
+  }
 });
 test('unreadable active squad blocks solving instead of treating the roster as empty',async()=>{
   const h=harness();h.ctx.services.Squad.requestSquadById=()=>observable({squad:{}});

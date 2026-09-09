@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, '..');
-const version = '27.0.3';
+const version = '27.0.4';
 const matches = ['https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*','https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*','https://www.easports.com/*/ea-sports-fc/ultimate-team/web-app/*'];
 const header = `// ==UserScript==
 // @name         Auto-SBC Local

@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend.setup import runAutoSBC
-from backend.solver_model import squad_rating
-from backend.solver_policy import prepare_players
+from backend.solver_model import normalize_sbc, squad_rating
+from backend.solver_policy import SolverInputError, prepare_players
 
 
 def player(number, **changes):
@@ -249,6 +249,47 @@ def test_inherited_rating_model_reference_combination_and_unsatisfiable_target()
 def test_rating_with_bricks_is_explicitly_unsupported():
     result = solve([player(1)], challenge(1, [requirement("TEAM_RATING", 80)]))
     assert result["status_key"] == "UNSUPPORTED_TEAM_RATING"
+
+
+def test_ea_team_rating_count_sentinel_preserves_rating_and_rarity_requirements():
+    # Native 10x85+ shape: group count 1, team rating 84 with unset count -1.
+    sbc = challenge(requirements=[requirement("PLAYER_RARITY_GROUP", 83, count=1),
+                                  requirement("TEAM_RATING", 84, count=-1)])
+    rows = [player(i, rating=84, groups=[83] if i == 1 else [4]) for i in range(1, 12)]
+    original = deepcopy(sbc)
+    result = solve(rows, sbc)
+    assert result["status_code"] == 4
+    assert result["summary"]["estimatedRating"] == 84
+    assert sbc == original
+    assert solve([dict(row, rating=83) for row in rows], sbc)["status_code"] == 3
+    assert solve([dict(row, groups=[4]) for row in rows], sbc)["status_code"] == 3
+
+
+@pytest.mark.parametrize("key", ["TEAM_RATING", "CHEMISTRY_POINTS", "ALL_PLAYERS_CHEMISTRY_POINTS",
+                                 "SAME_CLUB_COUNT", "SAME_LEAGUE_COUNT", "SAME_NATION_COUNT",
+                                 "CLUB_COUNT", "LEAGUE_COUNT", "NATION_COUNT", "PLAYER_QUALITY"])
+def test_ea_unset_count_is_supported_only_for_squad_wide_keys(key):
+    assert normalize_sbc(challenge(requirements=[requirement(key, 1, count=-1)]))["constraints"][0]["count"] == 11
+
+
+def test_ea_quality_unset_count_applies_to_all_open_slots():
+    sbc = challenge(2, [requirement("PLAYER_QUALITY", 2, count=-1)])
+    assert normalize_sbc(sbc)["constraints"][0]["count"] == 2
+    assert solve([player(1, rating=70), player(2, rating=60)], sbc)["status_code"] == 3
+    assert solve([player(1, rating=70), player(2, rating=80)], sbc)["status_code"] == 4
+
+
+@pytest.mark.parametrize("key", ["CLUB_ID", "LEAGUE_ID", "NATION_ID", "PLAYER_RARITY", "PLAYER_LEVEL",
+                                 "PLAYER_EXACT_OVR", "PLAYER_MIN_OVR", "PLAYER_MAX_OVR", "PLAYER_RARITY_GROUP"])
+def test_ea_unset_count_does_not_relax_player_count_rules(key):
+    with pytest.raises(SolverInputError, match="count must be a nonnegative integer"):
+        normalize_sbc(challenge(requirements=[requirement(key, 1, count=-1)]))
+
+
+@pytest.mark.parametrize("count", [-2, -1.0, "-1", None, True])
+def test_squad_wide_count_still_rejects_other_invalid_values(count):
+    with pytest.raises(SolverInputError, match="count must be a nonnegative integer"):
+        normalize_sbc(challenge(requirements=[requirement("TEAM_RATING", 84, count=count)]))
 
 
 def test_solver_does_not_modify_input_or_write_csv(tmp_path, monkeypatch):

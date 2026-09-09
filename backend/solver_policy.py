@@ -22,6 +22,9 @@ DEFAULT_POLICY = {
     "allowConcept": False,
     "protectSpecial": True,
     "protectEvolutions": True,
+    # Legacy uploaded inventories omit EA Bio stats. The Companion explicitly
+    # sends True by default and supplies its native getter-derived count.
+    "protectPlayed": False,
     "prioritizeDuplicates": True,
     "onlyStorage": False,
 }
@@ -191,6 +194,12 @@ def prepare_players(players, raw_policy=None):
         item["ratingTier"] = 1 if item["rating"] < 65 else 2 if item["rating"] < 75 else 3
         for field in ("isUntradeable", "isDuplicate", "isStorage", "isFixed", "isLocked", "concept", "isObjective", "isSbc"):
             item[field] = flag(item.get(field))
+        played = item.get("gamesPlayed")
+        item["gamesPlayed"] = int(played) if (
+            not isinstance(played, bool) and isinstance(played, (int, float))
+            and 0 <= played <= 9_007_199_254_740_991 and math.isfinite(played)
+            and int(played) == played
+        ) else None
         key = (item["concept"], identifier(item["id"]))
         if key in seen:
             raise SolverInputError(f"Repeated inventory item id {item['id']}; send each item once")
@@ -244,6 +253,10 @@ def prepare_players(players, raw_policy=None):
             reason = "loan"
         elif flag(item.get("isTimeLimited")):
             reason = "timeLimited"
+        elif policy["protectPlayed"] and not item["concept"] and item["gamesPlayed"] is None:
+            reason = "gamesPlayedUnknown"
+        elif policy["protectPlayed"] and not item["concept"] and item["gamesPlayed"] > 0:
+            reason = "played"
         elif policy["protectEvolutions"] and (flag(item.get("isEvolution")) or item["rarityId"] == 60):
             reason = "evolution"
         elif item["concept"] and not policy["allowConcept"]:

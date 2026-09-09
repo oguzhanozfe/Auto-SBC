@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const P = require('../frontend/policy.js');
 const player = (id, extra = {}) => ({ id, definitionId: id + 1000, assetId: id + 2000, name: `Player ${id}`, rating: 80,
-  isUntradeable: true, isSpecial: false, isLoan: false, possiblePositions: [14], ...extra });
+  isUntradeable: true, isSpecial: false, isLoan: false, gamesPlayed: 0, possiblePositions: [14], ...extra });
 const request = (players, formation = [14,14]) => ({ clubPlayers: players, sbcData: { formation, brickIndices: [] } });
 test('duplicate status never bypasses hard locks, loans or rating limits', () => {
   const policy = P.normalizePolicy({ lockedItemIds: ['1'] });
@@ -31,6 +31,17 @@ test('invalid numeric settings fail early and defaults preserve market weights',
   assert.equal(P.normalizePolicy().weights.untradeable,.7);
   assert.throws(() => P.normalizePolicy({maxRating:100}), /rating/);
   assert.throws(() => P.normalizePolicy({weights:{concept:NaN}}), /weight/);
+});
+test('played-card protection defaults on, rejects unknown counts and never applies ownership history to concepts', () => {
+  const policy = P.normalizePolicy();
+  assert.equal(policy.protectPlayed,true);
+  assert.equal(P.blockedReason(player(1),policy),null);
+  assert.match(P.blockedReason(player(1,{gamesPlayed:1}),policy),/Protected played/);
+  for (const gamesPlayed of [undefined,null,NaN,Infinity,-1,0.5,'0']) {
+    assert.match(P.blockedReason(player(1,{gamesPlayed}),policy),/Games played unknown/);
+    assert.equal(P.blockedReason(player(1,{gamesPlayed,concept:true}),policy),null);
+  }
+  assert.equal(P.blockedReason(player(1,{gamesPlayed:505}),P.normalizePolicy({protectPlayed:false})),null);
 });
 test('success assigns exact server positions and rejects unknown, duplicate and locked cards', () => {
   const players = [player(1),player(2)], input = request(players), policy = P.normalizePolicy();

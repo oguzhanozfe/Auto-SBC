@@ -27,6 +27,10 @@ MATCH_FIELDS = {
 SAME_FIELDS = {"SAME_CLUB_COUNT": "teamId", "SAME_LEAGUE_COUNT": "leagueId", "SAME_NATION_COUNT": "nationId"}
 UNIQUE_FIELDS = {"CLUB_COUNT": "teamId", "LEAGUE_COUNT": "leagueId", "NATION_COUNT": "nationId"}
 CHEMISTRY_KEYS = {"CHEMISTRY_POINTS", "ALL_PLAYERS_CHEMISTRY_POINTS"}
+# EA's UTSBCEligibilityDTO leaves count at -1 when a requirement has no
+# PLAYER_COUNT field. Its isRequirementMet evaluates these keys against the
+# eligibility value (or every open slot), never against that count sentinel.
+SQUAD_WIDE_KEYS = set(SAME_FIELDS) | set(UNIQUE_FIELDS) | CHEMISTRY_KEYS | {"TEAM_RATING", "PLAYER_QUALITY"}
 SUPPORTED_KEYS = set(MATCH_FIELDS) | set(SAME_FIELDS) | set(UNIQUE_FIELDS) | CHEMISTRY_KEYS | {
     "PLAYER_RARITY_GROUP", "PLAYER_MIN_OVR", "PLAYER_MAX_OVR", "PLAYER_QUALITY", "TEAM_RATING",
 }
@@ -72,6 +76,8 @@ def normalize_sbc(sbc):
         if key not in MATCH_FIELDS and key != "PLAYER_RARITY_GROUP" and len(values) != 1:
             raise SolverInputError(f"{key} requires exactly one eligibility value")
         count = req.get("count", 11 - len(bricks))
+        if type(count) is int and count == -1 and key in SQUAD_WIDE_KEYS:
+            count = 11 - len(bricks)
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise SolverInputError(f"{key} count must be a nonnegative integer")
         req["count"] = count

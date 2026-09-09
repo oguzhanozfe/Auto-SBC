@@ -60,6 +60,20 @@ zero games were checked in EA's player bio. Coin balance remained 577,251; no
 packs were opened or players purchased. This does not establish automatic
 played-history protection or compatibility with every SBC.
 
+Version 27.0.4 adds a default-on Companion gate for EA-reported played cards.
+It reads the same native getters as Player Bio, rejects positive or unreadable
+counts, and rechecks fresh inventory before Apply. Preview rows show the count.
+The backend enforces `protectPlayed` when supplied; its legacy API default stays
+off for older uploaded inventories without those fields. EA can initialize absent
+raw stats arrays to zero, so this follows EA Bio's authority and does not prove
+raw payload presence. Live validation of this new gate is recorded separately.
+
+The first 11-player 10x 85+ request also exposed EA's `count=-1` sentinel on a
+squad-wide TEAM_RATING condition (minimum 84). Version 27.0.4 normalizes that
+sentinel only for verified squad-wide keys. Counted player/group rules still
+reject negative counts; the accompanying rarity-group 83 minimum of one remains
+enforced. The regression fixture contains these constraints without club data.
+
 A separate concept-enabled run produced Xavier Dziekoński, definition 256953,
 with a 200-coin FUT.GG quote dated 2026-09-08T20:48:25Z. Native market search
 found no listing at 200 and listings starting at 350. The user clarified that
