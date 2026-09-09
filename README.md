@@ -4,7 +4,7 @@ A local SBC maker built from [Oğuzhan Özdemir’s Auto-SBC fork](https://githu
 
 Its central workflow combines owned cards with purchasable concept cards and produces a priced shopping list, including for an empty club. Reviewed concepts can be placed directly in the EA SBC squad using EA's concept entities. It searches a growing market pool within the time budget, keeps the best verified squad and distinguishes cash spend from the value of owned cards.
 
-The project includes a Python constraint solver, a local Turkish dashboard, a SQLite public player/price catalog, and a browser companion generated as a userscript and Chrome extension. **It prepares a reviewable squad. EA submission stays manual.**
+The project includes a Python constraint solver, a local Turkish dashboard, a SQLite public player/price catalog, and a browser companion generated as a userscript and Chrome extension. Individual solving produces a reviewable squad with explicit Apply and manual submission. A separately authorized finite queue can solve, save, submit and verify selected owned-card SBCs automatically. Version 27.0.6 also implements a finite daily-upgrade preset; its account-level live validation is pending.
 
 ## Start locally
 
@@ -47,11 +47,13 @@ As checked on 2026-09-08, the FC27 public catalog has **20,710 cards**, but both
 - **Anlık piyasadan çöz** uses the signed-in EA Web App's transfer search for current bronze, silver or gold listings. Only observed Buy Now quotes enter this mode's concept pool; old FUT.GG prices cannot replace missing live quotes. The local catalog supplies card metadata, while EA supplies the current price. Live quotes expire after two minutes and are not written to the catalog.
 - `maxPurchasePrice` limits quoted purchase cost separately from `maxTotalPrice` (owned opportunity value plus purchases). Selected concepts have exact card IDs, quantities, prices, source timestamps and links in `shoppingList`. Apply resolves each concept through EA's concept search and places the exact card in the SBC. This does not buy the player or make a concept eligible for submission.
 - Hard nation/team/league/rarity locks from Paletools apply to market cards too.
-- Hard item/athlete/definition locks, required players, loan/evolution/special protection, rating and market budgets, and storage-only selection. Duplicate priority never overrides a lock.
-- Constraint model supports rarity groups, quality/rating/card counts, league/nation/club requirements, alternative positions and supported chemistry profiles. It never quietly ignores unknown requirements.
+- Hard item/athlete/definition locks, required players, loan/evolution/special/played-card protection, rating and market budgets, and storage-only selection. Duplicate priority never overrides a lock; missing match history blocks selection when played-card protection is enabled.
+- Constraint model supports rarity groups, quality/rating/card counts, league/nation/club requirements, alternative positions and supported chemistry profiles. Unknown requirement keys are rejected. Combined same-player conditions and OR expressions still need explicit modeling; see the scoped backlog in [docs/QUALITY-PLAN.md](docs/QUALITY-PLAN.md).
 - Physical-item and athlete identities stay separate. Multiple versions of one athlete cannot fill a squad together. Rarity-group membership stays intact.
 - Time-limited background solve jobs keep the browser responsive. Infeasible, unsupported, feasible and proven optimal outcomes are distinguished. Price remains the primary objective.
-- Review and explicit Apply in the Web App; locks and inventory are checked again immediately before applying. No pack, transfer, discard or automatic SBC-submission hooks.
+- Review and explicit Apply in the individual Web App flow; locks and inventory are checked again immediately before applying. The separate finite batch forces played/evolution protection and owned cards, rechecks EA eligibility before submission, and verifies exact receipts and completion counters. Uncertain writes stop the queue without replay.
+- **Daily’leri otomatik yap** reads finite remaining rights for Daily Bronze, Silver, Common Gold and Rare Gold upgrades. The displayed plan runs in that order, uses low-rating card limits and preserves the manually selected queue. It stops if counters, scope, protections or the calendar day change. It does not purchase cards or open reward packs.
+- Version 27.0.6 adds one bounded retry after EA 429 for set-list and challenge-list reads, with a visible cooldown and Stop checks. Save, submit and other writes are never retried automatically.
 - No external JavaScript/CDN dependencies in the browser companion. Catalog requests go from the local service to public FUT.GG sources. Club data is processed in memory and is not sent to a hosted solving service.
 - Bounded diagnostics, localhost binding, allowed origins, one active solve and an expiring in-memory result cache replace the old global file dumps and force-kill shutdown.
 
@@ -69,11 +71,19 @@ Tests use synthetic SBCs and a mocked EA adapter. The previous ad hoc tests, deb
 
 ## Practical limits
 
-On 2026-09-09, version 27.0.1 completed ten Daily Silver Upgrade solve/Apply flows with the user's owned cards; native exchanges and reward claims were also verified. Each consumed card was a normal 65-rated silver with zero games checked in EA's player bio. The concept preview was verified separately. Version 27.0.2 adds native concept placement; its live validation is pending extension reload. One SBC storage candidate returned EA 500 during Apply and remains unresolved. EA's private Web App APIs can change. The native iOS/Android Companion apps are not modified.
+Recorded account evidence, separate from mocked tests:
+
+- **27.0.1:** ten Daily Silver Upgrade solve/Apply flows, followed by verified native exchanges and reward claims. Each consumed card was a normal 65-rated silver with zero games checked in EA's player bio.
+- **27.0.3:** Mason Toye's exact 65-rated concept card was placed in the SBC using an observed 200-coin EA listing. No purchase or submission occurred in that concept test.
+- **27.0.4:** 10x85+ and two 91-rated parts of the 98+ FOF/FUTTIES Pick were completed through Auto-SBC solve/Apply and native submission. Consumed cards passed zero-game checks; the coin balance remained **577,251**. Progress on the selected five-set request is **1/5 groups and 3/17 parts**.
+- **27.0.5:** the first automatic queue run stopped on a redundant `requestSets` read returning EA 429 while solving challenge 4116, before any save or submit. It completed **zero new parts**; the earlier three parts are not batch-runner results.
+- **27.0.6:** finite daily planning and bounded read-only 429 recovery are implemented and undergoing tests. Live daily completion and successful batch recovery remain unverified.
+
+One SBC storage candidate returned EA 500 during Apply and remains unresolved. EA's private Web App APIs can change. The native iOS/Android Companion apps are not modified.
 
 The inherited team-rating correction is modeled with exact integer arithmetic, but EA’s complete current rounding specification is not public; the output labels it as an estimate. Unsupported chemistry calculation types or incomplete card metadata are reported rather than guessed. A time limit is not proof that no solution exists. Large chemistry puzzles may require longer solving time.
 
-There is no multi-SBC global allocation, automatic grind loop, or guaranteed “best solver” claim. The next milestones and acceptance gates are in [docs/PLAN.md](docs/PLAN.md); the architecture and actual verification evidence are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+The finite queue solves each challenge sequentially; it does not optimize club allocation across all SBCs. The daily preset processes only the initially verified number of repetitions and has no unlimited grind loop. There is no guaranteed “best solver” claim. Current acceptance gates and known solver gaps are in [docs/QUALITY-PLAN.md](docs/QUALITY-PLAN.md); the architecture and verification record are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Sources and license
 

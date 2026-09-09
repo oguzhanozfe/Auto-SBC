@@ -3,8 +3,8 @@
 This is an independently implemented local companion built on the MIT-licensed
 TitiroMonkey Auto-SBC repository and its EA service adapters. It does not contain
 SBC Monkey or Paletools proprietary code. Both installation formats are generated
-from `policy.js`, `native-entry.js`, `batch-policy.js`, `batch-runner.js` and
-`companion.js`; do not edit the generated files.
+from `policy.js`, `native-entry.js`, `batch-policy.js`, `batch-runner.js`,
+`daily-plan.js`, `read-retry.js` and `companion.js`; do not edit the generated files.
 
 ## Build and test
 
@@ -134,8 +134,44 @@ The integration follows EA's publicly served
 [SBC service and response DTO](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_2.js?_=10821),
 and [reward presentation controller](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_3.js?_=10821).
 These private interfaces can change. Version 27.0.5 batch behavior is covered by
-mocked lifecycle and integration tests; its account-level live test is pending
-extension reload and execution.
+mocked lifecycle and integration tests. Its first account-level run stopped on
+a redundant `requestSets` read returning EA 429 during solve for challenge 4116,
+before any save or submit. It completed zero new parts.
+
+## Daily preset and read recovery (27.0.6)
+
+Choose **Daily’leri otomatik yap** to read current EA rights and display a plan.
+Review the repetition counts, enable the automatic-delivery checkbox, then choose
+**Daily planını başlat**. Only the observed English names Daily Bronze Upgrade,
+Daily Silver Upgrade, Daily Common Gold Upgrade and Daily Rare Gold Upgrade are
+recognized. The plan processes bronze, silver, common gold, then rare gold.
+
+Each repetition comes from a positive finite EA count, verified against
+`repeats - timesCompleted`. Completed, expired, exhausted, unknown or unlimited
+rights create no work. The default limits are 30 repetitions per set and 80 total;
+exceeding either rejects the plan with an explanation instead of truncating it.
+Every cycle requires the expected fresh remaining and completion counters.
+An external completion, reset, changed calendar day or changed season/platform
+stops the frozen plan rather than adding work.
+
+The preset forces played, evolution and special-card protection, disables
+concepts, and limits ratings to 64 for bronze, 74 for silver and 82 for both gold
+upgrades. Its per-card value ceiling is at most 1,000 coins and preserves a lower
+existing limit. It uses the same guarded owned-card batch path for each cycle.
+The manual selected queue and settings are restored afterward. Reward packs and
+player picks remain unopened; no market purchase is made.
+
+**Daily sırasını durdur** prevents the next effect or repetition. The whole daily
+job and each child batch keep a local journal before dispatch; uncertain or
+unreadable prior records block a new run. Reload does not resume a daily job.
+
+Version 27.0.6 permits one retry only for `requestSets` and
+`requestChallengesForSet` reads after HTTP 429. It honors a reported delay up to
+five minutes, otherwise uses a 60-second fallback; longer reported delays stop
+the retry. The visible wait checks Stop repeatedly. A second 429, another error,
+or an uncertain save/submit does not trigger another request. This is bounded
+recovery behavior, not evidence that EA will accept the retry. Daily and retry
+changes are undergoing tests; account-level success remains pending.
 
 ## Paletools compatibility scope
 
@@ -203,11 +239,14 @@ rapid clicks, challenge identity changes and result cancellation on navigation.
 The installed 27.0.1 extension completed ten owned-card Daily Silver solve/Apply
 flows on 2026-09-09; native exchanges and reward claims were verified separately.
 Native live-price concept placement passed in 27.0.3: Mason Toye, 65-rated, at a
-200-coin observed EA price, with no purchase or submission. In the current
+200-coin observed EA price, with no purchase or submission. In the
 27.0.4 task, 10x 85+ and two 91-rated parts of the 98+ FOF/FUTTIES Pick have
 completed using Auto-SBC solve/Apply followed by native submission: **1/5 groups,
-3/17 parts**. These are not results of the new batch runner. The other parts and
-groups remain pending, and batch live validation still awaits the 27.0.5 reload.
+3/17 parts**. Consumed cards passed zero-game checks and the coin balance remained
+**577,251**. These are not results of the batch runner. The 27.0.5 live queue
+stopped at a set-list 429 before any save or submit, adding zero completions.
+The other parts and groups remain pending. Version 27.0.6 daily execution and
+successful read-retry recovery have not yet been validated on the account.
 Batch tests cover finite queues, completed-part skipping, mandatory owned-card
 guards, second-part failure, stop during awaited operations, repeatable status
 reset, exact receipts, persistence failure and prevention of duplicate submits.

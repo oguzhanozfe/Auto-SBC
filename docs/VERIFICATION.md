@@ -154,7 +154,7 @@ verified universal fix; the earlier 500 remains unexplained. After repeated
 exchanges, opening the SBC later produced an EA null-squad error; a normal page
 reload restored navigation. This is not claimed as a general native-cache fix.
 
-## Explicit batch implementation (27.0.5; live test pending)
+## Explicit batch implementation (27.0.5; first live attempt)
 
 The user can explicitly select a finite queue and authorize automatic submission.
 The runner snapshots each set's remaining parts, skips completed parts/exhausted
@@ -184,9 +184,37 @@ receipts for reconciliation; it is not a full club-inventory dump.
 Mocked policy, runner and adapter integration tests exercise stop during awaited
 work, guarded fresh cards, finite repeatables, exact receipts, a failing second
 part, persistence failures and prevention of duplicate submission. Final counts
-are recorded in the release report. **The 27.0.5 batch itself has not completed a
-live account run yet; extension reload and live validation remain pending.** The
-current live task count stays at 1/5 groups and 3/17 segments.
+are recorded in the release report. On 10 September, the live batch started set
+1420 / challenge 4116, then stopped on EA 429 while redundantly rereading the set
+list before solving. The exported journal contains no save or submit receipts.
+The current live task count stays at 1/5 groups and 3/17 segments.
+
+## Daily automation and read pacing (27.0.6; live test pending)
+
+A separate Daily button reads the current finite rights for Daily Bronze, Silver,
+Common Gold and Rare Gold Upgrade. Explicitly starting its displayed plan runs
+those repetitions in that order, without extending the plan after a reset.
+Fresh native counters are checked before each cycle and submission. Daily
+profiles protect specials, played/evolved cards, active squads and Paletools
+locks; rating ceilings are 64/74/82 and each card value is capped at 1,000 coins
+or the user’s lower limit. No concept, purchase, pack opening or pick selection
+is part of this flow. The manual policy and selected queue are restored afterward.
+
+The batch reuses its just-read set snapshot for solving. Only requestSets and
+requestChallengesForSet can retry after a numeric 429, once, with a cancellable
+60-second fallback wait. A usable Retry-After is honored up to five minutes; a
+longer delay stops the run. Save, load/init and submit operations never retry.
+Separate daily and child journals preserve confirmed cycles and uncertain writes.
+The new Daily mode remains unvalidated on the real account until a confirmed run.
+
+The first 27.0.6 live automatic cycle solved, saved and submitted challenge 4116
+(90-rated) in set 1420. EA returned the exact success receipt and award pack 302.
+The native SBC list then showed 3/7 parts, up from 2/7; balance stayed 577,251.
+All eleven selected cards passed the zero-games gate. The immediate post-submit
+list refresh returned EA 521, so the queue stopped with claim verification
+uncertain and displayed zero fully reconciled parts. The actual task total is
+1/5 groups and 4/17 parts. Read-only journal reconciliation is being added; the
+successful submission must not be repeated.
 
 ## Known limitations
 
@@ -213,3 +241,26 @@ Supported profiles include standard chemistry and complete supplied type-1 local
 An actual FC26 public-catalog run with an empty club,75 rating requirement and 15 second limit considered 16,168 eligible market concepts, found an 11-card squad with2,500 coin purchase cost, and finished in 15.2 seconds. It was feasible; minimum cost was not proven. Chrome showed the shopping list, card IDs, quantities, separate 5,000 weighted score and 2,500 actual cash spend. FC27 selection showed 20,710 cards and 0 usable prices without a season fallback. No actual purchases or EA actions were performed.
 
 FC27 source manifest: https://r2.fut.gg/27/manifest.json. Console/PC price indexes both had 20,710 entries with no positive market quotes. Source publication 2026-09-03T08:58:19Z; checked 2026-09-08. Public card source totals sum to 20,696 but source responses contain 20,710 unique definitions; the 90–94 band returns 14 cards while declaring total 0. Local status exposes observed and reported totals plus warnings.
+
+
+## Read-only reconciliation (27.0.7)
+
+The **Son teslimi doğrula** control reads the durable batch report and fresh EA
+set/challenge counters. It accepts only one failed claim-verification stage whose
+ledger and exact receipt already prove successful submission and granted rewards.
+It never saves or submits again. Original receipts and ledger entries remain; a
+read-only reconciliation entry is appended. Matching Daily child records update
+with pinned journal checks, and interrupted persistence remains blocked.
+Completed set cycles leave the manual queue; partial sets remain stopped.
+
+Normal post-submit verification waits two cancellable seconds before its forced
+read. This is application pacing, not a documented EA requirement or a proven
+explanation for status521. 521 is not automatically retried. The UI distinguishes
+submission receipts from completed counter verification. Recovery currently
+supports claim-uncertain reports; submitted, claim-pending, uncertain save/submit
+and malformed reports stay blocked. There is no automatic replay after reload.
+
+All 221 browser tests passed, including finite daily rights, cancellation, exact
+receipt/counter reconciliation, persistence failures and repeatable queue removal.
+The generated extension passed syntax validation. The unchanged backend was
+previously validated with 176 tests; current commit CI is recorded separately.

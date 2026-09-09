@@ -24,6 +24,7 @@ class Storage {
   key(index) { return [...this.data.keys()][index]; }
   getItem(name) { return this.data.get(name) ?? null; }
   setItem(name,value) { this.data.set(name,String(value)); }
+  removeItem(name) { this.data.delete(name); }
 }
 const observable = data => ({ observe(owner,callback) { queueMicrotask(() => callback(this,{success:true,status:200,data})); }, unobserve() {} });
 function marketCard(id=9999, gameYear=26, platform='ps5') {
@@ -44,7 +45,9 @@ function marketResult(input, concepts=[marketCard()], ownedCount=10) {
 function harness(overrides = {}) {
   const body = new Element('html');
   const localStorage = new Storage(), sessionStorage = new Storage();
+  for (const [key,value] of Object.entries(overrides.storage || {})) localStorage.setItem(key,value);
   const writes = [], requests = [], conceptRequests = [];
+  const timerDelays=[];
   const activeSquadPlayers=[];
   let jobResult;
   const players = Array.from({length:12},(_,i) => ({id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`},
@@ -59,7 +62,7 @@ function harness(overrides = {}) {
     eligibilityRequirements:[{scope:0,count:11,kvPairs:{_collection:{1:[11]}}}]};
   const set = {id:20,name:'Test SBC',isComplete:()=>false};
   let activeChallenge=challenge,nativeOptions;
-  const ctx = {console,setTimeout,clearTimeout,setInterval,clearInterval,queueMicrotask,URL,Blob,AbortController,crypto:require('node:crypto').webcrypto,
+  const ctx = {console,setTimeout:(callback,delay,...args)=>{timerDelays.push(delay);return setTimeout(callback,delay===500?0:delay,...args);},clearTimeout,setInterval,clearInterval,queueMicrotask,URL,Blob,AbortController,crypto:require('node:crypto').webcrypto,
     localStorage,sessionStorage,location:{origin:'https://www.ea.com'},atob:value=>Buffer.from(value,'base64').toString(),
     document:{documentElement:body,createElement:tag=>new Element(tag),createTextNode:text=>new Element('#text',text)},
     repositories:{TeamConfig:{}},
@@ -95,13 +98,16 @@ function harness(overrides = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/policy.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-policy.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-runner.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-reconcile.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/daily-plan.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/read-retry.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/companion.js'),'utf8'),context);
   const elements = [];
   const visit = element => { elements.push(element);element.children.forEach(visit);if(element.shadowRoot)visit(element.shadowRoot);}; visit(body);
   const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
   const selects = elements.filter(element=>element.tag==='select');
   const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('SBC listesini yükle').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
-  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,localStorage,selects,nativeOptions,
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,localStorage,selects,nativeOptions,timerDelays,
     navigate:id=>{activeChallenge=id===null?null:{...challenge,id};}};
 }
 test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
@@ -560,6 +566,13 @@ test('batch checks native eligibility and service untradeable gate before submit
     assert.equal(h.writes.includes('submitChallenge'),false);assert.equal(h.report().snapshot.status,'blocked');
   });
 });
+test('batch reuses its initial set snapshot for solve and refreshes before and after submission',async()=>{
+  const h=batchHarness();await h.prepare();let setReads=0;const requestSets=h.ctx.services.SBC.requestSets;
+  h.ctx.services.SBC.requestSets=()=>{setReads++;return requestSets();};
+  await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.report().snapshot.status,'completed');assert.equal(setReads,3);
+  assert.equal(h.timerDelays.filter(delay=>delay===500).length,4,'reward check is paced in four cancellable 500ms chunks');
+});
 test('batch stops if played history or an active squad lock changes after save',async t=>{
   for(const name of ['played','active'])await t.test(name,async()=>{
     const h=batchHarness();h.ctx.services.SBC.saveChallenge=()=>{
@@ -594,6 +607,9 @@ test('batch stop while native submit internally saves records the in-flight resu
   await h.button('Sırayı durdur').click();release();await pending;
   assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'stopped');
   assert.equal(h.report().receipts.length,1);assert.equal(h.report().receipts[0].completed,true);
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Bu sıradaki kadroları')).children[0];
+  consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1,'a confirmed submit awaiting read verification cannot run again');
 });
 test('batch cannot dispatch save when durable pending journal fails',async()=>{
   const h=batchHarness();await h.prepare();const save=h.localStorage.setItem.bind(h.localStorage);
@@ -607,5 +623,256 @@ test('batch rechecks Paletools locks added while loading the saved challenge and
     else {const save=h.localStorage.setItem.bind(h.localStorage);h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.batch.v1'&&JSON.parse(value).phase==='submit')save('paletools:2026:account:lockedItems','[1000]');};}
     await h.prepare();await h.button('Sırayı otomatik tamamla').click();
     assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/Paletools lock/);
+  });
+});
+
+function dailyHarness({kind='silver',repeats=2,...overrides}={}) {
+  const h=batchHarness(overrides), names={bronze:'Daily Bronze Upgrade',silver:'Daily Silver Upgrade',common:'Daily Common Gold Upgrade',rare:'Daily Rare Gold Upgrade'};
+  Object.assign(h.set,{name:names[kind],isRepeatable:true,isLimitedRepeatable:true,repeats,timesCompleted:0,endTime:Date.now()+3600000,
+    isComplete:()=>false,hasExpired:flag=>{assert.equal(flag,false);return false;},getTimeRemaining:()=>3600,
+    getRepeatsRemaining:()=>h.set.repeats-h.set.timesCompleted});
+  const rating=kind==='bronze'?60:kind==='silver'?65:80;
+  for (let i=12;i<24;i++)h.players.push({...h.players[i%12],id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`}});
+  h.players.forEach(player=>{player.rating=rating;player.getTier=()=>kind==='bronze'?1:kind==='silver'?2:3;});
+  const consumed=new Set();
+  h.ctx.services.Club.search=()=>observable({items:h.players.filter(player=>!consumed.has(player.id)),retrievedAll:true});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>{
+    h.writes.push('submitChallenge');h.squad._players.slice(0,11).forEach(slot=>consumed.add(slot._item.id));
+    challenge.timesCompleted++;set.timesCompleted++;challenge.status='IN_PROGRESS';
+    return observable({setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]});
+  };
+  h.dailyConsent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Gösterilen daily')).children[0];
+  h.readDailies=async()=>{await h.refresh();await h.button('Daily’leri otomatik yap').click();};
+  h.consentDailies=async()=>{h.dailyConsent.checked=true;await Promise.all(h.dailyConsent.listeners.change.map(fn=>fn()));};
+  h.dailyReport=()=>JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1'));
+  h.control=label=>h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith(label)).children[0];
+  return h;
+}
+test('daily one-click plan is read-only and explicit start executes exactly its finite rights',async()=>{
+  const h=dailyHarness();await h.readDailies();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Daily planını başlat').disabled,true);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent.includes('Daily Silver Upgrade: 2 tekrar')));
+  await h.consentDailies();await h.button('Daily planını başlat').click();
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,2);
+  assert.equal(h.requests.length,2);
+  assert.equal(h.dailyReport().status,'completed');
+  assert.deepEqual(h.dailyReport().progress,{completedCycles:2,totalCycles:2,confirmedParts:2});
+  assert.equal(h.dailyReport().plan.entries.length,2);
+  assert.equal(h.button('Daily planını başlat').disabled,true);
+});
+test('daily restores exact manual policy, selected set, queue and consent afterward',async()=>{
+  const h=dailyHarness({repeats:1});await h.prepare();
+  const policyControls=['Özel kartları koru','Evolution kartlarını koru','Oynanmış kartları koru'];
+  policyControls.forEach(label=>{h.control(label).checked=false;});
+  h.control('En yüksek oyuncu reytingi').value=98;h.control('Kart başına değer limiti').value=1750;
+  h.control('Eksik yerleri fiyatlı').checked=true;
+  const original='{"manual":"preserve byte for byte"}';h.localStorage.setItem('autosbc.local.policy.v1',original);
+  const selection=h.selects.slice(0,4).map(control=>control.value);
+  await h.button('Daily’leri otomatik yap').click();await h.consentDailies();await h.button('Daily planını başlat').click();
+  assert.equal(h.dailyReport().status,'completed');assert.equal(h.localStorage.getItem('autosbc.local.policy.v1'),original);
+  assert.deepEqual(h.selects.slice(0,4).map(control=>control.value),selection);
+  policyControls.forEach(label=>assert.equal(h.control(label).checked,false));
+  assert.equal(h.control('En yüksek oyuncu reytingi').value,'98');assert.equal(h.control('Kart başına değer limiti').value,'1750');
+  assert.equal(h.control('Eksik yerleri fiyatlı').checked,true);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent===h.set.name));
+  assert.equal(h.control('Bu sıradaki kadroları').checked,true);
+  const request=h.requests[0].solverPolicy;
+  assert.equal(request.maxRating,74);assert.equal(request.maxPlayerPrice,1000);
+  assert.equal(request.protectSpecial,true);assert.equal(request.protectEvolutions,true);assert.equal(request.protectPlayed,true);assert.equal(request.allowConcept,false);
+});
+test('daily rating ceilings and lower user price limits are preserved per kind',async t=>{
+  for(const [kind,maxRating] of [['bronze',64],['silver',74],['common',82],['rare',82]])await t.test(kind,async()=>{
+    const h=dailyHarness({kind,repeats:1});h.control('Kart başına değer limiti').value=500;
+    await h.readDailies();await h.consentDailies();await h.button('Daily planını başlat').click();
+    assert.equal(h.dailyReport().status,'completed');assert.equal(h.requests[0].solverPolicy.maxRating,maxRating);assert.equal(h.requests[0].solverPolicy.maxPlayerPrice,500);
+  });
+});
+test('daily stop between cycles prevents the next save and preserves confirmed counts',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();
+  const save=h.localStorage.setItem.bind(h.localStorage);let stopped=false;
+  h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.daily.v1'){
+    const report=JSON.parse(value);
+    if(!stopped&&report.progress.completedCycles===1&&report.phase.includes('tekrar doğrulandı')){stopped=true;h.button('Daily sırasını durdur').click();}
+  }};
+  await h.button('Daily planını başlat').click();
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.requests.length,1);
+  assert.equal(h.dailyReport().status,'stopped');assert.equal(h.dailyReport().progress.completedCycles,1);assert.equal(h.dailyReport().progress.confirmedParts,1);
+});
+test('daily stops before saving when remaining rights change after planning',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();h.set.timesCompleted=1;
+  await h.button('Daily planını başlat').click();
+  assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.match(h.dailyReport().phase,/counters changed/);
+});
+test('daily rejects malformed native expiry before creating a writable plan',async t=>{
+  for(const value of [NaN,Infinity,-1,1.5,Number.MAX_SAFE_INTEGER+1,'12345'])await t.test(String(value),async()=>{
+    const h=dailyHarness();h.set.endTime=value;await h.readDailies();
+    assert.equal(h.button('Daily planını başlat').disabled,true);assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+    assert.ok(h.elements.some(e=>e.textContent.includes('Daily bitiş zamanı')));
+  });
+});
+test('daily stop during child submit records the in-flight receipt without another cycle',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();let release,enter;
+  const entered=new Promise(resolve=>{enter=resolve;});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>({observe(owner,callback){h.writes.push('submitChallenge');enter();release=()=>{challenge.timesCompleted++;set.timesCompleted++;callback(this,{success:true,status:200,data:{setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]}});};},unobserve(){}});
+  const pending=h.button('Daily planını başlat').click();await entered;await h.button('Daily sırasını durdur').click();release();await pending;
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.dailyReport().status,'stopped');
+  assert.equal(h.dailyReport().cycles[0].child.receipts.length,1);assert.equal(h.requests.length,1);
+});
+test('daily pending parent journal must persist before any child save dispatch',async()=>{
+  const h=dailyHarness({repeats:1});await h.readDailies();await h.consentDailies();const save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.daily.v1'&&JSON.parse(value).cycles[0]?.child?.phase==='save')throw new Error('Daily journal full');save(key,value);};
+  await h.button('Daily planını başlat').click();assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Daily journal full')));
+});
+test('daily reload never resumes and pending or malformed stored history blocks another plan',async t=>{
+  const histories=[
+    ['autosbc.local.daily.v1',JSON.stringify({runId:'old',status:'running',plan:{entries:[]},cycles:[{status:'pending'}]})],
+    ['autosbc.local.daily.v1','{broken'],['autosbc.local.batch.v1','{broken'],
+    ['autosbc.local.batch.v1',JSON.stringify({runId:'old',snapshot:{status:'running',queue:[]}})]
+  ];
+  for(const [key,value] of histories)await t.test(`${key}:${value.slice(0,16)}`,async()=>{
+    const h=dailyHarness({storage:{[key]:value}});assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+    await h.readDailies();assert.equal(h.button('Daily planını başlat').disabled,true);assert.deepEqual(h.writes,[]);
+  });
+});
+test('EA list diagnostics preserve status and safe code without raw response leakage',async()=>{
+  const h=batchHarness();await h.prepare();
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:500,error:{code:'MAX_FAILED_AUTH_ATTEMPTS',secret:'do-not-record'},headers:{Authorization:'do-not-record'}}));},unobserve(){}});
+  await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.report().lastError.status,500);assert.equal(h.report().lastError.code,'MAX_FAILED_AUTH_ATTEMPTS');
+  assert.equal(h.report().lastError.operation,'Sıradaki SBC setleri');assert.doesNotMatch(JSON.stringify(h.report()),/do-not-record/);assert.deepEqual(h.writes,[]);
+});
+test('daily two failed initial list reads make no writes and permit a later fresh plan',async()=>{
+  const h=dailyHarness({repeats:1});await h.readDailies();await h.consentDailies();const requestSets=h.ctx.services.SBC.requestSets;let failedReads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){failedReads++;queueMicrotask(()=>callback(this,{success:false,status:429,retryAfter:0.001,error:{code:'RATE_LIMIT'}}));},unobserve(){}});
+  await h.button('Daily planını başlat').click();
+  assert.equal(failedReads,2);assert.deepEqual(h.writes,[]);assert.equal(h.dailyReport().status,'blocked');assert.equal(h.dailyReport().cycles[0].status,'blocked');
+  assert.equal(h.dailyReport().lastError.status,429);assert.equal(h.dailyReport().lastError.retryAfterSeconds,0.001);
+  h.ctx.services.SBC.requestSets=requestSets;await h.button('Daily’leri otomatik yap').click();await h.consentDailies();
+  assert.equal(h.button('Daily planını başlat').disabled,false);assert.deepEqual(h.writes,[]);
+});
+
+function uncertainClaimReport({setCompleted=true}={}) {
+  const B=require('../frontend/batch-policy.js');
+  const controller=B.createBatch([20]),players=Array.from({length:11},(_,i)=>({id:String(i+1),concept:false,gamesPlayed:0,isEvolution:false}));
+  controller.startSet(20,{completed:false,repeatable:false,remaining:1});controller.beginStep(10);controller.readyStep(players);
+  for(const action of ['save','submit'])controller.confirmEffect(controller.beginEffect(action,players));
+  controller.failEffect(controller.beginEffect('claim'),'Sıradaki SBC setleri: EA returned 521 (521).');
+  return {runId:'reconcile-fixture',scope:{gameYear:26,platform:'ps5'},selectedSets:[{id:'20',name:'Test SBC'}],phase:'claim read failed',updatedAt:new Date().toISOString(),
+    snapshot:controller.snapshot(),lastError:{status:521,code:521,operation:'Sıradaki SBC setleri'},receipts:[{setId:'20',challengeId:'10',completed:true,rewardsGranted:true,setCompleted,
+      at:new Date().toISOString(),beforeChallenge:0,beforeSet:0,cardIds:players.map(player=>player.id),zeroGames:true,coinSpent:0,grantedChallengeAwards:[]}]};
+}
+function reconciliationHarness({report=uncertainClaimReport(),dailyReport,...overrides}={}) {
+  const h=batchHarness({...overrides,storage:{'autosbc.local.batch.v1':JSON.stringify(report),...(dailyReport?{'autosbc.local.daily.v1':JSON.stringify(dailyReport)}:{})}});
+  h.originalReport=JSON.parse(JSON.stringify(report));h.set.timesCompleted=1;h.challenge.timesCompleted=1;
+  h.selects[0].value='26';h.selects[1].value='ps5';return h;
+}
+test('read-only reconciliation verifies stored exact submission and stops without an account write',async()=>{
+  const h=reconciliationHarness(),old=JSON.stringify(h.originalReport);let reads=0;
+  const requestSets=h.ctx.services.SBC.requestSets;h.ctx.services.SBC.requestSets=()=>{reads++;return requestSets();};
+  await h.button('Son teslimi doğrula').click();
+  const report=h.report();assert.equal(report.snapshot.status,'stopped');assert.equal(report.snapshot.progress.confirmedChallenges,1);
+  assert.equal(report.snapshot.progress.completed,1);assert.equal(report.snapshot.queue[0].steps[0].status,'completed');
+  assert.deepEqual(report.receipts,h.originalReport.receipts);assert.deepEqual(report.snapshot.ledger.slice(0,h.originalReport.snapshot.ledger.length),h.originalReport.snapshot.ledger);
+  assert.equal(JSON.stringify(h.originalReport),old);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.equal(reads,1);
+  const reportText=h.localStorage.getItem('autosbc.local.batch.v1');
+  await h.button('Son teslimi doğrula').click();assert.equal(reads,1);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),reportText);
+});
+test('reconciliation cannot resolve a write ambiguity or a forged/missing submit confirmation',async t=>{
+  for(const kind of ['submit-uncertain','missing-confirmation','receipt-mismatch'])await t.test(kind,async()=>{
+    const report=uncertainClaimReport();
+    if(kind==='submit-uncertain')report.snapshot.ledger.at(-1).action='submit';
+    if(kind==='missing-confirmation')report.snapshot.ledger=report.snapshot.ledger.filter(event=>!(event.action==='submit'&&event.event==='effect-confirmed'));
+    if(kind==='receipt-mismatch')report.receipts[0].challengeId='11';
+    const h=reconciliationHarness({report});let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+    const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Son teslimi doğrula').click();
+    assert.equal(reads,0);assert.deepEqual(h.writes,[]);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);
+  });
+});
+test('reconciliation rejects unchanged counters and mismatched scope without clearing evidence',async t=>{
+  for(const kind of ['challenge-counter','set-counter','scope'])await t.test(kind,async()=>{
+    const h=reconciliationHarness();
+    if(kind==='challenge-counter')h.challenge.timesCompleted=0;
+    if(kind==='set-counter')h.set.timesCompleted=0;
+    if(kind==='scope')h.selects[1].value='pc';
+    const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Son teslimi doğrula').click();
+    assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+  });
+});
+test('a 521 during read-only reconciliation is not retried and preserves the original journal',async()=>{
+  const h=reconciliationHarness();let reads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:521,error:{code:521}}));},unobserve(){}});
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Son teslimi doğrula').click();
+  assert.equal(reads,1);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+test('cancel during reconciliation prevents journal updates and further reads',async()=>{
+  const h=reconciliationHarness();let release,enter;const entered=new Promise(resolve=>{enter=resolve;});
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){enter();release=()=>callback(this,{success:true,data:{sets:[h.set]}});},unobserve(){}});
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');const pending=h.button('Son teslimi doğrula').click();await entered;
+  await h.button('İptal').click();release();await pending;
+  assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+function linkedDaily(report) {
+  const D=require('../frontend/daily-plan.js');
+  const plan=D.createPlan([{id:20,name:'Daily Silver Upgrade',completed:false,expired:false,isRepeatable:true,isLimitedRepeatable:true,repeats:1,timesCompleted:0,remaining:1}]);
+  return {runId:'daily-fixture',scope:report.scope,day:new Date().toDateString(),plan,status:'blocked',phase:'old claim uncertainty',currentCycle:0,
+    cycles:[{entry:plan.entries[0],status:'pending',child:report}],progress:{completedCycles:0,totalCycles:1,confirmedParts:0}};
+}
+test('reconciliation updates the matching Daily child while preserving its original evidence',async t=>{
+  for(const setCompleted of [false,true])await t.test(String(setCompleted),async()=>{
+    const report=uncertainClaimReport({setCompleted}),h=reconciliationHarness({report,dailyReport:linkedDaily(report)});
+    await h.button('Son teslimi doğrula').click();
+    const daily=JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1'));
+    assert.equal(daily.status,'stopped');assert.equal(daily.progress.confirmedParts,1);assert.equal(daily.progress.completedCycles,setCompleted?1:0);
+    assert.equal(daily.cycles[0].status,setCompleted?'completed':'blocked');assert.deepEqual(daily.cycles[0].child,h.report());
+    assert.deepEqual(daily.cycles[0].child.receipts,report.receipts);assert.deepEqual(h.writes,[]);
+  });
+});
+test('mismatched Daily linkage fails closed before any EA read',async()=>{
+  const report=uncertainClaimReport(),daily=linkedDaily(report);daily.cycles[0].child=JSON.parse(JSON.stringify(report));daily.cycles[0].child.phase='different';
+  const h=reconciliationHarness({report,dailyReport:daily});let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Son teslimi doğrula').click();
+  assert.equal(reads,0);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+test('linked journal second-write failure leaves a blocking mismatch instead of resuming',async()=>{
+  const report=uncertainClaimReport(),h=reconciliationHarness({report,dailyReport:linkedDaily(report)}),save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.batch.v1')throw new Error('Storage full');save(key,value);};
+  await h.button('Son teslimi doğrula').click();assert.equal(h.report().snapshot.status,'blocked');
+  assert.equal(JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1')).status,'stopped');
+  h.localStorage.setItem=save;let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+  await h.button('Son teslimi doğrula').click();assert.equal(reads,0);assert.deepEqual(h.writes,[]);
+});
+test('stop during the post-submit pacing window prevents immediate reward GET',async()=>{
+  const h=batchHarness();await h.prepare();let reads=0;const requestSets=h.ctx.services.SBC.requestSets,oldTimer=h.ctx.setTimeout;let stopped=false;
+  h.ctx.services.SBC.requestSets=()=>{reads++;return requestSets();};
+  h.ctx.setTimeout=(callback,delay,...args)=>{if(delay===500&&!stopped){stopped=true;h.button('Sırayı durdur').click();}return oldTimer(callback,delay,...args);};
+  await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(reads,2);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'stopped');
+  assert.ok(h.elements.some(e=>e.tag==='p'&&e.textContent.includes('1 teslim onayı · 0 sayaç doğrulaması')));
+});
+test('completed repeatable sets leave the manual queue when a later set fails',async()=>{
+  const h=batchHarness(),other={id:30,name:'Other SBC',isComplete:()=>false,isRepeatable:false,isLimitedRepeatable:false,timesCompleted:0};
+  h.set.isRepeatable=true;h.set.isLimitedRepeatable=true;h.set.getRepeatsRemaining=()=>9;
+  h.ctx.services.SBC.requestSets=()=>observable({sets:[h.set,other]});
+  h.ctx.services.SBC.requestChallengesForSet=set=>set.id===20?observable({challenges:[h.challenge]}):{observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521}));},unobserve(){}};
+  await h.prepare();h.selects[2].value='30';await h.button('Seçili seti sıraya ekle').click();
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Bu sıradaki kadroları')).children[0];consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));
+  await h.button('Sırayı otomatik tamamla').click();
+  assert.equal(h.report().snapshot.progress.completed,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent==='Other SBC'));
+});
+test('manual batch cannot restart a reloaded claim-pending journal or malformed history',async t=>{
+  const pending=uncertainClaimReport();pending.snapshot.status='running';pending.snapshot.queue[0].status='running';pending.snapshot.queue[0].steps[0].status='claim-pending';pending.snapshot.ledger.pop();
+  for(const history of [JSON.stringify(pending),'{broken'])await t.test(history.slice(0,20),async()=>{
+    const h=batchHarness({storage:{'autosbc.local.batch.v1':history}});await h.prepare();await h.button('Sırayı otomatik tamamla').click();
+    assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),history);
+  });
+});
+test('reconciliation removes only a proven completed set from the manual queue',async t=>{
+  for(const setCompleted of [false,true])await t.test(String(setCompleted),async()=>{
+    const h=reconciliationHarness({report:uncertainClaimReport({setCompleted})});await h.refresh();await h.button('Seçili seti sıraya ekle').click();
+    await h.button('Son teslimi doğrula').click();
+    assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent===(setCompleted?'Henüz set eklenmedi.':'Test SBC')));
+    assert.deepEqual(h.writes,[]);
   });
 });
