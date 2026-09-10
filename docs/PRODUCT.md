@@ -131,7 +131,8 @@ can update owned-card valuation without sending club data to the provider.
 Unavailable valuations retain the value cap and produce price-specific
 diagnostics instead of a whole-club infeasibility claim.
 
-Acceptance still requires a deployed synthetic smoke test, repeated daily and
+The [resource-limited Docker CI smoke](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) passed on small synthetic
+inputs. Acceptance still requires a deployed synthetic smoke test, repeated daily and
 rating jobs within actual host limits, sleep/wake behavior and lost-job handling.
 An owner token is not a multi-user account system. The hosted dashboard does not
 yet provide a separate sign-in flow; use the authenticated extension transport.

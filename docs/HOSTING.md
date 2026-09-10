@@ -3,8 +3,8 @@
 Version 27.0.14 adds an opt-in single-owner hosted profile and Chrome HTTPS
 server settings. The ordinary launcher still defaults to unauthenticated local
 mode and must not be exposed publicly. A Render free Docker deployment is
-prepared, but it has **not been deployed**: user sign-in, Docker CI smoke and
-hosted validation remain pending. No hosted club payload has been uploaded.
+prepared, but it has **not been deployed**: user sign-in and actual hosted
+validation remain pending. [Docker CI smoke passed](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938). No hosted club payload has been uploaded.
 See [deployment setup](../deploy/README.md) and [extension setup](../INSTALL.md).
 
 ## Implemented evaluation profile
@@ -38,6 +38,17 @@ requires a fresh review. No solve POST or EA write is automatically replayed.
 The Docker context excludes local club exports, diagnostics, secrets and private
 databases. Access logging is disabled. These implementation checks do not prove
 that Render's free resources can sustain the intended workloads.
+
+## Resource-limited Docker CI smoke
+
+[CI run 34458034938](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) passed for code commit
+`bed43e179affcd63be5b98f3f55dda930727a0a3`, including 274 Python and 408 browser
+tests. The container enforced 0.1 CPU, 512 MiB memory, no extra swap and one
+solver worker. Three 22-candidate synthetic cases completed: Bronze in 1.1 s,
+rating in 1.0 s and chemistry in 1.0 s. The final idle reading was 79.64 MiB and
+no OOM occurred. That reading is not peak memory; these small synthetic cases
+do not establish representative workload capacity or Render performance.
+Actual deployment, cold starts and real hosted club-data validation remain pending.
 
 ## Observed request measurements
 
@@ -223,9 +234,8 @@ dependency level; an actual deployment still needs testing.
 ## Remaining hosting acceptance checks
 
 1. Complete user sign-in and review the proposed Render resources: one free
-   Docker web service, no paid disk, database or worker. Run the Docker CI smoke
-   job successfully before calling the image validated. No successful Docker
-   build or Render deployment is recorded yet.
+   Docker web service, no paid disk, database or worker. The resource-limited
+   Docker CI build/smoke passed; no Render deployment is recorded yet.
 2. Run the synthetic authenticated smoke against the real HTTPS service, then
    measure repeated daily and rating jobs with its actual CPU/memory limits.
    Include bounded chemistry cases separately. The default chemistry cap is an

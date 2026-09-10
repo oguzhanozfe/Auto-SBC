@@ -492,8 +492,9 @@ profile accepts owned cards, up to 30 seconds and 5,000 input cards, with a
 smaller default chemistry cap. Docker packaging contains public definition/rating
 seeds and excludes local club exports, private reports and secrets.
 
-Render configuration is prepared, but deployment awaits user sign-in. Docker CI
-smoke, deployed synthetic solve tests and sleep/restart validation are pending.
+Render configuration is prepared, but deployment awaits user sign-in.
+[Docker CI smoke passed](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938); deployed synthetic solve tests and
+sleep/restart validation are pending.
 No hosted private club run or cloud capacity result is claimed. The public
 hosted landing page directs the owner to the authenticated Chrome extension;
 the local dashboard remains available locally.
@@ -512,8 +513,14 @@ submissions/counters, not previews or saved squads. Raw journals, physical card
 IDs and account balances remain outside this distributable document.
 
 
-The final local suites passed **274 Python and 408 browser tests**. CI runs after
-the release commit; Docker smoke is still pending. Chrome reload of 27.0.14 was
+[CI run 34458034938](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) passed **274 Python and 408 browser tests**
+and the Docker smoke for code commit `bed43e179affcd63be5b98f3f55dda930727a0a3`.
+The container enforced 0.1 CPU, 512 MiB memory, no extra swap and one solver
+worker. Its 22-candidate synthetic Bronze, rating and chemistry cases completed
+in 1.1 s, 1.0 s and 1.0 s respectively. Final idle memory was 79.64 MiB with no
+OOM; this is not a peak-memory measurement or a production-capacity result.
+Actual Render deployment, cold starts and real hosted club-data validation
+remain pending. Chrome reload of 27.0.14 was
 blocked by the browser-control security boundary, so these live EA results
 must not be presented as a live 27.0.14 validation. The new transport and guards
 have local regression evidence only until that reload and walkthrough succeed.

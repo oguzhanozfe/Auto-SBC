@@ -24,8 +24,9 @@ Render warns that free instances are unsuitable for production.
 The current callable Sites service accepts Workers-compatible JavaScript output;
 it does not run this native Python/OR-Tools Docker service. A static landing page
 would not replace the solver. No Render connector, CLI, or authenticated Render
-account is available to this task, and Docker is not installed locally. These
-are deployment/build blockers, not reasons to pretend a hosted solver exists.
+account is available to this task, and Docker is not installed locally. The
+container build and resource-limited smoke have now passed in [GitHub CI](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938);
+actual Render sign-in and deployment remain pending.
 
 ## Configuration and privacy
 
@@ -94,8 +95,14 @@ docker build -t auto-sbc-studio:review .
 .venv/bin/python deploy/smoke.py https://YOUR-EXACT-SERVICE.onrender.com
 ```
 
-The Docker command has not been executed in the current environment. Public
-source constraints and synthetic API tests do not measure Render performance.
+The container build and smoke passed in [CI run 34458034938](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) for
+code commit `bed43e179affcd63be5b98f3f55dda930727a0a3`, alongside 274 Python and
+408 browser tests. The smoke enforced 0.1 CPU, 512 MiB memory, no extra swap and
+one solver worker. Three 22-candidate synthetic cases completed: Bronze 1.1 s,
+rating 1.0 s and chemistry 1.0 s. Final idle memory was 79.64 MiB with no OOM;
+this is not peak memory or representative capacity. Render deployment, cold
+starts and real hosted club-data validation remain pending. These CI results
+do not measure Render performance.
 The large Pre-Season experiment does not rule out small chemistry requests; the
 default 200-card cap is an evaluation boundary, not a measured memory guarantee.
 See [the hosting measurements](../docs/HOSTING.md) for actual request evidence.

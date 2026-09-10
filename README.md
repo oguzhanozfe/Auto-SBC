@@ -50,7 +50,7 @@ Add `--platform pc` for the PC market. Dashboard refresh handles ten pages per r
 
 Solves can make a bounded public bulk-price refresh when owned-card valuation or catalog concepts need fresh data. That refresh sends no club payload to the price provider. If the player value cap excludes cards with missing or stale prices and the remaining pool cannot solve the challenge, `PRICES_UNAVAILABLE` avoids claiming the full club is infeasible. Prices and protection limits are never silently relaxed.
 
-The opt-in hosted profile authenticates requests, restricts the exact host/origin and runs one solve at a time. It supports owned cards with a 30-second budget, up to 5,000 input cards and a smaller chemistry cap; concepts remain a local feature. [Render setup](deploy/README.md) and the [hosting evaluation](docs/HOSTING.md) describe the free-tier limits and pending smoke tests. Do not expose ordinary unauthenticated local mode publicly. Docker CI smoke and a deployed Render lifecycle test are still pending.
+The opt-in hosted profile authenticates requests, restricts the exact host/origin and runs one solve at a time. It supports owned cards with a 30-second budget, up to 5,000 input cards and a smaller chemistry cap; concepts remain a local feature. [Render setup](deploy/README.md) and the [hosting evaluation](docs/HOSTING.md) describe the free-tier limits and remaining deployed tests. Do not expose ordinary unauthenticated local mode publicly. [Docker CI smoke passed](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938); actual Render deployment, cold starts and real hosted club-data validation remain pending.
 
 ## Development
 
@@ -69,7 +69,7 @@ node --check tampermonkey-ai-sbc.user.js
 node --check backend/static/app.js
 ```
 
-Browser files are generated from `frontend/`; edit source modules instead of generated scripts. `VERSION` supplies the release number. CI tests the solver, catalog, API and browser adapter, then builds downloadable browser artifacts. The added Docker smoke job still needs a successful run for this release. Mocks are distinct from live account evidence. The old scripts are preserved under `legacy/` and are not part of startup.
+Browser files are generated from `frontend/`; edit source modules instead of generated scripts. `VERSION` supplies the release number. CI tests the solver, catalog, API and browser adapter, then builds downloadable browser artifacts. The [release CI run](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) passed 274 Python tests, 408 browser tests and the resource-limited Docker smoke. The small synthetic smoke does not establish production capacity. Mocks are distinct from live account evidence. The old scripts are preserved under `legacy/` and are not part of startup.
 
 Product journeys and release gates: [PRODUCT.md](docs/PRODUCT.md). Observed account scenarios and acceptance criteria: [REAL-WORLD-CASES.md](docs/REAL-WORLD-CASES.md). Architecture and test evidence: [VERIFICATION.md](docs/VERIFICATION.md).
 

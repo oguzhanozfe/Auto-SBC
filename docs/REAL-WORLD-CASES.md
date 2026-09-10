@@ -198,9 +198,9 @@ requests, Save and Submit until the tab is reloaded and a fresh review begins.
 **Evidence:** Implemented extension/adapter tests cover consent, exact permission,
 missing or unreadable settings, wrong response origins, changed revisions after
 preview and after Save, and Cancel during the fresh settings check. Hosted auth,
-limits and synthetic API cases have local tests. **Pending:** Render sign-in,
-Docker CI smoke, deployment, synthetic hosted smoke and service sleep/restart
-validation. No live hosted club-data run is claimed.
+limits and synthetic API cases have local tests. [Resource-limited Docker CI
+smoke passed](https://github.com/oguzhanozfe/Auto-SBC/actions/runs/34458034938) with small synthetic inputs. **Pending:** Render
+sign-in, deployment, synthetic hosted smoke and service sleep/restart validation. No live hosted club-data run is claimed.
 
 ## Next work, ordered by observed friction
 
