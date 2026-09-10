@@ -7,7 +7,7 @@ from copy import deepcopy
 from fastapi.responses import Response
 
 from . import setup
-from .solver_policy import flag, identifier, normalize_policy
+from .solver_policy import flag, identifier, normalize_policy, owned_price_stale, positive_price
 from .live_market import plan_live
 
 
@@ -22,11 +22,40 @@ def validate_scope(body, catalog):
                 raise ValueError(f"{label}: {key} differs from selected {catalog.platform} market.")
 
 
-def plan(body, catalog, progress=None):
-    start = time.monotonic()
+def price_diagnostics(result, refresh):
+    diagnostics = result.setdefault("diagnostics", {})
+    if refresh is not None:
+        diagnostics["priceRefresh"] = refresh
+        if refresh["state"] not in ("fresh", "refreshed"):
+            diagnostics.setdefault("warnings", []).append("Current public prices could not be refreshed. Existing quote freshness checks and player value limits remain in force.")
+    unavailable = diagnostics.get("priceLimitWithoutQuote", {})
+    count = sum(unavailable.get(key, 0) for key in ("stale", "missing"))
+    if count and not result.get("solution") and result.get("status_code") == 3:
+        # Keep the proof for the restricted pool, but do not describe missing
+        # prices as proof that the owned club cannot satisfy this challenge.
+        diagnostics["priceLimitedSolveStatus"] = {"status_code": result["status_code"], "status_key": result.get("status_key"), "status": result.get("status")}
+        result.update(status_code=0, status_key="PRICES_UNAVAILABLE",
+                      status=f"No squad found among currently valued cards. {count} otherwise eligible owned cards were excluded by the player value limit because prices are stale or missing; refresh prices and retry. Infeasibility is not proven across those cards.")
+    return result
+
+
+def plan(body, catalog, progress=None, *, refresh_prices=False):
     validate_scope(body, catalog)
     policy = dict(body.solverPolicy)
     normalize_policy(policy)  # Validate before database work or silent filtering.
+    refresh = None
+    # Supplied live quotes do not depend on the public catalog price snapshot.
+    catalog_concepts = policy.get("allowConcept", False) and getattr(body, "liveMarket", None) is None
+    needs_catalog_prices = catalog_concepts or any(
+        not flag(player.get("concept")) and (owned_price_stale(player) or not any(
+            positive_price(player.get(key)) for key in ("marketPrice", "futggPrice", "futBinPrice", "price")))
+        for player in body.clubPlayers)
+    if refresh_prices and needs_catalog_prices:
+        if progress:
+            progress({"stage": "prices", "message": "Checking current public market prices"})
+        refresh = catalog.refresh_prices_if_stale()
+    # Price refresh is separate from the user's CP-SAT search budget.
+    start = time.monotonic()
     # Fallback valuation is scoped to this season; it is never a purchase quote.
     policy["ratingFallbackPrices"] = catalog.rating_fallbacks()
     owned = catalog.enrich([p for p in body.clubPlayers if not flag(p.get("concept"))])
@@ -35,7 +64,7 @@ def plan(body, catalog, progress=None):
     sbc = {**body.sbcData, "gameYear": catalog.game_year, "platform": catalog.platform}
     sbc.pop("conceptCoverage", None)  # Server computes coverage itself.
     if getattr(body, "liveMarket", None) is not None:
-        return plan_live(body, catalog, owned, policy, sbc, progress)
+        return price_diagnostics(plan_live(body, catalog, owned, policy, sbc, progress), refresh)
     limits = (750, 2500, 6000, 12000, 20000) if policy.get("allowConcept") else (0,)
     candidates, stages = {}, []
     best, last, best_coverage = None, None, None
@@ -108,4 +137,4 @@ def plan(body, catalog, progress=None):
             result.update(status_code=0, status_key="MARKET_UNAVAILABLE", status="Selected season/platform has no usable market quotes; refresh the database or solve with owned cards")
     result["conceptCandidates"] = best_proof
     result.update(database=database, gameYear=catalog.game_year, platform=catalog.platform, reviewRequired=True)
-    return result
+    return price_diagnostics(result, refresh)

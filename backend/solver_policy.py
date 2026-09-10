@@ -70,6 +70,25 @@ def positive_price(value):
         return None
 
 
+def owned_price_stale(item):
+    """Recheck dated owned valuations without inventing dates for legacy rows."""
+    if flag(item.get("priceStale")):
+        return True
+    stamp = item.get("priceSnapshotAt") or item.get("priceUpdatedAt")
+    if stamp is None:
+        return False
+    try:
+        published = (datetime.fromtimestamp(stamp, timezone.utc) if type(stamp) in (int, float)
+                     else datetime.fromisoformat(str(stamp).replace("Z", "+00:00")))
+        if published.tzinfo is None:
+            return True
+        age = (datetime.now(timezone.utc) - published).total_seconds()
+        max_age = float(os.environ.get("AUTOSBC_PRICE_MAX_AGE_HOURS", "6"))
+        return not math.isfinite(max_age) or max_age <= 0 or age < -300 or age > max_age * 3600
+    except (ValueError, TypeError, OverflowError, OSError):
+        return True
+
+
 def normalize_policy(raw=None):
     if raw is not None and not isinstance(raw, dict):
         raise SolverInputError("solverPolicy must be an object")
@@ -219,7 +238,9 @@ def prepare_players(players, raw_policy=None):
         item["Original_Idx"] = original_index
         item["marketPriceSource"] = item.get("marketPriceSource") or item.get("priceSource") or item.get("catalogSource")
         item["_conceptQuoteIssue"] = concept_quote_issue(item) if item["concept"] else None
-        stale = flag(item.get("priceStale"))
+        stale = owned_price_stale(item)
+        if stale:
+            item["priceStale"] = True
         raw_price = None if stale else next((p for field in ("marketPrice", "futggPrice", "futBinPrice") if (p := positive_price(item.get(field))) is not None), None)
         # The legacy price may already contain a protection multiplier or fixed=1.
         if raw_price is None and not stale and not (item["concept"] or item["isObjective"] or item["isSbc"] or item["isFixed"]):
@@ -232,6 +253,7 @@ def prepare_players(players, raw_policy=None):
         rows.append(item)
     policy["requiredItemIds"] = sorted(set(policy["requiredItemIds"]) | set(required_from_flags))
     filtered, retained, price_sources = Counter(), [], Counter()
+    price_limit_without_quote = Counter()
     for item in rows:
         item_id, asset_id, definition_id = (identifier(item[k]) for k in ("id", "assetId", "definitionId"))
         reason = None
@@ -289,6 +311,8 @@ def prepare_players(players, raw_policy=None):
         item["priceSource"] = price_source
         item["purchaseQuoteVerified"] = bool(item["concept"] and not quote_issue)
         if policy.get("maxPlayerPrice") is not None and market_price > policy["maxPlayerPrice"]:
+            if not reason and not item["concept"] and price_source == "unknownConservativeFallback":
+                price_limit_without_quote["stale" if item.get("priceStale") else "missing"] += 1
             reason = reason or "priceLimit"
         if reason:
             filtered[reason] += 1
@@ -304,8 +328,11 @@ def prepare_players(players, raw_policy=None):
     diagnostics = {
         "inputCount": len(rows), "candidateCount": len(retained),
         "filteredCounts": dict(filtered), "priceSources": dict(price_sources),
+        "priceLimitWithoutQuote": {"stale": price_limit_without_quote["stale"], "missing": price_limit_without_quote["missing"]},
         "warnings": [],
     }
+    if price_limit_without_quote:
+        diagnostics["warnings"].append(f"{sum(price_limit_without_quote.values())} otherwise eligible owned cards lack current prices or a rating valuation and were excluded by the player value limit. Their conservative fallback is not a known market price.")
     if price_sources["unknownConservativeFallback"]:
         diagnostics["warnings"].append("Some market prices are unknown; a conservative 15,000,000 replacement value is used. This is an estimate, not a market quote.")
     if price_sources["candidateRatingP60"]:

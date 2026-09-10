@@ -208,7 +208,8 @@ def test_extension_download_contains_only_built_browser_files(client, tmp_path, 
     assert client.get('/download/chrome-extension').status_code == 404
     directory = tmp_path / 'dist/chrome-extension'
     directory.mkdir(parents=True)
-    names = {'manifest.json', 'companion.js', 'bridge.js', 'worker.js', 'LICENSE'}
+    names = {'manifest.json', 'companion.js', 'bridge.js', 'worker.js', 'LICENSE',
+             'transport.js', 'options.html', 'options.js', 'options.css'}
     for name in names:
         (directory / name).write_text('built fixture')
     assert client.get('/download/chrome-extension').status_code == 409

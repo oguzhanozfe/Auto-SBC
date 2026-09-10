@@ -1,13 +1,13 @@
 # Real-world acceptance cases
 
-Live checkpoint: **27.0.13, 10 September 2026**. The selected five-set request stands at **2/5 groups
-and 13/17 parts**: ten selected-set parts completed automatically and three
-through earlier solve/Apply plus native submission. After the earlier **1/60**
-Bronze daily run, a fresh 59-cycle plan verified **2/59** more cycles, and the
-27.0.13 plan verified **1/57**. That is four automatic Bronze dailies and
-**fourteen automatic parts/cycles overall**, confirmed in the UI and local reports.
-Earlier Daily Silver tests are separate. Neither the original 60 rights nor the
-replacement plan has been fully completed or validated.
+Release checkpoint: **27.0.14, 10 September 2026**. The selected five-set request
+stands at **5/5 sets and 17/17 parts**: 14 selected-set parts completed
+automatically and three through earlier solve/Apply plus native submission.
+The latest live session added Provisions, Ultimate Rewind, five Bronze
+dailies and the final two Yan parts through Auto-SBC 27.0.13. Nine Bronze dailies are now verified, giving **23 automatic
+parts/cycles overall**. Earlier Daily Silver tests are separate. The five selected sets are complete;
+the last plan has **51 cycles remaining**. Neither that plan nor the original daily allowance is fully
+completed or validated.
 
 “Observed” means an account action or read was verified. “Mocked” means a
 controlled test exercises the behavior. “Pending” is an acceptance condition,
@@ -46,10 +46,12 @@ one eligible cycle per selected set. Count a saved squad, an accepted submission
 and a verified completed part separately. Preserve confirmed progress when the
 next part fails; keep completed groups out of the remaining queue.
 
-**Evidence:** Observed completion of 10x85+ and the 98+ FOF/FUTTIES Pick, with five
-Yan Diomandé parts verified. Current progress is 2/5 groups, 13/17 parts; balance
-remained 577,251. Mocked tests cover finite queues and second-part failures.
-**Pending:** finish the remaining three groups and four parts. Squad selection
+**Evidence:** Observed completion of 10x85+, the 98+ FOF/FUTTIES Pick,
+Provisions, Ultimate Rewind and all seven Yan Diomandé parts. Current progress
+is 5/5 sets and 17/17 parts. The final two 92-rated squads succeeded after the
+maximum card rating changed from 94 to 95, retaining the 25,000 card value cap
+and played/evolution/saved-squad protections. No cards were purchased. Mocked
+tests cover finite queues and second-part failures. Squad selection
 is sequential; global allocation of club cards across all remaining parts is
 not implemented.
 
@@ -85,7 +87,8 @@ Preserve the original uncertain event and prior receipts.
 completion or submission. Mocked tests cover missing cards, stale evidence,
 timeouts and other unresolved effects. A fresh protected 27.0.11 queue later completed part 4152 with a new receipt
 and counter verification at 00:48:58 UTC. The next 92-rated part reached its
-30-second solve limit before saving. **Pending:** complete the remaining work.
+30-second solve limit before saving. Subsequent protected solves completed both
+remaining 92-rated parts under the higher maximum card rating described above.
 The original 409 cause remains unknown.
 
 ## 5. Sixty daily rights, but reward packs are still unopened
@@ -123,8 +126,12 @@ verified one of its 57 cycles, then stopped on an initial 426 list response
 before any write. That 4xx response is outside the retry policy. The test ended
 there: 56 rights remain by arithmetic, without another rights refresh. Only the
 521 retry was observed live; the broader 5xx range has unit coverage.
-**Pending:** the remaining finite cycles and actual inventory shortages before
-proposing pack handling. A valid saved squad must not be reported as completed.
+The latest live session added five Bronze dailies through Auto-SBC, for nine
+verified automatic daily cycles. The latest 53-cycle plan verified two Bronze cycles and stopped on an initial
+426 list read before the next write; 51 cycles remain. A five-second cancellable pause now separates verified cycles; its
+Stop regression preserves the receipt and prevents the next list, solve and
+write. **Pending:** the remaining finite cycles and actual inventory shortages.
+A valid saved squad must not be reported as completed.
 
 ## 6. Early FC 27, an empty club and an outdated price snapshot
 
@@ -174,23 +181,40 @@ alone must not exclude a repeatable set with rights remaining.
 
 **Evidence:** Mocked daily tests cover resets, external completion, expiry,
 counter changes and cancellation before saving. **Pending:** controlled live
-confirmation of this boundary. The current 60-cycle plan must remain fixed even
-if more rights become available during the run.
+confirmation of this boundary. Each approved plan must remain fixed even if
+more rights become available during the run.
+
+## 9. Choose a hosted solver, then change its settings during a review
+
+**Trigger:** A player selects a private HTTPS solver, or changes its origin/token
+after a solution has been reviewed.
+
+**Required behavior:** Keep localhost as the default. Require explicit destination
+consent and an owner token kept in extension storage. Display the origin before
+sending club-card data; never forward EA cookies or credentials. Pin the
+loaded EA tab to one configuration. Changed settings must prevent private
+requests, Save and Submit until the tab is reloaded and a fresh review begins.
+
+**Evidence:** Implemented extension/adapter tests cover consent, exact permission,
+missing or unreadable settings, wrong response origins, changed revisions after
+preview and after Save, and Cancel during the fresh settings check. Hosted auth,
+limits and synthetic API cases have local tests. **Pending:** Render sign-in,
+Docker CI smoke, deployment, synthetic hosted smoke and service sleep/restart
+validation. No live hosted club-data run is claimed.
 
 ## Next work, ordered by observed friction
 
-1. Carry the four verified Bronze completions through the remaining daily
-   rights. Validate bounded, cancellable list-read recovery while preserving
-   receipts and preventing write replay; do not assign undocumented causes to
-   the observed 512/521 responses.
-2. Carry the now-observed all-saved-squad read through the remaining four parts.
-   Improve explanations for actual read, ownership or eligibility failures
-   before widening recovery to other uncertain states.
-3. Make the proven 521 and narrow 409 recovery paths understandable from the
-   report itself. Preserve receipts and counts through every stop or reload.
-4. Resolve or explicitly reject combined/OR constraint gaps before broader
-   puzzle coverage. Treat FC 27 live behavior and current prices as separate
-   launch checks, rather than inferring readiness from catalog size.
+1. Carry nine verified Bronze completions through the remaining approved daily
+   rights. Preserve receipts, cancellable pacing and no write replay.
+2. Retain the complete five-set evidence and repeat the protected workflow on
+   future requests. Keep price-limited failure distinct from whole-club
+   infeasibility; do not infer global multi-part card allocation.
+3. Validate Render with synthetic input and actual service limits before a
+   private hosted club run. Keep public hosting unavailable until that setup is
+   complete; ordinary local mode remains unauthenticated and local.
+4. Preserve the explicit combined/OR rejection until those semantics are
+   implemented and checked against EA. Treat FC 27 live behavior and prices as
+   separate launch checks.
 
 ## Observed chemistry workload, separate from stress testing
 

@@ -22,12 +22,16 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+from .solver_policy import owned_price_stale, positive_price
+
 SOURCE = 'https://www.fut.gg/players/'
 # FUT.GG's public FC position enum; definition-data supplies these numeric IDs.
 POSITIONS = {'GK': 0, 'RWB': 2, 'RB': 3, 'CB': 5, 'LB': 7, 'LWB': 8,
              'CDM': 10, 'RM': 12, 'CM': 14, 'LM': 16, 'CAM': 18, 'CF': 21,
              'RW': 23, 'ST': 25, 'LW': 27}
 POSITION_NAMES = {value: key for key, value in POSITIONS.items()}
+PRICE_REFRESH_COOLDOWN_SECONDS = 300
+PRICE_REFRESH_TIMEOUT = (3, 5)
 # Each partition is below the search API's 10,000-result ceiling. Prioritize fodder.
 BANDS = [(80, 84), (85, 89), (75, 79), (65, 74), (0, 64), (90, 94), (95, 99)]
 PAGE_SIZE = 100
@@ -58,6 +62,8 @@ def _positive_price(value):
 
 def decode_prices(index, blob):
     """Decode public v2 price blobs, rejecting mismatched versions/array lengths."""
+    if not isinstance(index, dict) or not isinstance(blob, dict):
+        raise ValueError('Invalid FUT.GG price objects; existing prices were retained.')
     if index.get('v') != 2 or blob.get('v') != 2:
         raise ValueError('Unsupported FUT.GG price format; existing prices were retained.')
     deltas, values, states = index.get('d'), blob.get('p'), blob.get('s')
@@ -305,6 +311,9 @@ class Catalog:
                     item['gameYear'] = self.game_year
                 if item.get('platform') is None:
                     item['platform'] = self.platform
+                supplied_stale = owned_price_stale(item)
+                if supplied_stale:
+                    item['priceStale'] = True
                 try:
                     definition_id = int(player.get('definitionId'))
                 except (TypeError, ValueError):
@@ -317,9 +326,13 @@ class Catalog:
                     item['catalogMarketPrice'] = fields['marketPrice']
                     if fields['priceStale']:
                         fields['marketPrice'] = fields['futggPrice'] = None
+                    replace_quote = fields['quoteReady'] and (supplied_stale or not any(
+                        positive_price(item.get(key)) for key in ('marketPrice', 'futggPrice', 'futBinPrice', 'price')))
                     for key in ('marketPrice', 'futggPrice', 'priceSource', 'priceUpdatedAt', 'priceSnapshotAt', 'priceFetchedAt', 'priceStale', 'priceGameYear', 'pricePlatform', 'quoteReady'):
-                        if key not in item or item[key] is None:
+                        if replace_quote or key not in item or item[key] is None:
                             item[key] = fields[key]
+                    if replace_quote:
+                        item['marketPriceSource'] = fields['priceSource']
                 enriched.append(item)
         return enriched
 
@@ -527,14 +540,89 @@ class Catalog:
             offset += len(players)
         return stream.getvalue()
 
-    def _fetch(self, url, params=None):
-        response = self.session.get(url, params=params, timeout=(10, 45),
+    def _fetch(self, url, params=None, *, timeout=(10, 45)):
+        response = self.session.get(url, params=params, timeout=timeout,
                                     headers={'User-Agent': 'Auto-SBC-Local-Catalog/1.0', 'Accept': 'application/json'})
         # No retries/challenge solving/alternate hosts on access denials or rate limiting.
         if response.status_code in (401, 403, 429):
             raise RuntimeError(f'FUT.GG returned HTTP {response.status_code}; sync stopped without bypass or retry.')
         response.raise_for_status()
         return response.json()
+
+    def _sync_prices_unlocked(self, *, timeout=(10, 45)):
+        """Exactly three fixed public requests; no club data or card-page crawl."""
+        manifest_url = f'https://r2.fut.gg/{self.game_year}/manifest.json'
+        manifest = self._fetch(manifest_url, timeout=timeout)
+        if not isinstance(manifest, dict):
+            raise ValueError('Invalid public CDN manifest.')
+        published_at = manifest.get('_published_at') or {}
+        if not isinstance(published_at, dict):
+            raise ValueError('Invalid public CDN publication metadata.')
+        with self._connect() as db:
+            self._set_meta(db, 'availability', {'available': True, 'checkedAt': _now(), 'manifestUrl': manifest_url})
+        def cdn(key):
+            version, token = manifest.get('_version'), manifest.get(key)
+            if not isinstance(version, int) or not isinstance(token, str) or not token.isalnum():
+                raise ValueError(f'Invalid public CDN manifest entry: {key}')
+            return f'https://r2.fut.gg/{self.game_year}/{key}.v{version}.{token}.json'
+        index_url = cdn('player-prices-index')
+        price_key = f'player-prices-{self.platform}-dyn'
+        price_url = cdn(price_key)
+        prices = decode_prices(self._fetch(index_url, timeout=timeout), self._fetch(price_url, timeout=timeout))
+        published = _iso_timestamp(published_at.get(price_key))
+        fetched = _now()
+        with self._connect() as db:
+            db.execute('DELETE FROM prices')
+            db.executemany('INSERT INTO prices VALUES (?, ?, ?, ?, ?, ?)', [(*row, published, fetched) for row in prices])
+            self._set_meta(db, 'prices', {'url': price_url, 'indexUrl': index_url, 'manifestUrl': manifest_url,
+                                        'publishedAt': published, 'fetchedAt': fetched})
+
+    def refresh_prices_if_stale(self):
+        """One optional bulk refresh, sharing the manual-sync lock and cooldown.
+
+        Failed attempts are also persisted so subsequent daily cycles and
+        separate service processes cannot repeatedly hit an unavailable source.
+        Existing prices are only replaced after the complete snapshot validates.
+        """
+        def report(state, attempted=False, **extra):
+            current = self.status()
+            return {'state': state, 'attempted': attempted,
+                    'pricesPublishedAt': current['pricesPublishedAt'], **extra}
+        def current_prices():
+            current = self.status()
+            return not current['pricesStale'] and current['marketPriceCount'] > 0
+        if current_prices():
+            return report('fresh')
+        with self.path.with_suffix('.sync.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return report('busy')
+            try:
+                if current_prices():
+                    return report('fresh')
+                now = time.time()
+                with self._connect() as db:
+                    previous = self._get_meta(db, 'priceRefresh', {})
+                    attempted_at = previous.get('attemptedAt')
+                    if type(attempted_at) in (int, float) and math.isfinite(attempted_at):
+                        elapsed = now - attempted_at
+                        if elapsed < PRICE_REFRESH_COOLDOWN_SECONDS:
+                            return report('cooldown', cooldownSeconds=math.ceil(min(PRICE_REFRESH_COOLDOWN_SECONDS,
+                                          PRICE_REFRESH_COOLDOWN_SECONDS - elapsed)))
+                    self._set_meta(db, 'priceRefresh', {'attemptedAt': now, 'state': 'refreshing'})
+                try:
+                    self._sync_prices_unlocked(timeout=PRICE_REFRESH_TIMEOUT)
+                    current = self.status()
+                    state = 'refreshed' if current_prices() else 'stale' if current['marketPriceCount'] else 'missing'
+                    result = report(state, True)
+                except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError, OverflowError, OSError):
+                    result = report('failed', True, errorCode='PUBLIC_PRICE_REFRESH_FAILED')
+                with self._connect() as db:
+                    self._set_meta(db, 'priceRefresh', {'attemptedAt': now, **result})
+                return result
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def sync(self, max_pages=10):
         """Refresh bulk prices and resume paced public card pages (maximum 1,000)."""
@@ -557,26 +645,7 @@ class Catalog:
         pace = max(.1, min(float(os.environ.get('AUTOSBC_SYNC_DELAY_SECONDS', '.35')), 10))
         pages_fetched = 0
         try:
-            manifest_url = f'https://r2.fut.gg/{self.game_year}/manifest.json'
-            manifest = self._fetch(manifest_url)
-            with self._connect() as db:
-                self._set_meta(db, 'availability', {'available': True, 'checkedAt': _now(), 'manifestUrl': manifest_url})
-            def cdn(key):
-                version, token = manifest.get('_version'), manifest.get(key)
-                if not isinstance(version, int) or not isinstance(token, str) or not token.isalnum():
-                    raise ValueError(f'Invalid public CDN manifest entry: {key}')
-                return f'https://r2.fut.gg/{self.game_year}/{key}.v{version}.{token}.json'
-            index_url = cdn('player-prices-index')
-            price_key = f'player-prices-{self.platform}-dyn'
-            price_url = cdn(price_key)
-            prices = decode_prices(self._fetch(index_url), self._fetch(price_url))
-            published = _iso_timestamp((manifest.get('_published_at') or {}).get(price_key))
-            fetched = _now()
-            with self._connect() as db:
-                db.execute('DELETE FROM prices')
-                db.executemany('INSERT INTO prices VALUES (?, ?, ?, ?, ?, ?)', [(*row, published, fetched) for row in prices])
-                self._set_meta(db, 'prices', {'url': price_url, 'indexUrl': index_url, 'manifestUrl': manifest_url,
-                                            'publishedAt': published, 'fetchedAt': fetched})
+            self._sync_prices_unlocked()
             with self._connect() as db:
                 cursor = self._get_meta(db, 'cursor', {})
             if not cursor:

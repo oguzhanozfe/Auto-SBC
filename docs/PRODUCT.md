@@ -2,8 +2,10 @@
 
 Auto-SBC Studio should let a player choose SBCs, protect the cards they care
 about, and let the tool do the repeated solving and submission work. The
-product is an English Chrome extension with a local solver. It is currently a
-private beta distributed as an unpacked extension, not a hosted public service.
+product is an English Chrome extension with a local solver and an opt-in
+single-owner HTTPS transport. It is a private beta distributed as an unpacked
+extension. The Render profile is prepared; account sign-in, deployment and
+hosted smoke tests remain pending. No public hosted service is claimed.
 
 These priorities come from the user's repeated requests: place inexpensive
 concepts through the tool, complete eligible dailies automatically, return to
@@ -29,7 +31,9 @@ expired quote, wrong-season price or missing listing cannot become a confident
 purchase price. Concept placement remains distinct from buying a card or
 completing an SBC.
 
-The observed FC 26 concept flow is useful evidence for this journey. FC 27
+Concept search and placement use the local solver; the hosted evaluation
+profile supports owned cards only. The observed FC 26 concept flow is useful
+evidence for this journey. FC 27
 adapter compatibility and usable FC 27 prices require their own live acceptance
 case; a populated catalog or FC 26 test does not establish them.
 
@@ -111,6 +115,27 @@ resuming a queue. Setup must expose privacy information and a feedback route.
 The generated extension needs the regression suite and real browser validation;
 a successful build alone is insufficient.
 
+## Choose where club data is solved
+
+Localhost stays the default. A hosted user explicitly chooses an HTTPS origin,
+enters a single-owner bearer token and grants permission for that destination.
+The panel displays the address before solving. The extension keeps the token
+out of the EA page and request exports, omits cookies and rejects redirects.
+Changing settings requires an EA reload; fresh checks prevent an old preview
+from being saved or submitted after an origin or token revision change.
+
+Hosted evaluation currently limits owned squads to 30 seconds and 5,000 input
+cards, with a default 200-card cap for chemistry. It rejects unsupported inputs
+without changing the pool or requirements. Bounded public bulk-price refresh
+can update owned-card valuation without sending club data to the provider.
+Unavailable valuations retain the value cap and produce price-specific
+diagnostics instead of a whole-club infeasibility claim.
+
+Acceptance still requires a deployed synthetic smoke test, repeated daily and
+rating jobs within actual host limits, sleep/wake behavior and lost-job handling.
+An owner token is not a multi-user account system. The hosted dashboard does not
+yet provide a separate sign-in flow; use the authenticated extension transport.
+
 ## Measure the workloads the player actually asks it to solve
 
 Use [REAL-WORLD-CASES.md](REAL-WORLD-CASES.md) as the release acceptance set:
@@ -130,16 +155,19 @@ answer different questions and must remain distinguishable in product claims.
 
 ## Private-beta limits and public release
 
-The local service and unpacked extension remain the supported distribution.
-Live daily completion and the remaining selected-set work must be recorded as
-observed results, not inferred from mocked passes. Combined/OR requirement
-gaps must be resolved or explicitly rejected before expanding puzzle coverage;
-see [QUALITY-PLAN.md](QUALITY-PLAN.md).
+The local service and unpacked extension remain the live-validated distribution.
+At 27.0.14, 23 automatic parts/cycles are verified: 14 selected-set parts and
+nine Bronze dailies. The selected request is complete at 5/5 sets and 17/17
+parts. The latest 53-cycle daily plan stopped after two verified Bronze cycles; 51
+cycles remain. These
+results must not be inferred to cover the full plan. Combined same-player and
+OR/unknown eligibility operations now fail before solve/write; broader puzzle
+semantics remain future work. See [QUALITY-PLAN.md](QUALITY-PLAN.md).
 
-Public distribution still needs reliable extension updates, privacy and support
-pages, and a usable support channel. A hosted solver additionally needs
-user-scoped jobs, abuse controls and compute limits measured on representative
-eligible workloads. Deployment decisions and prerequisites are in
+Public distribution still needs reliable extension updates and a tested support
+workflow. Privacy and feedback pages exist, but a wider hosted service would
+also need per-user identities, job isolation, abuse controls and compute limits
+measured on representative eligible workloads. Deployment decisions and prerequisites are in
 [HOSTING.md](HOSTING.md). The beta should earn broader claims through these
 concrete journeys rather than promise every puzzle, every market minimum or
 unverified superiority over another extension.

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Private solver · Auto-SBC Studio</title><link rel="stylesheet" href="/static/style.css"></head>
+<body class="privacy-page"><main>
+<header><span>Auto-SBC Studio</span><a href="/privacy">Privacy</a></header>
+<article>
+<h1>Your private solver endpoint</h1>
+<p>This single-owner service is used through the Auto-SBC Chrome extension. The interactive Studio dashboard is available in local mode. This page does not load club data or accept an access token.</p>
+<h2>Connect the extension</h2>
+<ol>
+<li>Install the reviewed Auto-SBC Chrome extension and copy its extension ID from <code>chrome://extensions</code> into this server’s <code>AUTOSBC_EXTENSION_IDS</code> configuration.</li>
+<li>Open the extension’s server settings and choose <strong>My private HTTPS server</strong>. Enter this service’s exact HTTPS origin and its owner access token. Keep the token private; do not place it in a URL.</li>
+<li>Review and approve sending your SBC requirements and club-card data to that destination. Reload the EA Web App, confirm the displayed server, then select <strong>Check server</strong>.</li>
+</ol>
+<h2>Evaluation limits</h2>
+<p>This initial hosted profile accepts owned cards, one solve at a time, with up to 5,000 input cards and a 30-second solver budget. Chemistry requests have a separate server-configured limit, initially 200 cards. Oversized requests are rejected without removing candidates. Concepts require local Studio in this release.</p>
+<p>Free hosting may sleep or restart. If the initial connection times out during a cold start, wait and check the server again. A lost solve job requires a fresh review; account actions are never replayed automatically.</p>
+<p>Jobs, catalog data, downloads and diagnostics require the owner token. Public health contains only the service status, version and mode. Review <a href="/privacy">how data is handled</a> before connecting your club.</p>
+</article><footer>Independent community software · Private beta · MIT</footer>
+</main></body></html>

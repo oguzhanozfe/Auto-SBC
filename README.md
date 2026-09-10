@@ -28,11 +28,13 @@ Concepts need a positive, fresh quote for the selected season and platform. Miss
 
 ## Current beta status
 
-The current release uses a local service. Your club payload is processed in memory on your computer; EA credentials and account actions stay in the Web App. See [Privacy](PRIVACY.md).
+Version **27.0.14** defaults to the local service, where your club payload is processed in memory on your computer. The Chrome extension also supports an explicitly chosen private HTTPS solver with an owner access token and destination-specific consent. Hosted solving sends selected club-card data to that server; EA credentials and account actions stay in the Web App. The Render deployment is prepared but has not been deployed: account sign-in and hosted validation remain pending. See [Privacy](PRIVACY.md) and [hosting setup](deploy/README.md).
 
-Live FC 26 evidence includes ten earlier Daily Silver solve/Apply flows and native concept placement using a current EA price. Auto-SBC has since completed **fourteen SBC parts/cycles fully automatically**: ten selected-set parts and four Bronze dailies. Across the selected five-set test, progress is **2/5 sets and 13/17 parts**, including 10x85+ and the complete 98+ FOF/FUTTIES pick. The rejected Yan Diomandé attempt was reconciled without completion credit; a fresh protected solve later completed that part. Its next 92-rated part had no feasible solution under the current protected inventory and rating/value caps. The latest daily run verified one more cycle, then stopped on a 426 list read before the next squad. An earlier 521 list failure recovered automatically after one bounded wait. Full-plan validation remains pending. Full evidence and limits are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+Live FC 26 evidence includes ten earlier Daily Silver solve/Apply flows and native concept placement using a current EA price. Auto-SBC has since completed **23 SBC parts/cycles fully automatically**: 14 selected-set parts and nine Bronze dailies. The latest session added five Bronze dailies, Provisions, Ultimate Rewind and the final two Yan Diomandé parts. All selected work is now verified: **5/5 sets and 17/17 parts**. The two 92-rated Yan squads succeeded with a maximum card rating of 95 and a 25,000-coin card value cap, while played/evolution/saved-squad protections remained enabled.
 
-FC 27 catalog metadata is available, but usable prices and live Web App compatibility are separate checks. FC 26 prices are never substituted for FC 27. Combined same-player conditions, OR expressions and unsupported chemistry profiles remain launch gates; see [QUALITY-PLAN.md](docs/QUALITY-PLAN.md).
+The latest 53-cycle plan verified two Bronze cycles, then stopped on a 426 list read before the next squad. **51 cycles remain**; the plan is unfinished. Earlier stopped-run recovery preserved successful receipts without replaying submissions. These results do not establish completion of the full daily plan. These live EA actions used 27.0.13; the 27.0.14 extension reload and live walkthrough remain pending. Full evidence and limits are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+FC 27 catalog metadata is available, but usable prices and live Web App compatibility are separate checks. FC 26 prices are never substituted for FC 27. Combined same-player conditions and OR/unknown eligibility operations now stop before solving or account writes. Unsupported chemistry profiles remain excluded with diagnostics; see [QUALITY-PLAN.md](docs/QUALITY-PLAN.md).
 
 ## Database and hosting
 
@@ -46,7 +48,9 @@ The public FUT.GG catalog and versioned price snapshots are cached separately by
 
 Add `--platform pc` for the PC market. Dashboard refresh handles ten pages per run and resumes. A fetch timestamp never makes an old price current; snapshot quotes expire after six hours by default, and live EA quotes after two minutes.
 
-Remote hosting is possible. The [hosting evaluation](docs/HOSTING.md) compares free offers, measured solver memory and the changes needed for a hosted beta. The current unauthenticated local service is not ready to expose publicly. No cloud deployment has been performed.
+Solves can make a bounded public bulk-price refresh when owned-card valuation or catalog concepts need fresh data. That refresh sends no club payload to the price provider. If the player value cap excludes cards with missing or stale prices and the remaining pool cannot solve the challenge, `PRICES_UNAVAILABLE` avoids claiming the full club is infeasible. Prices and protection limits are never silently relaxed.
+
+The opt-in hosted profile authenticates requests, restricts the exact host/origin and runs one solve at a time. It supports owned cards with a 30-second budget, up to 5,000 input cards and a smaller chemistry cap; concepts remain a local feature. [Render setup](deploy/README.md) and the [hosting evaluation](docs/HOSTING.md) describe the free-tier limits and pending smoke tests. Do not expose ordinary unauthenticated local mode publicly. Docker CI smoke and a deployed Render lifecycle test are still pending.
 
 ## Development
 
@@ -65,7 +69,7 @@ node --check tampermonkey-ai-sbc.user.js
 node --check backend/static/app.js
 ```
 
-Browser files are generated from `frontend/`; edit source modules instead of generated scripts. `VERSION` supplies the release number. CI tests the solver, catalog, API and browser adapter, then builds downloadable browser artifacts. Mocks are distinct from live account evidence. The old scripts are preserved under `legacy/` and are not part of startup.
+Browser files are generated from `frontend/`; edit source modules instead of generated scripts. `VERSION` supplies the release number. CI tests the solver, catalog, API and browser adapter, then builds downloadable browser artifacts. The added Docker smoke job still needs a successful run for this release. Mocks are distinct from live account evidence. The old scripts are preserved under `legacy/` and are not part of startup.
 
 Product journeys and release gates: [PRODUCT.md](docs/PRODUCT.md). Observed account scenarios and acceptance criteria: [REAL-WORLD-CASES.md](docs/REAL-WORLD-CASES.md). Architecture and test evidence: [VERIFICATION.md](docs/VERIFICATION.md).
 
@@ -76,4 +80,4 @@ Product journeys and release gates: [PRODUCT.md](docs/PRODUCT.md). Observed acco
 - [Paletools](https://pale.tools/fifa/paletools.html)
 - [FUT.GG public catalog](https://www.fut.gg/players/)
 
-Unofficial community software, unaffiliated with EA, SBC Monkey or Paletools. MIT applies to repository code; provider data and EA assets retain their own rights. Public catalog snapshots are not committed to Git.
+Unofficial community software, unaffiliated with EA, SBC Monkey or Paletools. MIT applies to repository code; provider data and EA assets retain their own rights. Full public catalog databases are not committed to Git; the Docker profile includes small public definition/rating seeds without club ownership data.

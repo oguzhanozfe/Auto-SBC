@@ -50,7 +50,10 @@ function harness(overrides = {}) {
   const localStorage = new Storage(), sessionStorage = new Storage();
   for (const [key,value] of Object.entries(overrides.storage || {})) localStorage.setItem(key,value);
   const writes = [], requests = [], conceptRequests = [];
-  const timerDelays=[];
+  const timerDelays=[], pageMessages=[], workerMessages=[];
+  const extension = overrides.extension ? {config:overrides.extension.config || {mode:'hosted',origin:'https://solver.example',token:'x'.repeat(48),consent:true,revision:'configured-v1'},
+    infoError:overrides.extension.infoError, noInfoResponse:overrides.extension.noInfoResponse, responseOrigin:overrides.extension.responseOrigin,
+    openedOptions:0, infoRequests:0, beforeInfo:null, beforeNetwork:null} : null;
   const activeSquadPlayers=[], cacheReads=[];
   const savedSquads=new Map([[7,activeSquadPlayers]]);
   const nativeSquad=(id,slots)=>({getId:()=>id,getPlayers:()=>Array.from({length:23},(_,index)=>({
@@ -64,11 +67,11 @@ function harness(overrides = {}) {
   const squad = {_formation:{generalPositions:Array(11).fill(14)},simpleBrickIndices:[],_players:Array.from({length:11},()=>({_item:{}})),
     removeAllItems(keepManager){assert.equal(keepManager,true);writes.push('removeAllItems');this._players=this._players.map(()=>({_item:{id:0,isPlayer:()=>false}}));},
     setPlayers(items) { writes.push('setPlayers'); this._players=items.map(item=>({_item:item})); }};
-  const challenge = {id:10,setId:20,name:'Test challenge',status:'IN_PROGRESS',squad,
+  const challenge = {id:10,setId:20,name:'Test challenge',status:'IN_PROGRESS',squad,eligibilityOperation:'AND',
     eligibilityRequirements:[{scope:0,count:11,kvPairs:{_collection:{1:[11]}}}]};
   const set = {id:20,name:'Test SBC',isComplete:()=>false};
   let activeChallenge=challenge,nativeOptions;
-  const ctx = {console,setTimeout:(callback,delay,...args)=>{timerDelays.push(delay);return setTimeout(callback,delay===500?0:delay,...args);},clearTimeout,setInterval,clearInterval,queueMicrotask,URL,Blob,AbortController,crypto:require('node:crypto').webcrypto,
+  const ctx = {console,setTimeout:(callback,delay,...args)=>{timerDelays.push(delay);return setTimeout(callback,delay===500||extension?.noInfoResponse&&delay===10000?0:delay,...args);},clearTimeout,setInterval,clearInterval,queueMicrotask,URL,Blob,AbortController,crypto:require('node:crypto').webcrypto,
     localStorage,sessionStorage,location:{origin:'https://www.ea.com'},atob:value=>Buffer.from(value,'base64').toString(),
     document:{documentElement:body,createElement:tag=>new Element(tag),createTextNode:text=>new Element('#text',text)},
     repositories:{TeamConfig:{},Item:{getClub:()=>({reset:()=>cacheReads.push('club-reset')}),setDirty:pile=>cacheReads.push(`dirty-${pile}`)}},
@@ -103,7 +106,35 @@ function harness(overrides = {}) {
     ctx.getAppMain=()=>({getRootViewController:()=>({getPresentedViewController:()=>({getCurrentViewController:()=>({getCurrentController:()=>({childViewControllers:[{_challenge:activeChallenge}]})})})})});
   }
   ctx.window = ctx;
-  const context = vm.createContext(ctx);
+  const context = vm.createContext(ctx), pageWindow = vm.runInContext('window',context);
+  if(extension) {
+    const T=require('../frontend/extension-transport.js'),listeners=new Set();
+    ctx.__autoSBCExtension=true;
+    ctx.addEventListener=(name,callback)=>{if(name==='message')listeners.add(callback);};
+    ctx.removeEventListener=(name,callback)=>{if(name==='message')listeners.delete(callback);};
+    ctx.postMessage=(data,origin)=>{
+      pageMessages.push(data);
+      queueMicrotask(()=>{for(const listener of [...listeners])listener({source:pageWindow,origin,data});});
+    };
+    const bridgeContext=vm.createContext({window:pageWindow,location:ctx.location,chrome:{runtime:{sendMessage:async message=>{
+      workerMessages.push(message);
+      if(message.type==='autosbc-server-info') {
+        extension.infoRequests++;
+        if(extension.noInfoResponse)return new Promise(()=>{});
+        if(extension.beforeInfo)await extension.beforeInfo(message);
+        if(extension.infoError)return {error:extension.infoError};
+        try{return T.info(extension.config);}catch(error){return {error:error.message};}
+      }
+      if(message.type==='autosbc-server-options'){extension.openedOptions++;return {ok:true};}
+      if(message.type!=='autosbc-local-http')throw new Error('Unexpected extension message.');
+      if(extension.beforeNetwork)await extension.beforeNetwork(message);
+      let request;
+      try{request=T.request(extension.config,message);}catch(error){return {error:error.message};}
+      const response=await ctx.fetch(request.url,request.options);
+      return {ok:response.ok,status:response.status,body:JSON.parse(await response.text()),serverOrigin:extension.responseOrigin||request.origin};
+    }}}});
+    vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/extension-bridge.js'),'utf8'),bridgeContext);
+  }
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/policy.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-policy.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-runner.js'),'utf8'),context);
@@ -117,7 +148,7 @@ function harness(overrides = {}) {
   const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
   const selects = elements.filter(element=>element.tag==='select');
   const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('Load SBCs').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
-  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,savedSquads,nativeSquad,cacheReads,localStorage,selects,nativeOptions,timerDelays,
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,savedSquads,nativeSquad,cacheReads,localStorage,selects,nativeOptions,timerDelays,extension,pageMessages,workerMessages,
     navigate:id=>{activeChallenge=id===null?null:{...challenge,id};}};
 }
 test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
@@ -130,6 +161,93 @@ test('EA integration: solve only reads; reviewed Apply is the only save', async 
   await h.button('Apply squad').click();
   assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
   assert.equal(h.button('Apply squad').disabled,true);
+});
+function nativeRequirementHarness(h=harness()) {
+  // Verified public EA enums: AND/OR are strings; scope 0/1/2 means min/max/exact.
+  Object.assign(h.ctx.SBCEligibilityKey,{10:'NATION_ID',11:'LEAGUE_ID',19:'TEAM_RATING',25:'PLAYER_RARITY_GROUP'});
+  h.ctx.SBCEligibilityScope={0:'GREATER',1:'LOWER',2:'EXACT'};
+  // Two French LaLiga cards and two English Premier League cards satisfy
+  // separate minimum counts, but none satisfy their same-player intersection.
+  h.players.forEach((player,index)=>{player.nationId=index<2?18:index<4?14:99;player.leagueId=index<2?53:index<4?13:99;});
+  return h;
+}
+function nativeRequirement(pairs,scope=0,count=2) {
+  return {scope,count,kvPairs:{_collection:pairs},get isCombinedRequirement(){return Object.keys(this.kvPairs._collection).length>1;}};
+}
+test('separate native AND requirements preserve their scopes and player counts',async t=>{
+  for(const [scope,name] of [[0,'GREATER'],[1,'LOWER'],[2,'EXACT']])await t.test(name,async()=>{
+    const h=nativeRequirementHarness();
+    h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]},scope),nativeRequirement({11:[13]},scope)];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,1);assert.deepEqual(h.requests[0].sbcData.constraints,[
+      {scope:name,count:2,requirementKey:'NATION_ID',eligibilityValues:[18]},
+      {scope:name,count:2,requirementKey:'LEAGUE_ID',eligibilityValues:[13]}
+    ]);
+    assert.equal(h.button('Apply squad').disabled,false);assert.deepEqual(h.writes,[]);
+  });
+});
+test('combined same-player predicates stop before solving for minimum, maximum and exact counts',async t=>{
+  for(const scope of [0,1,2])await t.test(String(scope),async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[nativeRequirement({10:[18],11:[13]},scope)];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.deepEqual(h.cacheReads,[]);
+    assert.equal(h.button('Apply squad').disabled,true);assert.equal(h.button('Export solve request').disabled,true);
+    assert.ok(h.elements.some(e=>e.textContent.includes('combines multiple conditions on the same players')));
+  });
+});
+test('native OR and every missing or unknown operation stop without assuming AND',async t=>{
+  for(const operation of ['OR',undefined,null,0,1,true,'XOR','and','AND ','OR ',{},[]])await t.test(String(operation),async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityOperation=operation;
+    h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]}),nativeRequirement({11:[13]})];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+    const message=operation==='OR'?'alternative (OR) requirements':'requirement operation is missing or unsupported';
+    assert.ok(h.elements.some(e=>e.textContent.includes(message)));
+  });
+});
+test('single-key native alternative values and unset squad-level counts remain intact',async()=>{
+  const h=nativeRequirementHarness();
+  h.challenge.eligibilityRequirements=[nativeRequirement({19:[84]},0,-1),nativeRequirement({25:[83,84]},0,1),nativeRequirement({11:[13,53]},2,4)];
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.deepEqual(h.requests[0].sbcData.constraints,[
+    {scope:'GREATER',count:-1,requirementKey:'TEAM_RATING',eligibilityValues:[84]},
+    {scope:'GREATER',count:1,requirementKey:'PLAYER_RARITY_GROUP',eligibilityValues:[83,84]},
+    {scope:'EXACT',count:4,requirementKey:'LEAGUE_ID',eligibilityValues:[13,53]}
+  ]);assert.deepEqual(h.writes,[]);
+});
+test('malformed grouping metadata cannot bypass the same-player requirement gate',async t=>{
+  const cases=[
+    ['false combined flag on multiple predicates',{scope:0,count:2,isCombinedRequirement:false,kvPairs:{_collection:{10:[18],11:[13]}}}],
+    ['true combined flag on one predicate',{scope:0,count:2,isCombinedRequirement:true,kvPairs:{_collection:{10:[18]}}}],
+    ['unknown combined flag',{scope:0,count:2,isCombinedRequirement:'false',kvPairs:{_collection:{10:[18]}}}],
+    ['empty predicate map',{scope:0,count:2,kvPairs:{_collection:{}}}],
+    ['array predicate map',{scope:0,count:2,kvPairs:{_collection:[[18]]}}],
+    ['string predicate map',{scope:0,count:2,kvPairs:{_collection:'10'}}],
+    ['missing predicate map',{scope:0,count:2}],['null requirement',null],['array requirement',[]]
+  ];
+  for(const [name,requirement] of cases)await t.test(name,async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[requirement];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('an unsupported operation returned by Load SBC invalidates an earlier actionable preview',async()=>{
+  const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]})];
+  await h.refresh();await h.button('Solve and preview').click();assert.equal(h.button('Apply squad').disabled,false);
+  h.ctx.services.SBC.loadChallenge=()=>{h.challenge.eligibilityOperation='OR';return observable(h.challenge);};
+  await h.button('Solve and preview').click();await h.button('Apply squad').click();
+  assert.equal(h.requests.length,1);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  assert.equal(h.button('Export solve request').disabled,true);
+});
+test('automatic queues also reject grouped and OR challenges before save or submit',async t=>{
+  for(const kind of ['combined','OR'])await t.test(kind,async()=>{
+    const h=nativeRequirementHarness(batchHarness());
+    h.challenge.eligibilityRequirements=kind==='combined'?[nativeRequirement({10:[18],11:[13]})]:[nativeRequirement({10:[18]}),nativeRequirement({11:[13]})];
+    if(kind==='OR')h.challenge.eligibilityOperation='OR';
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.deepEqual(h.report().receipts,[]);
+    assert.equal(h.report().snapshot.status,'blocked');assert.equal(h.report().snapshot.progress.confirmedChallenges,0);
+  });
 });
 test('Paletools lock added after review stops Apply before any mutation', async () => {
   const h=harness(); await h.refresh();await h.button('Solve and preview').click();
@@ -706,6 +824,74 @@ function batchHarness(overrides={}) {
   h.report=()=>JSON.parse(h.localStorage.getItem('autosbc.local.batch.v1'));
   return h;
 }
+test('extension handshake pins the displayed hosted destination before sending private solve data',async()=>{
+  const h=harness({extension:{}});await h.refresh();
+  assert.equal(h.requests.length,0);
+  await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.equal(h.button('Apply squad').disabled,false);
+  const info=h.pageMessages.findIndex(message=>message.source==='autosbc-server-info-response');
+  const solve=h.pageMessages.findIndex(message=>message.source==='autosbc-local-request'&&message.method==='POST');
+  assert.ok(info>=0&&solve>info);
+  assert.ok(h.elements.some(element=>element.tag==='p'&&element.textContent==='Hosted solver: https://solver.example. Selected club cards are sent to this server.'));
+  const link=h.elements.find(element=>element.tag==='a'&&element.textContent==='Open hosted server ↗');assert.equal(link.href,'https://solver.example');
+  assert.equal(JSON.stringify(h.pageMessages).includes('x'.repeat(48)),false);
+  await h.button('Server settings').click();await new Promise(setImmediate);
+  assert.equal(h.extension.openedOptions,1);assert.deepEqual(h.writes,[]);
+});
+test('extension default local destination remains usable without a token or remote label',async()=>{
+  const h=harness({extension:{config:{mode:'local',origin:'http://127.0.0.1:8000',revision:'local-default-v1'}}});await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.equal(h.button('Apply squad').disabled,false);
+  assert.ok(h.elements.some(element=>element.tag==='p'&&element.textContent==='Local solver: http://127.0.0.1:8000. Club data stays on this computer.'));
+});
+test('extension missing consent, unreadable settings and absent handshake fail before private transport',async t=>{
+  for(const [name,extension] of [['missing consent',{config:{mode:'hosted',origin:'https://solver.example',token:'x'.repeat(48),consent:false,revision:'v1'}}],
+    ['read error',{infoError:'Server settings are unavailable'}],['no response',{noInfoResponse:true}]])await t.test(name,async()=>{
+    const h=harness({extension});await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+    assert.equal(h.workerMessages.some(message=>message.type==='autosbc-local-http'),false);
+    assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('extension response from a different origin is rejected before private solve or review',async t=>{
+  await t.test('wrong health origin',async()=>{
+    const h=harness({extension:{responseOrigin:'https://other.example'}});await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+    assert.ok(h.elements.some(element=>element.textContent.includes('server destination changed')));
+  });
+  await t.test('wrong poll origin',async()=>{
+    const h=harness({extension:{}});h.extension.beforeNetwork=async message=>{if(message.path.startsWith('/api/solve/jobs/'))h.extension.responseOrigin='https://other.example';};
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,1);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('a destination change between health and job creation transmits no club request to the new server',async()=>{
+  const h=harness({extension:{}});h.extension.beforeNetwork=async message=>{
+    if(message.path==='/api/solve/jobs')h.extension.config={...h.extension.config,origin:'https://other.example',revision:'v2'};
+  };
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Server settings changed')));
+});
+test('changing server settings after a preview blocks Apply before any squad mutation or save',async()=>{
+  const h=harness({extension:{}});await h.refresh();await h.button('Solve and preview').click();assert.equal(h.button('Apply squad').disabled,false);
+  h.extension.config={...h.extension.config,origin:'https://other.example',revision:'v2'};
+  await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,1);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Server settings changed')));
+});
+test('a same-origin token/config revision change after save blocks the queued submission',async()=>{
+  const h=batchHarness({extension:{}}),save=h.ctx.services.SBC.saveChallenge;
+  h.ctx.services.SBC.saveChallenge=(...args)=>{const result=save(...args);h.extension.config={...h.extension.config,revision:'rotated-token'};return result;};
+  await h.prepare();await h.button('Start queue').click();
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.includes('submitChallenge'),false);
+  assert.equal(h.report().receipts.length,0);assert.match(h.report().phase,/Server settings changed/);
+});
+test('Cancel during the fresh extension settings check prevents Apply after that check resolves',async()=>{
+  const h=harness({extension:{}});await h.refresh();await h.button('Solve and preview').click();
+  let entered,release;const checking=new Promise(resolve=>{entered=resolve;});
+  h.extension.beforeInfo=()=>new Promise(resolve=>{release=resolve;entered();});
+  const pending=h.button('Apply squad').click();await checking;await h.button('Cancel').click();release();await pending;
+  assert.deepEqual(h.writes,[]);
+});
 test('explicit batch solves, saves, submits, verifies reward counters and completes one selected set',async()=>{
   const h=batchHarness();await h.prepare();await h.button('Start queue').click();
   assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge','submitChallenge']);
@@ -943,6 +1129,26 @@ test('daily stop between cycles prevents the next save and preserves confirmed c
   await h.button('Start daily plan').click();
   assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.requests.length,1);
   assert.equal(h.dailyReport().status,'stopped');assert.equal(h.dailyReport().progress.completedCycles,1);assert.equal(h.dailyReport().progress.confirmedParts,1);
+});
+test('Stop during the five-second daily pacing wait preserves its receipt and prevents every next-cycle request',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();
+  const original=h.ctx.setTimeout;let entered,release,waiting=false;
+  const started=new Promise(resolve=>{entered=resolve;});
+  h.ctx.setTimeout=(callback,delay,...args)=>{
+    const report=h.dailyReport();
+    if(delay===500&&report?.phase==='Cycle verified. Next daily begins in 5 seconds; Stop cancels it.'&&!waiting){
+      waiting=true;release=()=>callback(...args);entered();return 0;
+    }
+    return original(callback,delay,...args);
+  };
+  let setReads=0;const sets=h.ctx.services.SBC.requestSets;h.ctx.services.SBC.requestSets=(...args)=>{setReads++;return sets(...args);};
+  const pending=h.button('Start daily plan').click();await started;
+  const before={setReads,requests:h.requests.length,writes:h.writes.length};
+  await h.button('Stop daily plan').click();release();await pending;
+  assert.equal(waiting,true);assert.equal(setReads,before.setReads);assert.equal(h.requests.length,before.requests);assert.equal(h.writes.length,before.writes);
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+  assert.equal(h.dailyReport().status,'stopped');assert.deepEqual(h.dailyReport().progress,{completedCycles:1,totalCycles:2,confirmedParts:1});
+  assert.equal(h.dailyReport().cycles[0].child.receipts.length,1);assert.equal(h.dailyReport().cycles[1].status,'planned');
 });
 test('daily stops before saving when remaining rights change after planning',async()=>{
   const h=dailyHarness();await h.readDailies();await h.consentDailies();h.set.timesCompleted=1;

@@ -15,6 +15,7 @@ import time
 from ortools.sat.python import cp_model
 
 from .logger import add_log
+from .runtime_config import solver_workers
 from .solver_policy import SolverInputError, flag, identifier, is_special
 
 
@@ -539,7 +540,7 @@ def solve_rows(rows, sbc, policy, max_solve_time, diagnostics, _warm_start=True)
         raise SolverInputError(f"Invalid solver model: {validation}", "MODEL_INVALID")
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(0.001, max_solve_time - (time.monotonic() - started))
-    solver.parameters.num_search_workers = min(8, os.cpu_count() or 1)
+    solver.parameters.num_search_workers = solver_workers()
     solver.parameters.random_seed = 42
     # Large clubs should spend their short time limit searching. Probing can
     # otherwise consume the whole budget before the first feasible solution.

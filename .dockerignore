@@ -1,0 +1,22 @@
+# Allowlist the build context. No club exports, local databases, secrets or logs.
+**
+!Dockerfile
+!VERSION
+!LICENSE
+!requirements.txt
+!requirements-lock.txt
+!backend/
+!backend/*.py
+!backend/static/
+!backend/static/*.html
+!backend/static/*.js
+!backend/static/*.css
+!frontend/
+!frontend/*.js
+!frontend/*.mjs
+!frontend/*.html
+!frontend/*.css
+!deploy/
+!deploy/*.py
+!deploy/public-ratings-fc26.json.gz
+!deploy/public-ratings-fc27.json.gz

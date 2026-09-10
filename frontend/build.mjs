@@ -40,10 +40,17 @@ await mkdir(out, { recursive: true });
 await writeFile(resolve(out, 'companion.js'), 'window.__autoSBCExtension = true;\n' + source);
 await copyFile(resolve(here, 'extension-bridge.js'), resolve(out, 'bridge.js'));
 await copyFile(resolve(here, 'extension-worker.js'), resolve(out, 'worker.js'));
+for (const name of ['transport.js', 'options.html', 'options.js', 'options.css']) {
+  await copyFile(resolve(here, `extension-${name}`), resolve(out, name));
+}
 await copyFile(resolve(repo, 'LICENSE'), resolve(out, 'LICENSE'));
 await writeFile(resolve(out, 'manifest.json'), JSON.stringify({ manifest_version: 3, name: 'Auto-SBC Studio',
-  version, description: 'Local SBC solver with protected cards and explicit finite auto-submit queues. No purchases, pack opening or player-pick selection.',
+  version, description: 'SBC solver with protected cards, a chosen local/private server and finite queues. No purchases or pack opening.',
+  permissions: ['storage'],
   host_permissions: ['http://127.0.0.1:8000/*'],
+  optional_host_permissions: ['https://*/*'],
+  action: { default_title: 'Auto-SBC server settings' },
+  options_ui: { page: 'options.html', open_in_tab: true },
   background: { service_worker: 'worker.js' },
   content_scripts: [
     { matches, js: ['bridge.js'], run_at: 'document_idle', world: 'ISOLATED' },

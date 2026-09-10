@@ -17,8 +17,28 @@ release number. Build output includes `tampermonkey-ai-sbc.user.js`,
 `plainJavascript.js` and `dist/chrome-extension`. Edit source modules, then rebuild.
 
 See [INSTALL.md](../INSTALL.md) for startup, Chrome installation and updates.
-The extension injects only on the listed EA Web App paths. Its isolated network
-worker permits the scoped local service at `http://127.0.0.1:8000`.
+The extension injects only on the listed EA Web App paths. Its isolated worker
+defaults to `http://127.0.0.1:8000`; the userscript remains local-only.
+
+## Server destination
+
+Version 27.0.14 adds **Server settings**, also available from the extension’s
+toolbar icon. Hosted mode requires an HTTPS origin, a 32–512-character owner
+token and explicit destination consent. Chrome grants optional access only to
+that chosen host. The token stays in extension local storage restricted to
+trusted contexts; it is not exposed to the EA page or solve exports.
+
+Before solving, the panel displays the selected address. Requests omit cookies,
+reject redirects and permit only health and solve-job routes. The EA tab pins
+its initial origin/configuration revision. A changed setting blocks further
+requests and fresh pre-Save/Submit checks until the tab is reloaded. Stop any
+queue before opening settings; an already-dispatched request can still finish.
+
+The single-owner hosted profile accepts owned squads, up to 30 seconds and
+5,000 input cards, with a default 200-card chemistry cap. Larger inputs are
+rejected without trimming. Concepts require local mode. Render configuration is
+prepared but deployment, Docker CI smoke and hosted lifecycle tests remain
+pending; see [the deployment guide](../deploy/README.md).
 
 ## Solve and review
 
@@ -28,7 +48,7 @@ Select a set and challenge, review card rules and budgets, then solve.
 Navigation or challenge changes invalidate its pending preview.
 
 **Solve and preview** uses owned inventory plus fresh catalog concepts when
-allowed. **Solve with live prices** reads a bounded set of current EA market
+allowed in local mode. **Solve with live prices** reads a bounded set of current EA market
 listings. The server joins exact card definitions to public metadata; live mode
 cannot fall back to snapshot prices. Quotes expire after two minutes for live
 prices or six hours by default for provider snapshots.
@@ -38,6 +58,11 @@ exact card and athlete identities, source timestamps and matching season/platfor
 Missing prices, unsupported results or inconsistent shopping-list proof cannot
 become an actionable squad. The search reports observed coverage; an optimum in
 that pool is not a claim about the entire market.
+
+The planner may refresh stale valuation through bounded public price snapshots;
+provider requests contain no club payload. Missing or stale prices do not weaken
+the value cap. `PRICES_UNAVAILABLE` identifies a price-limited failed solve
+without claiming the full club is infeasible.
 
 Individual **Apply squad** checks current ownership, locks, identities,
 requirements and preview freshness, then saves the reviewed squad. It resolves
@@ -79,7 +104,8 @@ counters. A changed day, season, market or allowance stops the run.
 The preset protects played, evolution and special cards and disables concepts.
 Rating ceilings are 64, 74 and 82 respectively; per-card value is at most 1,000
 coins while preserving a lower selected limit. Manual settings and queue are
-restored afterward. Reward packs stay closed.
+restored afterward. Reward packs stay closed. A five-second cancellable pause
+separates verified cycles; Stop prevents the next list, solve and account write.
 
 ## Compatibility and limits
 
@@ -89,7 +115,7 @@ accounts’ locks are combined conservatively; temporary unlock exceptions do no
 weaken the gate. The native solve button preserves existing view initializer
 wrappers and does not replace EA submission methods.
 
-Played-card rules uses the same EA getters as Player Bio. Positive or
+Played-card rules use the same EA getters as Player Bio. Positive or
 unreadable lifetime/current counts block selection. EA can initialize absent raw
 statistics to zero; this is not an independent history database.
 
@@ -103,8 +129,10 @@ have several causes. Saved-squad diagnostics are shown only if EA returns a full
 validated bounded list; generic failures remain generic.
 
 Current season and platform must be selected explicitly. FC 27 metadata does not
-establish usable prices or live compatibility. Unsupported combined requirements,
-OR expressions and chemistry profiles remain tracked launch gates.
+establish usable prices or live compatibility. Combined same-player native
+requirements, OR and unknown eligibility operations stop before solving or
+writing. Unsupported chemistry profiles remain excluded with diagnostics; no
+expanded puzzle coverage is inferred from that rejection.
 
 See [VERIFICATION.md](../docs/VERIFICATION.md) for actual account results and
 [QUALITY-PLAN.md](../docs/QUALITY-PLAN.md) for remaining acceptance checks. Tests
@@ -137,9 +165,12 @@ attempt unresolved. Success appends evidence, retains the original uncertain
 event and prior receipts, and permits a separately started fresh plan. It never
 claims the failed attempt completed or repeats that recorded submission.
 
-At the 27.0.13 live checkpoint, ten selected-set parts and four Bronze dailies
-had completed automatically. The original selected request remained 2/5 sets,
-13/17 parts. The latest daily plan verified 1/57, then stopped on a 426 list read
-before the next write. Full daily-plan validation remains pending. Only the 521
-list retry was observed live; the wider 5xx policy has unit coverage. Report
-downloads were verified through Chrome's native Save dialog and file readback.
+At the 27.0.14 release checkpoint, **23 automatic parts/cycles** are verified:
+14 selected-set parts and nine Bronze dailies. The selected request is complete
+at **5/5 sets and 17/17 parts**; three earlier solve/Apply plus native-submit
+parts are included in that selected total but excluded from the automatic count.
+The final two Yan parts completed through Auto-SBC 27.0.13 with maximum card
+rating 95 and a 25,000 value cap while protections remained enabled. The latest 53-cycle daily plan verified two Bronze cycles, then stopped on a
+426 list read before any next-cycle effect; 51 cycles remain. Full-plan and hosted validation remain
+pending. Report downloads were verified through Chrome’s native Save dialog
+and file readback; wider list-error coverage remains distinct from live results.

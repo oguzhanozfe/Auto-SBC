@@ -1,8 +1,43 @@
 # Provisional hosting assessment — 10 September 2026
 
-Auto-SBC can run remotely, but the current release is a local private beta. It
-must not be exposed publicly with its existing unauthenticated, single-user API.
-No cloud deployment or club-data upload has been performed.
+Version 27.0.14 adds an opt-in single-owner hosted profile and Chrome HTTPS
+server settings. The ordinary launcher still defaults to unauthenticated local
+mode and must not be exposed publicly. A Render free Docker deployment is
+prepared, but it has **not been deployed**: user sign-in, Docker CI smoke and
+hosted validation remain pending. No hosted club payload has been uploaded.
+See [deployment setup](../deploy/README.md) and [extension setup](../INSTALL.md).
+
+## Implemented evaluation profile
+
+The extension requires an explicitly selected HTTPS origin, owner token and
+consent to send club-card data there. Chrome requests permission only for
+that chosen destination. The token stays in extension-owned local storage;
+requests omit cookies, reject redirects and are restricted to health/solve-job
+routes. A loaded EA tab pins the origin and configuration revision. Fresh
+checks block Save and Submit if settings change after a preview.
+
+Hosted startup requires the exact public HTTPS origin and a strong bearer token.
+Data, jobs and download routes require that token, while public health exposes
+only status/version/mode. Supplied browser origins are checked against the exact
+configured origins, including allowed Chrome extension IDs. The hosted root
+page directs users to the authenticated extension; the local dashboard remains
+available in local mode. This is one owner's service, not multi-user isolation.
+
+The profile runs one web process, one solver worker and one active solve. It
+accepts owned squads with a 30-second solver budget and at most 5,000 input cards;
+chemistry defaults to at most 200 input cards. Larger inputs fail without
+silently pruning candidates. Concepts and full remote catalog sync are disabled.
+Public definition/rating seeds and bounded public bulk-price refresh support
+owned-card valuation. Provider requests contain no club data. Missing/stale
+valuations retain the player value cap; `PRICES_UNAVAILABLE` distinguishes a
+price-limited failure from proof that the full club is infeasible.
+
+Inputs and results remain in process memory. Results expire after ten minutes;
+restart or sleep can remove them sooner. A missing hosted job returns 410 and
+requires a fresh review. No solve POST or EA write is automatically replayed.
+The Docker context excludes local club exports, diagnostics, secrets and private
+databases. Access logging is disabled. These implementation checks do not prove
+that Render's free resources can sustain the intended workloads.
 
 ## Observed request measurements
 
@@ -165,7 +200,7 @@ size.
 
 | Host | Free offer and qualifications | Provisional assessment |
 | --- | --- | --- |
-| Render | 512 MB and 0.1 CPU; sleeps after 15 minutes; storage is ephemeral. Free use without a payment method is documented | Remains a candidate pending representative time and memory measurements; sleep and storage require lifecycle handling |
+| Render | 512 MB and 0.1 CPU; sleeps after 15 minutes; storage is ephemeral. Free use without a payment method is documented | Prepared evaluation target; not deployed. Actual capacity, cold starts and restart recovery remain unmeasured |
 | Cloud Run | Monthly request-based allowances include 180,000 vCPU-seconds, 360,000 GiB-seconds and two million requests; a billing account is required and overages or adjacent services can cost money | Managed option after transport and access changes; capacity and cost require representative measurements |
 | Oracle Always Free A1 | Current resource documentation gives 2 OCPU/12 GB and 200 GB combined boot/block storage for free tenancies; card verification and regional capacity are required | VM option subject to availability and maintenance; representative deployment testing still required |
 | Hugging Face Spaces | CPU Basic lists 2 vCPU/16 GB without hourly charges, but creating a new Docker/Gradio compute Space now requires a paid plan | Does not meet a free new deployment requirement under the documented rules |
@@ -185,35 +220,34 @@ release has Linux ARM64 wheels for Python 3.11/3.12, making A1 plausible at the
 dependency level; an actual deployment still needs testing.
 [OR-Tools publisher files](https://pypi.org/project/ortools/9.15.6755/#files)
 
-## Architecture requirements before a hosted beta
+## Remaining hosting acceptance checks
 
-These requirements apply independently of the outstanding capacity measurements.
+1. Complete user sign-in and review the proposed Render resources: one free
+   Docker web service, no paid disk, database or worker. Run the Docker CI smoke
+   job successfully before calling the image validated. No successful Docker
+   build or Render deployment is recorded yet.
+2. Run the synthetic authenticated smoke against the real HTTPS service, then
+   measure repeated daily and rating jobs with its actual CPU/memory limits.
+   Include bounded chemistry cases separately. The default chemistry cap is an
+   evaluation boundary, not a measured memory guarantee.
+3. Test idle sleep/wake, restart and missing-job handling. Keep browser receipts
+   and require a new review after a lost job. A healthy endpoint alone is not
+   sufficient evidence of solver capacity or safe lifecycle behavior.
+4. Preserve source age and unavailable-price outcomes across ephemeral storage
+   resets. Do not claim the public rating seed is a full concept catalog.
+5. Before any multi-user service, add real identities, user-bound jobs, abuse
+   controls and per-user quotas. The implemented shared owner token is explicitly
+   limited to one owner and must not be marketed as account isolation.
+6. For Cloud Run, replace the detached Python thread with an active request/stream
+   or a supported durable job system. In-memory polling jobs cannot safely scale
+   across instances or rely on idle CPU. Chrome worker fetch lifecycle limits
+   also apply; simply increasing a timeout does not solve this.
 
-1. Use an explicitly configured HTTPS origin in the backend, extension transport
-   and manifest. Retain the local mode as an option. Do not grant access to
-   arbitrary origins.
-2. Authenticate API requests and bind every solve job/result to its user. Add
-   per-user quotas and bounded concurrency. CORS is not authentication, and a
-   shared key alone is not a multi-user product.
-3. Disclose that hosted solving sends selected club-card data to that server.
-   Keep credentials, market actions and SBC submission in the EA browser.
-   Keep club payloads transient; exclude them from application/access logs.
-4. Preserve public catalog snapshots separately from disposable compute.
-   Schedule controlled updates and show source age/coverage to users.
-5. Explicitly cap OR-Tools workers to allocated CPU. Run the representative
-   benchmark matrix before choosing resources, starting with one server worker
-   and one compute job at a time. Add larger synthetic stress pools separately.
-6. For Cloud Run, replace the current detached Python thread with an active
-   request/stream or a supported durable job system. In-memory polling jobs
-   cannot safely scale across instances or rely on idle CPU. Chrome service
-   worker fetches also have lifecycle limits; simply increasing a timeout does
-   not solve this.
-
-These constraints follow [Cloud Run's execution guidance](https://docs.cloud.google.com/run/docs/tips/general)
+The last constraint follows [Cloud Run's execution guidance](https://docs.cloud.google.com/run/docs/tips/general)
 and [Chrome's extension service-worker lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle).
 
-The next capacity check is to measure repeated daily and rating requests with
-the intended CPU/worker limits and service lifecycle, then reproduce the actual
-chemistry case under controlled conditions. Render remains under consideration; neither the synthetic stress case
-nor the historical unoptimized chemistry result settles that choice. No provider
-is selected by the current evidence.
+Render is the prepared free evaluation route, pending sign-in and deployment.
+The synthetic stress case and historical unoptimized chemistry result do not
+settle its suitability. Only measured service behavior can establish whether
+this limited profile is useful on that plan; no zero-cost production-capacity
+guarantee is made.

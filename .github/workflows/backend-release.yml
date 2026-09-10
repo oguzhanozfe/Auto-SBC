@@ -36,3 +36,49 @@ jobs:
             dist/chrome-extension/
             tampermonkey-ai-sbc.user.js
           retention-days: 14
+  docker-free-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the synthetic smoke client
+        run: |
+          python -m pip install --only-binary=:all: -c requirements-lock.txt requests
+      - name: Build the allowlisted container image
+        run: docker build --tag auto-sbc-ci .
+      - name: Generate an ephemeral owner token
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, secrets
+          token = secrets.token_urlsafe(48)
+          # Register the generated secret before exporting it to later steps.
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"AUTOSBC_API_TOKEN={token}\n")
+          PY
+      - name: Start with the Render free CPU and memory limits
+        run: |
+          docker run --detach --name auto-sbc-ci \
+            --publish 127.0.0.1:18000:10000 \
+            --memory 512m --memory-swap 512m --cpus 0.1 \
+            --env AUTOSBC_API_TOKEN \
+            --env AUTOSBC_PUBLIC_ORIGIN=https://127.0.0.1 \
+            --env AUTOSBC_HOSTED=1 --env AUTOSBC_SOLVER_WORKERS=1 \
+            --env WEB_CONCURRENCY=1 auto-sbc-ci
+          test "$(docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}}' auto-sbc-ci)" = "536870912 536870912 100000000"
+      - name: Check synthetic Bronze, rating and chemistry jobs
+        timeout-minutes: 5
+        run: python deploy/smoke.py --local-container --wait-ready 90 http://127.0.0.1:18000
+      - name: Report resource and service diagnostics
+        if: always()
+        run: |
+          docker inspect --format 'running={{.State.Running}} exit={{.State.ExitCode}} oomKilled={{.State.OOMKilled}}' auto-sbc-ci || true
+          docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' auto-sbc-ci || true
+          docker logs --tail 100 auto-sbc-ci || true
+      - name: Remove the evaluation container
+        if: always()
+        run: docker rm --force auto-sbc-ci || true

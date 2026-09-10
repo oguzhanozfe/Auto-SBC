@@ -6,25 +6,26 @@ The goal is reliable SBC completion with visible limits and preserved club cards
 
 | Area | Current evidence | Acceptance check |
 | --- | --- | --- |
-| Owned squads | Ten selected-set parts fully automatic; selected request: 2/5 groups and 13/17 parts. Played/evolution checks preserved; balance 577,251 | Finish the three remaining groups/four parts with exact receipts and protected-card checks |
-| Concept players | 27.0.3: Mason Toye's exact 65-rated EA concept placed using an observed 200-coin listing; no purchase or submission | Preserve identity, source, platform and 120-second live quote age; never pretend a concept is owned |
-| Card protection | Zero-game, evolution, all saved-squad and Paletools locks. One-card targeted Club checks passed live; Storage and saved squads still refresh | Preserve exact physical/revision identity and ownership before save/submit; changed or unreadable protection stops consumption |
-| Finite automation | 14 fully automatic parts/cycles: ten selected-set parts plus four Bronze dailies. Full selected queue and daily plan remain unfinished | Complete the finite remaining work without replaying successful or uncertain effects |
-| Read recovery | One 429 retry and one 521 retry observed live. 27.0.13 allows one list-only retry for numeric 429/integer 500–599; broader range is unit-tested | Preserve bounded cooldown, generic unknown-code reporting and no write retries. The observed next-cycle 426 stays outside the policy |
-| Daily preset | Reports verify 1/60, then 2/59, then 1/57 in fresh finite plans: four Bronze cycles. Latest 426 list failure stopped before the next write | Validate remaining cycles and actual eligible-card shortages; preserve manual settings and unopened rewards. Do not claim all 60 passed |
-| Recovery | 27.0.7 reconciled confirmed-submit/521-read without resubmission. 27.0.9 proved no completion for 4152/409; a later fresh protected solve completed 4152 | Preserve original uncertainty and receipts; do not widen no-completion recovery beyond its strict status/ownership proof |
-| Diagnostics | EA status and solver diagnostics available | Explain exact unsatisfied constraints, stale prices and retry state in ordinary language |
-| FC 27 | Separate catalog exists; prior source had no usable FC 27 market prices | Verify live FC 27 adapter, definitions and market prices after launch; never reuse FC 26 prices |
+| Owned squads | Fourteen selected-set parts fully automatic; selected request: 5/5 sets and 17/17 parts. Played/evolution/saved-squad protections retained | Preserve the completed five-set evidence; validate future requests without weakening protections |
+| Concept players | Exact FC 26 native concept placement using an observed live quote; no purchase or submission | Preserve exact revision, source, platform and quote age. Local solver only; never pretend a concept is owned |
+| Card protection | EA-reported zero-game, evolution, all saved-squad and Paletools checks. Targeted Club ownership checks passed live; Storage and saved squads still refresh | Preserve exact physical/revision identity before save/submit; changed or unreadable protection stops consumption |
+| Finite automation | 23 fully automatic parts/cycles: 14 selected-set parts plus nine Bronze dailies | Complete the remaining finite work without replaying successful or uncertain effects |
+| Read recovery | Bounded 429 and 521 list retries observed live. Numeric 429/integer 500–599 permit one list-only retry; broader range has unit coverage | Preserve cancellable cooldown and no write retries; do not infer undocumented causes from numeric responses |
+| Daily preset | Nine Bronze cycles verified across separately approved plans; latest 53-cycle plan verified two, then stopped on a 426 list read. It has 51 cycles remaining | Validate the remaining cycles and actual eligible-card shortages, preserve manual settings and keep rewards unopened |
+| Recovery | Confirmed-submit/521-read reconciled without resubmission; narrow 409 no-completion proof allowed a later fresh protected solve | Preserve original uncertainty and receipts; do not widen recovery beyond its strict status/ownership proof |
+| Price diagnostics | Bounded public bulk refresh for stale valuation; `PRICES_UNAVAILABLE` distinguishes missing valuations from whole-club infeasibility | Preserve source age and player value caps when refresh fails; no private payload in provider requests |
+| Hosted transport | HTTPS origin selection, bearer auth, destination consent, exact host/origin restrictions and changed-settings guards are implemented and tested | Render account sign-in, deployed synthetic smoke, sleep/wake and repeated-job capacity checks remain pending; Docker CI smoke still needs a passing run |
+| FC 27 | Separate catalog exists; prior source had no usable FC 27 market prices | Verify live adapter and matching-season market quotes; never reuse FC 26 prices |
 
-This is the 27.0.13 checkpoint: 227 Python and 337 browser tests passed. These
-tests and four live Bronze cycles do not establish full-plan reliability. The
-concrete journeys in [REAL-WORLD-CASES.md](REAL-WORLD-CASES.md) prioritize daily
-rights, protected rating parts, concepts and understandable stopped-state recovery.
+This is the 27.0.14 release checkpoint. Python and browser suites have passed
+locally; the final release report records exact counts and CI status after all
+changes settle. Unit tests and nine Bronze cycles do not establish full-plan
+reliability. The journeys in [REAL-WORLD-CASES.md](REAL-WORLD-CASES.md) prioritize
+daily rights, protected rating parts, concepts and understandable recovery.
 The actual Pre-Season 6 export is an 81-rating/31-chemistry case; its one-worker
-replay returned UNKNOWN with no solution at 587.5 MiB/30.251 seconds. It is
-separate from the historical all-flexible 3,000-card synthetic stress case and
-does not supersede those product priorities. See [HOSTING.md](HOSTING.md) for
-measurement and concurrent-activity limits.
+replay returned UNKNOWN with no solution at 587.5 MiB/30.251 seconds. It remains
+separate from the all-flexible 3,000-card synthetic stress case and does not
+supersede those priorities. See [HOSTING.md](HOSTING.md) for measurement limits.
 
 ## Scoped solver acceptance backlog
 
@@ -33,11 +34,11 @@ with EA's public `UTSBCChallengeEntity.isRequirementMet` and `meetsRequirements`
 implementations. They are code-level findings, not claims that the current
 selected SBCs contain these conditions.
 
-| Gap | Reproducible example and current behavior | Acceptance scope |
+| Boundary | Implemented behavior | Further acceptance scope |
 | --- | --- | --- |
-| Combined requirements lose the same-player intersection | One EA requirement with multiple `kvPairs` is flattened into separate constraints. “At least two French Premier League players” can therefore be satisfied by two French LaLiga players plus two English Premier League players in the local model; EA counts zero matching players | Preserve the requirement group and count players satisfying every member predicate. Add cases for minimum, maximum and exact counts. Until supported, reject combined shapes explicitly instead of returning a falsely valid squad |
-| Requirement-level OR is omitted | `eligibilityOperation` is not exported and the backend applies every constraint. For “at least two French players OR at least two Premier League players,” two French LaLiga players satisfy EA's first branch but can be rejected locally | Carry the operation in the request and model OR explicitly, or reject it as unsupported. Use the same player pool to verify distinct AND and OR outcomes; reject unknown operations |
-| Native rule validation happens after saving, at batch submit | Apply verifies placed item identities before `saveChallenge`, but does not read EA's rule verdict. A locally accepted squad can be saved before batch `canSubmit()` rejects it. Batch consumption is already guarded | For owned squads, obtain and display the native rule result before saving or fail before dispatch with restoration of the prior squad. Identify failed requirements. Preserve concept preview support: concepts cannot pass `canSubmit()` merely by meeting rating/chemistry conditions |
+| Combined same-player requirements | Multiple predicates in one native requirement are explicitly rejected before solving or saving. They are no longer flattened into unrelated counts; minimum, maximum and exact shapes have regressions | Model the same-player intersection before claiming support. For example, two French LaLiga cards plus two English Premier League cards cannot satisfy “two French Premier League players” |
+| Requirement-level OR and unknown operations | OR, missing/unknown operation values and malformed grouping metadata fail closed. Separate supported AND requirements preserve their counts and scopes | Add explicit OR semantics and compare against EA before widening support; do not silently require every branch |
+| Native rule validation before saving | Apply verifies exact placed identities; batch submission checks native `canSubmit()` and the relevant feature gates. A locally accepted squad can still be saved before EA's submit verdict rejects it | For owned squads, display the native rule result before save or restore the prior squad on rejection. Preserve concept previews, which cannot submit while concepts remain |
 
 The native `count=-1` sentinel is already handled for verified squad-wide keys;
 player-count requirements still reject invalid negative counts. Team rating with
@@ -59,4 +60,4 @@ A feature not described on these pages must not be presented as absent from the 
 
 ## Installation and refresh
 
-Use the existing unpacked extension's refresh button, then reload the EA tab. Routine source changes use the same manifest permissions. Never refresh during an active or uncertain submission. Do not add browser-management or debugging permissions just to automate this step. See [Chrome's official reload instructions](https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#reload-the-extension).
+Use the existing unpacked extension's refresh button, then reload the EA tab. Version 27.0.14 adds extension storage and optional HTTPS host permissions; the user grants access only to a specifically chosen server through its settings. Never refresh during an active or uncertain submission. Do not add browser-management or debugging permissions just to automate this step. See [Chrome's official reload instructions](https://developer.chrome.com/docs/extensions/get-started/tutorial/hello-world#reload-the-extension).

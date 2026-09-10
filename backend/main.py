@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import io
+import hmac
 import logging
 import os
 import re
@@ -23,6 +24,8 @@ from starlette.concurrency import run_in_threadpool
 from . import logger, setup, planner
 from .catalog import Catalog
 from .live_market import LiveMarket
+from .runtime_config import RuntimeConfig
+from .hosted_seed import seed_ratings
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -70,9 +73,13 @@ class ConceptRequest(MarketScope):
 
 
 def create_app(data_dir=None):
+    config = RuntimeConfig.read()
     app = FastAPI(title="Auto-SBC Studio", version=VERSION)
+    app.state.runtime_config = config
     catalog = Catalog(data_dir=data_dir, game_year=int(os.environ.get("AUTOSBC_GAME_YEAR", "26")),
                       platform=os.environ.get("AUTOSBC_PLATFORM", "ps5"))
+    if config.hosted:
+        seed_ratings(catalog)
     catalogs = {(catalog.game_year, catalog.platform): catalog}
     catalog_lock = Lock()
     def get_catalog(game_year=None, platform=None):
@@ -80,6 +87,8 @@ def create_app(data_dir=None):
         with catalog_lock:
             if key not in catalogs:
                 catalogs[key] = Catalog(data_dir=data_dir, game_year=key[0], platform=key[1])
+                if config.hosted:
+                    seed_ratings(catalogs[key])
             return catalogs[key]
     solve_lock = Lock()
     sync_lock = Lock()
@@ -89,32 +98,44 @@ def create_app(data_dir=None):
     app.state.get_catalog = get_catalog
     app.state.solve_lock = solve_lock
     app.state.sync_lock = sync_lock
-    allowed_origins = EA_ORIGINS | LOCAL_ORIGINS
+    allowed_origins = EA_ORIGINS | ({config.public_origin} | config.extension_origins if config.hosted else LOCAL_ORIGINS)
     port = os.environ.get("AUTOSBC_PORT", "8000")
-    allowed_origins |= {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    if not config.hosted:
+        allowed_origins |= {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
     app.add_middleware(CORSMiddleware, allow_origins=sorted(allowed_origins),
-                       allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
+                       allow_origin_regex=None if config.hosted else r"^chrome-extension://[a-p]{32}$",
                        allow_credentials=False, allow_methods=["GET", "POST"],
-                       allow_headers=["Content-Type"])
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+                       allow_headers=["Content-Type", "Authorization"] if config.hosted else ["Content-Type"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[config.hostname] if config.hosted else ["127.0.0.1", "localhost", "testserver"])
 
     @app.middleware("http")
     async def guard_request(request: Request, call_next):
         origin = request.headers.get("origin")
-        if origin and origin not in allowed_origins and not re.fullmatch(r"chrome-extension://[a-p]{32}", origin):
-            return JSONResponse(status_code=403, content={"detail": "This origin cannot access the local solver."})
+        if origin and origin not in allowed_origins and (config.hosted or not re.fullmatch(r"chrome-extension://[a-p]{32}", origin)):
+            return JSONResponse(status_code=403, content={"detail": "This origin cannot access the solver."})
+        request.state.owner_authenticated = False
+        if config.hosted:
+            public = request.method in {"GET", "HEAD"} and request.url.path in {
+                "/", "/privacy", "/health", "/static/app.js", "/static/style.css"}
+            preflight = request.method == "OPTIONS" and origin in allowed_origins and request.headers.get("access-control-request-method") in {"GET", "POST"}
+            supplied = request.headers.get("authorization", "")
+            if supplied:
+                request.state.owner_authenticated = hmac.compare_digest(supplied.encode(), ("Bearer " + config.token).encode())
+            if not preflight and (supplied and not request.state.owner_authenticated or not public and not request.state.owner_authenticated):
+                return JSONResponse(status_code=401, content={"detail": "A valid owner access token is required."}, headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
         if request.method == "POST":
             try:
                 length = int(request.headers.get("content-length", "0"))
             except ValueError:
                 return JSONResponse(status_code=400, content={"detail": "Invalid content length."})
-            if length > MAX_BODY_BYTES:
+            body_limit = 8 * 1024 * 1024 if config.hosted else MAX_BODY_BYTES
+            if length > body_limit:
                 return JSONResponse(status_code=413, content={"detail": "Request is too large."})
             size = 0
             body_parts = []
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > MAX_BODY_BYTES:
+                if size > body_limit:
                     return JSONResponse(status_code=413, content={"detail": "Request is too large."})
                 body_parts.append(chunk)
             request._body = b"".join(body_parts)
@@ -130,7 +151,8 @@ def create_app(data_dir=None):
 
     @app.get("/")
     def dashboard():
-        return FileResponse(ROOT / "backend/static/index.html")
+        filename = "hosted.html" if config.hosted else "index.html"
+        return FileResponse(ROOT / "backend/static" / filename)
 
     @app.get("/privacy")
     def privacy():
@@ -139,7 +161,8 @@ def create_app(data_dir=None):
     @app.get("/download/chrome-extension")
     def download_extension():
         directory = ROOT / "dist/chrome-extension"
-        names = ("manifest.json", "companion.js", "bridge.js", "worker.js", "LICENSE")
+        names = ("manifest.json", "companion.js", "bridge.js", "worker.js", "LICENSE",
+                 "transport.js", "options.html", "options.js", "options.css")
         if any(not (directory / name).is_file() for name in names):
             raise HTTPException(404, "The Chrome extension has not been built. Run node frontend/build.mjs first.")
         try:
@@ -162,8 +185,11 @@ def create_app(data_dir=None):
         return FileResponse(ROOT / "backend/static" / filename)
 
     @app.get("/health")
-    def health(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+    def health(request: Request, gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        if config.hosted and not request.state.owner_authenticated:
+            return {"status": "ok", "version": VERSION, "mode": "hosted"}
         return {"status": "ok", "version": VERSION, "solverBusy": solve_lock.locked(),
+                **({"mode": "hosted", "capabilities": config.capabilities} if config.hosted else {}),
                 "database": get_catalog(gameYear, platform).status()}
 
     @app.get("/api/database/status")
@@ -180,6 +206,8 @@ def create_app(data_dir=None):
 
     @app.post("/api/concepts")
     async def concept_candidates(body: ConceptRequest):
+        if config.hosted:
+            raise HTTPException(422, "This hosted free profile supports owned cards only. Use local Studio for concepts.")
         try:
             selected = get_catalog(body.gameYear, body.platform)
             return await run_in_threadpool(selected.concept_candidates, body.sbcData, body.solverPolicy, body.limit)
@@ -188,6 +216,8 @@ def create_app(data_dir=None):
 
     @app.post("/api/database/sync")
     async def sync_database(body: SyncRequest):
+        if config.hosted:
+            raise HTTPException(403, "Catalog sync is disabled for this ephemeral hosted free profile.")
         if not sync_lock.acquire(blocking=False):
             raise HTTPException(409, "A database update is already running.")
         def work():
@@ -203,7 +233,7 @@ def create_app(data_dir=None):
     def solve_work(body, progress=None):
         logger.clear_logs()
         try:
-            return planner.plan(body, get_catalog(body.gameYear, body.platform), progress)
+            return planner.plan(body, get_catalog(body.gameYear, body.platform), progress, refresh_prices=True)
         except (ValueError, TypeError, KeyError) as exc:
             logger.add_log(f"Invalid solve input: {exc}")
             raise HTTPException(422, str(exc)) from exc
@@ -218,8 +248,21 @@ def create_app(data_dir=None):
         if not solve_lock.acquire(blocking=False):
             raise HTTPException(409, "A solution is already being calculated. Wait for it to finish.")
 
+    def hosted_solve_limits(body):
+        if not config.hosted:
+            return
+        if body.maxSolveTime > 30 or len(body.clubPlayers) > 5000:
+            raise HTTPException(422, "Hosted free profile limit: 30 seconds and 5,000 input cards. Use local Studio for a larger request; no candidates were discarded.")
+        if body.liveMarket is not None or body.solverPolicy.get("allowConcept") is True or any(player.get("concept") for player in body.clubPlayers):
+            raise HTTPException(422, "This hosted free profile supports owned cards only. Use local Studio for concepts.")
+        requirements = body.sbcData.get("constraints", [])
+        chemistry = isinstance(requirements, list) and any(isinstance(req, dict) and req.get("requirementKey") in {"CHEMISTRY_POINTS", "ALL_PLAYERS_CHEMISTRY_POINTS"} for req in requirements)
+        if chemistry and len(body.clubPlayers) > config.max_chemistry_players:
+            raise HTTPException(422, f"Hosted chemistry input limit: {config.max_chemistry_players} cards. Use local Studio for this larger pool; no candidates were discarded.")
+
     @app.post("/solve")
     async def solve(body: SolveRequest):
+        hosted_solve_limits(body)
         acquire_solver()
         return await run_in_threadpool(solve_work, body)
 
@@ -235,6 +278,7 @@ def create_app(data_dir=None):
 
     @app.post("/api/solve/jobs", status_code=202)
     def start_solve_job(body: SolveRequest):
+        hosted_solve_limits(body)
         acquire_solver()
         job_id = uuid.uuid4().hex
         with jobs_lock:
@@ -268,7 +312,7 @@ def create_app(data_dir=None):
         with jobs_lock:
             prune_jobs()
             if job_id not in jobs:
-                raise HTTPException(404, "This solve job is missing or expired. Results stay in memory for ten minutes.")
+                raise HTTPException(410 if config.hosted else 404, "This solve job is missing or expired, possibly after a service restart. Results stay in memory for ten minutes. Start a fresh review; never replay an account action.")
             return {key: value for key, value in jobs[job_id].items() if key != "created"}
 
     @app.get("/solver-logs")

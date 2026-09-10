@@ -1,27 +1,45 @@
-/* Network bridge restricted to the local companion API, MIT. */
+/* Requests go only to the user's configured solver. No EA credentials, MIT. */
 'use strict';
+importScripts('transport.js');
+const T = AutoSBCTransport;
+// Prevent content scripts from reading the access token through chrome.storage.
+const storageReady = chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+async function selectedServer() {
+  await storageReady;
+  const stored = await chrome.storage.local.get(T.STORAGE_KEY);
+  return T.config(stored[T.STORAGE_KEY]);
+}
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (message?.type !== 'autosbc-local-http') return false;
-  const origin = sender.tab?.url;
-  if (!origin || !/^https:\/\/www\.(ea\.com|easports\.com)\//.test(origin)) return false;
-  const paths = { '/health': 'GET', '/api/solve/jobs': 'POST' };
-  let url;
-  try { url = new URL(message.path, 'http://127.0.0.1:8000'); } catch { return false; }
-  const permittedMethod = /^\/api\/solve\/jobs\/[a-zA-Z0-9-]+$/.test(url.pathname) ? 'GET' : paths[url.pathname];
-  if (url.origin !== 'http://127.0.0.1:8000' || permittedMethod !== message.method) {
-    respond({ error: 'Unsupported local endpoint.' }); return false;
+  if (!T.eaSender(sender, chrome.runtime.id)) return false;
+  if (message?.type === 'autosbc-server-info') {
+    selectedServer().then(value => respond(T.info(value))).catch(error => respond({error: error.message}));
+    return true;
   }
-  const controller = new AbortController();
-  const timeout = Math.min(Math.max(Number(message.timeout) || 15000, 1000), 345000);
-  const timer = setTimeout(() => controller.abort(), timeout);
-  fetch(url.href, { method: message.method, headers: { 'Content-Type': 'application/json' },
-    credentials: 'omit', signal: controller.signal,
-    body: message.data === undefined ? undefined : JSON.stringify(message.data)
-  }).then(async response => {
-    const text = await response.text();
-    let body; try { body = JSON.parse(text); } catch { throw new Error('Local server did not return JSON.'); }
-    respond({ ok: response.ok, status: response.status, body });
-  }).catch(error => respond({ error: error.name === 'AbortError' ? 'Local solver request timed out.' : 'Cannot reach the local solver. Start the server and retry.' }))
-    .finally(() => clearTimeout(timer));
+  if (message?.type === 'autosbc-server-options') {
+    chrome.runtime.openOptionsPage().then(() => respond({ok:true})).catch(() => respond({error:'Open this extension’s options from chrome://extensions.'}));
+    return true;
+  }
+  if (message?.type !== 'autosbc-local-http') return false;
+  (async () => {
+    const selected = await selectedServer();
+    const request = T.request(selected, message);
+    if (selected.mode === 'hosted' && !(await chrome.permissions.contains({origins:[`${selected.origin}/*`]}))) {
+      throw new Error('Server permission is missing. Open extension settings and save the selected server again.');
+    }
+    const controller = new AbortController();
+    const timeout = Math.min(Math.max(Number(message.timeout) || 15000, 1000), 25000);
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(request.url, { ...request.options, signal: controller.signal });
+      const text = await response.text();
+      let body; try { body = JSON.parse(text); } catch { throw new Error('The configured solver did not return JSON.'); }
+      // Only API JSON and public destination metadata cross into the EA page.
+      respond({ ok: response.ok, status: response.status, body, serverOrigin: selected.origin });
+    } catch (error) {
+      respond({ error: error.name === 'AbortError' ? 'The configured solver request timed out. It may still be running; do not repeat an uncertain job.' :
+        'Cannot reach the configured solver. Check its status, address and permissions. Redirects are not followed.', serverOrigin: selected.origin });
+    } finally { clearTimeout(timer); }
+  })().catch(error => respond({error:error.message}));
   return true;
 });
