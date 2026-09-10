@@ -42,6 +42,9 @@ function marketResult(input, concepts=[marketCard()], ownedCount=10) {
       squadPosition:p.squadPosition,marketPrice:p.marketPrice,source:p.priceSource,priceSnapshotAt:p.priceSnapshotAt,priceFetchedAt:p.priceFetchedAt,
       gameYear:p.gameYear,platform:p.platform,url:p.url}))};
 }
+function filterClub(players,criteria) {
+  return criteria.defId?.length ? players.filter(player=>criteria.defId.includes(Number(player.definitionId))) : players;
+}
 function harness(overrides = {}) {
   const body = new Element('html');
   const localStorage = new Storage(), sessionStorage = new Storage();
@@ -71,7 +74,7 @@ function harness(overrides = {}) {
     repositories:{TeamConfig:{},Item:{getClub:()=>({reset:()=>cacheReads.push('club-reset')}),setDirty:pile=>cacheReads.push(`dirty-${pile}`)}},
     ItemPile:{STORAGE:'storage',PURCHASED:'purchased'},
     services:{SBC:{requestSets:()=>observable({sets:[set]}),requestChallengesForSet:()=>observable({challenges:[challenge]}),loadChallenge:()=>observable(challenge),saveChallenge:()=>{writes.push('saveChallenge');return observable({});}},
-      Club:{clubDao:{resetStatsCache(){}},getStats:()=>observable({}),search:()=>observable({items:players,retrievedAll:true})},Item:{searchStorageItems:()=>observable({items:[],endOfList:true}),requestUnassignedItems:()=>observable({items:[]})},
+      Club:{clubDao:{resetStatsCache(){}},getStats:()=>observable({}),search:criteria=>observable({items:filterClub(players,criteria),retrievedAll:true})},Item:{searchStorageItems:()=>observable({items:[],endOfList:true}),requestUnassignedItems:()=>observable({items:[]})},
       Squad:{resetSquadsCache:()=>cacheReads.push('squads-reset'),
         requestSquadList:()=>observable({activeSquadId:7,listFull:false,squads:[...savedSquads].map(([id,slots])=>nativeSquad(id,slots))}),
         getActiveSquadId:()=>7,requestSquadById:id=>observable({squad:nativeSquad(id,savedSquads.get(id))})},
@@ -423,9 +426,10 @@ test('each inventory read refreshes club cache before traversing cumulative sear
   h.ctx.services.Club.getStats=()=>{stats++;return observable({});};
   h.ctx.services.Club.search=criteria=>{
     offsets.push(criteria.offset);
-    if(!refreshed)return observable({items:h.players,retrievedAll:false});
-    if(criteria.offset===0)return observable({items:h.players.slice(0,7),retrievedAll:false});
-    refreshed=false;return observable({items:h.players,retrievedAll:true});
+    const items=filterClub(h.players,criteria);
+    if(!refreshed)return observable({items,retrievedAll:false});
+    if(criteria.offset===0)return observable({items:items.slice(0,7),retrievedAll:false});
+    refreshed=false;return observable({items,retrievedAll:true});
   };
   await h.refresh();await h.button('Solve and preview').click();
   assert.equal(h.requests[0].clubPlayers.length,12);
@@ -439,14 +443,82 @@ test('repeated pages after cache refresh still block with source and count diagn
   assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
   assert.ok(h.elements.some(e=>e.textContent.includes('Club players: offset=91, rows=12, unique=12, retrievedAll=false, endOfList=missing')));
 });
+test('owned Apply reads exact reviewed definitions and refreshes full storage before all saved squads',async()=>{
+  const h=harness(),reads=[];
+  const search=h.ctx.services.Club.search,storage=h.ctx.services.Item.searchStorageItems;
+  h.ctx.UTBucketedItemSearchViewModel=class {constructor(){this.searchCriteria={};Object.defineProperty(this.searchCriteria,'cacheable',{get:()=>true});}};
+  h.ctx.services.Club.search=criteria=>{reads.push({kind:'club',...JSON.parse(JSON.stringify(criteria))});return search(criteria);};
+  h.ctx.services.Item.searchStorageItems=criteria=>{reads.push({kind:'storage',...JSON.parse(JSON.stringify(criteria))});return storage(criteria);};
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Apply squad').click();
+  assert.equal(reads[0].defId,undefined,'solve still reads the full club');
+  assert.deepEqual(reads[2].defId,Array.from({length:11},(_,i)=>1000+i));assert.equal(reads[2].isExactSearch,true);
+  assert.deepEqual(reads.filter(read=>read.kind==='storage').map(read=>read.defId),[undefined,undefined]);
+  assert.deepEqual(h.cacheReads,['club-reset','dirty-storage','squads-reset','club-reset','dirty-storage','squads-reset']);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+});
+test('targeted ownership rejects missing physical cards, alternate revisions and unrelated native results before Apply',async t=>{
+  const variants=[
+    ['removed card',items=>items.slice(1)],
+    ['another physical copy of the same athlete',items=>[{...items[0],id:90001},...items.slice(1)]],
+    ['same athlete but another full revision',items=>[{...items[0],definitionId:items[0].definitionId+0x1000000},...items.slice(1)]],
+    ['unrelated definition',items=>[...items,{...items[0],id:90002,definitionId:999999}]],
+    ['changed athlete on the same physical item',items=>[{...items[0],assetId:999999},...items.slice(1)]]
+  ];
+  for(const [name,change] of variants)await t.test(name,async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();
+    h.ctx.services.Club.search=criteria=>{assert.equal(criteria.isExactSearch,true);return observable({items:change(filterClub(h.players,criteria)),retrievedAll:true});};
+    await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,1);
+    assert.ok(h.elements.some(e=>/no longer in your club|different card definition|owned card changed/.test(e.textContent)));
+  });
+});
+test('targeted ownership traverses cumulative full pages until the selected physical cards arrive',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();
+  const offsets=[],duplicates=Array.from({length:91},(_,i)=>({...h.players[0],id:90000+i}));
+  h.ctx.services.Club.search=criteria=>{
+    offsets.push(criteria.offset);assert.equal(criteria.isExactSearch,true);assert.equal(criteria.count,91);
+    return observable({items:criteria.offset===0?duplicates:[...duplicates,...h.players.slice(0,11)],retrievedAll:criteria.offset===91});
+  };
+  await h.button('Apply squad').click();assert.deepEqual(offsets,[0,91]);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.deepEqual(Array.from(h.squad._players.slice(0,11),slot=>slot._item.id),Array.from({length:11},(_,i)=>i+1));
+});
+test('empty or stalled targeted pages with a false native completion flag cannot authorize Apply',async t=>{
+  for(const variant of ['empty','stalled'])await t.test(variant,async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();const offsets=[];
+    h.ctx.services.Club.search=criteria=>{offsets.push(criteria.offset);return observable({items:variant==='empty'?[]:filterClub(h.players,criteria),retrievedAll:false,endOfList:false});};
+    await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
+    assert.deepEqual(offsets,variant==='empty'?[0]:[0,91]);
+    assert.ok(h.elements.some(e=>e.textContent.includes('EA pagination stopped advancing.')));
+  });
+});
+test('saved-squad hydration cannot restore a removed card to a targeted ownership snapshot',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();const removed=h.players.shift();
+  const list=h.ctx.services.Squad.requestSquadList;
+  h.ctx.services.Squad.requestSquadList=()=>{h.players.unshift(removed);return list();};
+  await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('is no longer in your club')));
+});
+test('targeted ownership retains fresh storage cards and detects an inactive reserve lock added after preview',async t=>{
+  for(const locked of [false,true])await t.test(String(locked),async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();const moved=h.players.shift();
+    h.ctx.services.Item.searchStorageItems=criteria=>{assert.equal(criteria.defId,undefined);return observable({items:[moved],endOfList:true});};
+    if(locked){const slots=[];slots[22]={_item:moved};h.savedSquads.set(9,slots);}
+    await h.button('Apply squad').click();
+    assert.equal(h.writes.includes('saveChallenge'),!locked);
+    if(locked)assert.deepEqual(h.writes,[]);
+  });
+});
 const eaConcept=player=>({id:0,concept:true,definitionId:player.definitionId,assetId:player.assetId,rating:player.rating,rareflag:player.rarityId,isPlayer:()=>true,compareResourceTo(other){return this.assetId===other.assetId;}});
 test('reviewed mixed Apply uses exact EA concept entities and retains the shopping list without spending',async()=>{
   const concept=marketCard(), raw=eaConcept(concept), searches=[];
   const h=harness({solve:input=>marketResult(input,[concept])});
+  const clubScopes=[],search=h.ctx.services.Club.search;
+  h.ctx.services.Club.search=criteria=>{clubScopes.push(criteria.defId);return search(criteria);};
   h.ctx.services.Item.searchConceptItems=criteria=>{searches.push([...criteria.defId]);return observable({items:[raw]});};
   await h.refresh();await h.button('Solve and preview').click();
   assert.deepEqual(h.writes,[]);await h.button('Place concept players').click();
   assert.deepEqual(searches,[[concept.definitionId]]);
+  assert.deepEqual(clubScopes,[undefined,undefined],'mixed concept placement retains full owned inventory checks');
   assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
   assert.equal(h.squad._players[10]._item,raw);assert.equal(h.squad._players[0]._item,h.players[0]);
   assert.equal(h.squad._players[10]._item.concept,true);
@@ -713,15 +785,27 @@ test('batch rechecks Paletools locks added while loading the saved challenge and
 });
 
 function dailyHarness({kind='silver',repeats=2,...overrides}={}) {
-  const h=batchHarness(overrides), names={bronze:'Daily Bronze Upgrade',silver:'Daily Silver Upgrade',common:'Daily Common Gold Upgrade',rare:'Daily Rare Gold Upgrade'};
+  const h=batchHarness({solve:input=>({status_code:4,status:'Optimal',solution:input.sbcData.formation.flatMap((position,index)=>position===-1?[]:[index])
+    .map((slot,index)=>({...input.clubPlayers[index],squadPosition:slot}))}),...overrides}), names={bronze:'Daily Bronze Upgrade',silver:'Daily Silver Upgrade',common:'Daily Common Gold Upgrade',rare:'Daily Rare Gold Upgrade'};
   Object.assign(h.set,{name:names[kind],isRepeatable:true,isLimitedRepeatable:true,repeats,timesCompleted:0,endTime:Date.now()+3600000,
     isComplete:()=>false,hasExpired:flag=>{assert.equal(flag,false);return false;},getTimeRemaining:()=>3600,
     getRepeatsRemaining:()=>h.set.repeats-h.set.timesCompleted});
   const rating=kind==='bronze'?60:kind==='silver'?65:80;
   for (let i=12;i<24;i++)h.players.push({...h.players[i%12],id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`}});
   h.players.forEach(player=>{player.rating=rating;player.getTier=()=>kind==='bronze'?1:kind==='silver'?2:3;});
+  if(kind==='bronze'||kind==='silver') {
+    const selected=kind==='bronze'?0:10;
+    h.squad.simpleBrickIndices=Array.from({length:11},(_,index)=>index).filter(index=>index!==selected);
+    h.challenge.eligibilityRequirements=[{scope:0,count:1,kvPairs:{_collection:{1:[1]}}}];
+    h.brickSlot=()=>({_item:{id:0,definitionId:0,concept:false,isPlayer:()=>true,isValid:()=>false},
+      isRegularBrick:()=>true,isCustomBrick:()=>false});
+    const hydrate=()=>{h.squad.simpleBrickIndices.forEach(index=>{h.squad._players[index]=h.brickSlot();});};
+    hydrate();
+    h.ctx.services.SBC.loadChallenge=()=>{hydrate();return observable(h.challenge);};
+  }
   const consumed=new Set();
-  h.ctx.services.Club.search=()=>observable({items:h.players.filter(player=>!consumed.has(player.id)),retrievedAll:true});
+  h.consumed=consumed;
+  h.ctx.services.Club.search=criteria=>observable({items:filterClub(h.players.filter(player=>!consumed.has(player.id)),criteria),retrievedAll:true});
   h.ctx.services.SBC.submitChallenge=(challenge,set)=>{
     h.writes.push('submitChallenge');h.squad._players.slice(0,11).forEach(slot=>consumed.add(slot._item.id));
     challenge.timesCompleted++;set.timesCompleted++;challenge.status='IN_PROGRESS';
@@ -745,6 +829,82 @@ test('daily one-click plan is read-only and explicit start executes exactly its 
   assert.deepEqual(h.dailyReport().progress,{completedCycles:2,totalCycles:2,confirmedParts:2});
   assert.equal(h.dailyReport().plan.entries.length,2);
   assert.equal(h.button('Start daily plan').disabled,true);
+});
+test('a one-card Bronze daily uses one full solve scan and three exact selected-card club reads',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:1}),reads=[];const search=h.ctx.services.Club.search;
+  h.ctx.services.Club.search=criteria=>{reads.push(JSON.parse(JSON.stringify(criteria)));return search(criteria);};
+  await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(h.dailyReport().status,'completed');assert.equal(reads.length,4);assert.equal(reads[0].defId,undefined);
+  for(const read of reads.slice(1)){assert.deepEqual(read.defId,[1000]);assert.equal(read.isExactSearch,true);assert.equal(read.count,91);}
+  assert.equal(h.cacheReads.filter(read=>read==='club-reset').length,4);
+  assert.equal(h.cacheReads.filter(read=>read==='dirty-storage').length,4);
+  assert.equal(h.cacheReads.filter(read=>read==='squads-reset').length,4);
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
+test('card removal at each targeted batch check prevents the next account write',async t=>{
+  for(const phase of [1,2,3])await t.test(`selected read ${phase}`,async()=>{
+    const h=batchHarness(),search=h.ctx.services.Club.search;let filtered=0;
+    h.ctx.services.Club.search=criteria=>{
+      if(criteria.defId&&++filtered===phase)return observable({items:filterClub(h.players,criteria).slice(1),retrievedAll:true});
+      return search(criteria);
+    };
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(filtered,phase);assert.equal(h.writes.includes('submitChallenge'),false);
+    assert.equal(h.writes.filter(write=>write==='saveChallenge').length,phase===3?1:0);
+    if(phase<3)assert.deepEqual(h.writes,[]);
+  });
+});
+test('Stop during a targeted batch read prevents storage refresh and all later writes',async()=>{
+  const h=batchHarness(),search=h.ctx.services.Club.search;let release,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  h.ctx.services.Club.search=criteria=>{
+    if(!criteria.defId)return search(criteria);
+    return {observe(owner,callback){release=()=>callback(this,{success:true,data:{items:filterClub(h.players,criteria),retrievedAll:true}});entered();},unobserve(){}};
+  };
+  await h.prepare();const pending=h.button('Start queue').click();await started;
+  await h.button('Stop queue').click();release();await pending;
+  assert.deepEqual(h.writes,[]);assert.equal(h.cacheReads.filter(read=>read==='dirty-storage').length,1);
+  assert.equal(h.report().snapshot.status,'stopped');
+});
+test('bronze and silver dailies submit one owned card while retaining ten native player-typed null bricks',async t=>{
+  for(const kind of ['bronze','silver'])await t.test(kind,async()=>{
+    const h=dailyHarness({kind,repeats:1});await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+    assert.equal(h.dailyReport().status,'completed');assert.equal(h.dailyReport().progress.confirmedParts,1);
+    assert.equal(h.requests[0].sbcData.brickIndices.length,10);assert.equal(h.report().receipts[0].cardIds.length,1);
+    assert.equal([...h.consumed].filter(id=>id>0).length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+    const index=h.squad.simpleBrickIndices[0],slot=h.squad._players[index];
+    assert.equal(slot.isRegularBrick(),true);assert.equal(slot._item.isPlayer(),true);assert.equal(slot._item.id,0);
+  });
+});
+test('a brick flag never permits an owned card, concept or malformed null item in an unused daily slot',async t=>{
+  const cases=[
+    ['positive item ID',(h,slot)=>{slot._item={...h.players[1],isValid:()=>false};}],
+    ['nonzero definition',(h,slot)=>{slot._item.definitionId=999;}],
+    ['concept',(h,slot)=>{slot._item.concept=true;}],
+    ['valid item',(h,slot)=>{slot._item.isValid=()=>true;}],
+    ['missing validity',(h,slot)=>{delete slot._item.isValid;}],
+    ['missing regular brick',(h,slot)=>{delete slot.isRegularBrick;}],
+    ['custom brick',(h,slot)=>{slot.isRegularBrick=()=>false;slot.isCustomBrick=()=>true;}]
+  ];
+  for(const [name,change] of cases)await t.test(name,async()=>{
+    const h=dailyHarness({kind:'bronze',repeats:1}),load=h.ctx.services.SBC.loadChallenge;let loads=0;
+    h.ctx.services.SBC.loadChallenge=()=>{const response=load();if(++loads===3)change(h,h.squad._players[1]);return response;};
+    await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+    assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.includes('submitChallenge'),false);
+    assert.equal(h.dailyReport().status,'blocked');assert.equal(h.dailyReport().progress.confirmedParts,0);
+    const message=h.report().phase;assert.match(message,/Slot details:/);
+    const details=JSON.parse(message.split('Slot details: ')[1]);assert.equal(details.length,1);assert.equal(details[0].index,1);
+    assert.equal(details[0].expectedId,null);assert.equal(details[0].simpleBrick,true);
+  });
+});
+test('full daily slot validation is repeated at submit dispatch after inventory reads',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:1}),save=h.localStorage.setItem.bind(h.localStorage);let changed=false;
+  h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.batch.v1'){
+    const report=JSON.parse(value),last=report.snapshot.ledger.at(-1);
+    if(last?.event==='effect-started'&&last.action==='submit'&&!changed){changed=true;h.squad._players[1]._item={...h.players[1],isValid:()=>false};}
+  }};
+  await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(changed,true);assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/Slot details:/);
 });
 test('daily restores exact manual policy, selected set, queue and consent afterward',async()=>{
   const h=dailyHarness({repeats:1});await h.prepare();
@@ -888,6 +1048,70 @@ test('daily two failed initial list reads make no writes and permit a later fres
   h.ctx.services.SBC.requestSets=requestSets;await h.button('Build daily plan').click();await h.consentDailies();
   assert.equal(h.button('Start daily plan').disabled,false);assert.deepEqual(h.writes,[]);
 });
+test('a 521 before the next Bronze cycle retries only the list and never repeats the verified first submission',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets,retry=h.ctx.AutoSBCReadRetry,messages=[];let nextReads=0,firstChild,writesBeforeRetry;
+  h.ctx.AutoSBCReadRetry={read:options=>retry.read({...options,onWait:event=>{
+    options.onWait(event);if(event.status===521)messages.push(h.elements.filter(e=>e.tag==='p').map(e=>e.textContent).join('\n'));
+  }})};
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle===1) {
+      nextReads++;
+      if(nextReads===1) {
+        firstChild=daily.cycles[0].child;writesBeforeRetry=[...h.writes];
+        assert.equal(daily.progress.completedCycles,1);assert.equal(firstChild.receipts.length,1);
+        return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+      }
+      if(nextReads===2) {
+        assert.deepEqual(h.writes,writesBeforeRetry);assert.deepEqual(daily.cycles[0].child,firstChild);
+      }
+    }
+    return requestSets();
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();
+  assert.equal(nextReads,4,'one failed initial read, one retry, then the next cycle’s pre-submit and reward reads');
+  assert.equal(daily.status,'completed');assert.deepEqual(daily.progress,{completedCycles:2,totalCycles:2,confirmedParts:2});
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,2);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,2);
+  assert.equal(h.requests.length,2);assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.notDeepEqual(daily.cycles[0].child.receipts[0].cardIds,daily.cycles[1].child.receipts[0].cardIds);
+  for(const cycle of daily.cycles)assert.equal(cycle.child.snapshot.ledger.filter(event=>event.action==='submit'&&event.event==='effect-started').length,1);
+  assert.ok(messages.length>0);assert.ok(messages.every(message=>message.includes('The EA SBC list is temporarily unavailable (521).')&&!message.includes('EA limited the list request')));
+});
+test('a second 521 before the next daily cycle stops with the prior receipt and counters unchanged',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets;let nextReads=0,firstChild;
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle!==1)return requestSets();
+    nextReads++;firstChild??=daily.cycles[0].child;
+    return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();
+  assert.equal(nextReads,2);assert.equal(daily.status,'blocked');assert.deepEqual(daily.progress,{completedCycles:1,totalCycles:2,confirmedParts:1});
+  assert.equal(daily.lastError.status,521);assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.equal(daily.cycles[1].status,'blocked');assert.deepEqual(daily.cycles[1].child.receipts,[]);
+  assert.equal(h.requests.length,1);assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
+test('Stop during the next daily cycle’s 521 countdown prevents its retry and preserves the completed cycle',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets,retry=h.ctx.AutoSBCReadRetry;let nextReads=0,firstChild;
+  h.ctx.AutoSBCReadRetry={read:options=>retry.read({...options,onWait:async event=>{
+    await options.onWait(event);if(event.status===521)await h.button('Stop daily plan').click();
+  }})};
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle!==1)return requestSets();
+    nextReads++;firstChild??=daily.cycles[0].child;
+    return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();assert.equal(nextReads,1);assert.equal(daily.status,'stopped');
+  assert.deepEqual(daily.progress,{completedCycles:1,totalCycles:2,confirmedParts:1});assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.equal(h.requests.length,1);assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
 
 function uncertainSubmitReport() {
   const B=require('../frontend/batch-policy.js');
@@ -916,10 +1140,12 @@ test('recovery actions are enabled only for the matching pure report plan',()=>{
 });
 test('read-only card verification brackets fresh ownership with status reads and adds no completion credit',async()=>{
   const h=replanHarness(),reads=[];
+  const helper=h.ctx.AutoSBCBatchReplan;let ownership;
+  h.ctx.AutoSBCBatchReplan={...helper,reconcile:(report,evidence)=>{ownership=evidence.inventory;return helper.reconcile(report,evidence);}};
   for(const method of ['loadChallenge','saveChallenge','submitChallenge'])h.ctx.services.SBC[method]=()=>{throw new Error(`Forbidden ${method}`);};
   for(const method of ['requestSquadList','requestSquadById'])h.ctx.services.Squad[method]=()=>{throw new Error(`Forbidden ${method}`);};
   for(const [service,method] of [[h.ctx.services.SBC,'requestSets'],[h.ctx.services.SBC,'requestChallengesForSet'],[h.ctx.services.Club,'search'],[h.ctx.services.Item,'searchStorageItems']]){
-    const call=service[method];service[method]=(...args)=>{reads.push(method);return call(...args);};
+    const call=service[method];service[method]=(...args)=>{reads.push(method);if(method==='search')assert.equal(args[0].defId,undefined);return call(...args);};
   }
   await h.button('Verify cards and replan').click();
   assert.deepEqual(reads,['requestSets','requestChallengesForSet','search','searchStorageItems','requestSets','requestChallengesForSet']);
@@ -927,6 +1153,8 @@ test('read-only card verification brackets fresh ownership with status reads and
   const report=h.report();assert.equal(report.snapshot.status,'stopped');assert.equal(report.snapshot.queue[0].steps[0].status,'blocked');
   assert.equal(report.snapshot.progress.confirmedChallenges,0);assert.deepEqual(report.receipts,[]);
   assert.equal(report.reconciliation.ownership.matchedItems.length,11);
+  assert.equal(ownership.clubComplete,true);assert.equal(ownership.clubFilter,undefined);assert.equal(ownership.storageComplete,true);
+  assert.ok(Object.isFrozen(ownership));assert.ok(Object.isFrozen(ownership.items));
   assert.deepEqual(report.snapshot.ledger.slice(0,-1),h.original.snapshot.ledger);
   assert.equal(h.button('Verify cards and replan').disabled,true);
   const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
@@ -1020,11 +1248,11 @@ test('reconciliation rejects unchanged counters and mismatched scope without cle
     assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
   });
 });
-test('a 521 during read-only reconciliation is not retried and preserves the original journal',async()=>{
+test('two 521 list failures during read-only reconciliation stop after one retry and preserve the original journal',async()=>{
   const h=reconciliationHarness();let reads=0;
-  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:521,error:{code:521}}));},unobserve(){}});
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}});
   const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Verify last submission').click();
-  assert.equal(reads,1);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+  assert.equal(reads,2);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
 });
 test('cancel during reconciliation prevents journal updates and further reads',async()=>{
   const h=reconciliationHarness();let release,enter;const entered=new Promise(resolve=>{enter=resolve;});
@@ -1075,7 +1303,7 @@ test('completed repeatable sets leave the manual queue when a later set fails',a
   const h=batchHarness(),other={id:30,name:'Other SBC',isComplete:()=>false,isRepeatable:false,isLimitedRepeatable:false,timesCompleted:0};
   h.set.isRepeatable=true;h.set.isLimitedRepeatable=true;h.set.getRepeatsRemaining=()=>9;
   h.ctx.services.SBC.requestSets=()=>observable({sets:[h.set,other]});
-  h.ctx.services.SBC.requestChallengesForSet=set=>set.id===20?observable({challenges:[h.challenge]}):{observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521}));},unobserve(){}};
+  h.ctx.services.SBC.requestChallengesForSet=set=>set.id===20?observable({challenges:[h.challenge]}):{observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001}));},unobserve(){}};
   await h.prepare();h.selects[2].value='30';await h.button('Add selected set').click();
   const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));
   await h.button('Start queue').click();

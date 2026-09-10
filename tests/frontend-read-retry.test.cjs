@@ -12,7 +12,8 @@ function fixture(extra={}) {
     now:()=>clock,sleep:async ms=>{sleeps.push(ms);clock+=ms;},onWait:event=>progress.push(event),...extra};
   return {options,sleeps,progress,attemptTimes,get calls(){return calls;},get clock(){return clock;}};
 }
-const limited=seconds=>Object.assign(new Error('EA 429'),{status:429,...(seconds===undefined?{}:{retryAfterSeconds:seconds})});
+const transient=(status,seconds)=>Object.assign(new Error(`EA ${status}`),{status,...(seconds===undefined?{}:{retryAfterSeconds:seconds})});
+const limited=seconds=>transient(429,seconds);
 
 test('both allowed reads return successful values without sleeping or retrying',async()=>{
   for(const kind of ['requestSets','requestChallengesForSet']) {
@@ -26,64 +27,76 @@ test('load, save, submit and unknown operation kinds cannot dispatch',async()=>{
     assert.equal(f.calls,0);assert.deepEqual(f.sleeps,[]);
   }
 });
-test('only a strict numeric first 429 retries once after sixty seconds in interruptible chunks',async()=>{
-  const f=fixture(),request=f.options.request;let first=true;
-  f.options.request=async()=>{const result=await request();if(first){first=false;throw limited();}return result;};
-  assert.deepEqual(await Retry.read(f.options),{sets:[]});
-  assert.equal(f.calls,2);assert.deepEqual(f.attemptTimes,[10000,70000]);
-  assert.equal(f.sleeps.reduce((sum,ms)=>sum+ms,0),60000);
-  assert.ok(f.sleeps.every(ms=>ms>0&&ms<=500));
-  assert.equal(f.progress[0].remainingMs,60000);assert.equal(f.progress.at(-1).remainingMs,0);
-  assert.ok(f.progress.every(event=>event.kind==='requestSets'&&event.attempt===2&&event.delayMs===60000));
+test('strict numeric 429 and 521 retry either allowed list once after sixty interruptible seconds',async()=>{
+  for(const status of [429,521])for(const kind of ['requestSets','requestChallengesForSet']) {
+    const f=fixture({kind}),request=f.options.request;let first=true;
+    f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status);}return result;};
+    assert.deepEqual(await Retry.read(f.options),{sets:[]});
+    assert.equal(f.calls,2);assert.deepEqual(f.attemptTimes,[10000,70000]);
+    assert.equal(f.sleeps.reduce((sum,ms)=>sum+ms,0),60000);
+    assert.ok(f.sleeps.every(ms=>ms>0&&ms<=500));
+    assert.equal(f.progress[0].remainingMs,60000);assert.equal(f.progress.at(-1).remainingMs,0);
+    assert.ok(f.progress.every(event=>event.kind===kind&&event.status===status&&event.reason===(status===429?'rate-limit':'list-unavailable')&&event.attempt===2&&event.delayMs===60000));
+  }
 });
 test('positive Retry-After is respected exactly, including the five-minute boundary',async()=>{
-  for(const seconds of [0.75,2,90,300]) {
+  for(const status of [429,521])for(const seconds of [0.75,2,90,300]) {
     const f=fixture(),request=f.options.request;let first=true;
-    f.options.request=async()=>{const result=await request();if(first){first=false;throw limited(seconds);}return result;};
+    f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status,seconds);}return result;};
     await Retry.read(f.options);
     assert.equal(f.calls,2);assert.equal(f.attemptTimes[1]-f.attemptTimes[0],seconds*1000);
     assert.ok(f.sleeps.every(ms=>ms>0&&ms<=500));
   }
 });
 test('long server delays halt instead of shortening the requested cooldown',async()=>{
-  for(const seconds of [300.1,600,Infinity]) {
-    const error=limited(seconds),f=fixture({request:async()=>{throw error;}});
-    await assert.rejects(Retry.read(f.options),e=>e.status===429&&e.cause===error&&e.retryAfterSeconds===seconds);
+  for(const status of [429,521])for(const seconds of [300.1,600,Infinity]) {
+    const error=transient(status,seconds),f=fixture({request:async()=>{throw error;}});
+    await assert.rejects(Retry.read(f.options),e=>e.status===status&&e.cause===error&&e.retryAfterSeconds===seconds);
     assert.deepEqual(f.sleeps,[]);assert.deepEqual(f.progress,[]);
   }
 });
 test('missing and malformed delay metadata use the documented local fallback',async()=>{
-  for(const seconds of [undefined,null,0,-1,NaN,'5',true]) {
+  for(const status of [429,521])for(const seconds of [undefined,null,0,-1,NaN,'5',true]) {
     const f=fixture(),request=f.options.request;let first=true;
-    f.options.request=async()=>{const result=await request();if(first){first=false;throw limited(seconds);}return result;};
+    f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status,seconds);}return result;};
     await Retry.read(f.options);assert.equal(f.calls,2);assert.equal(f.attemptTimes[1]-f.attemptTimes[0],60000);
   }
 });
-test('401, 500, timeouts, string statuses and a second 429 propagate without further attempts',async()=>{
+test('other statuses, timeouts and nonnumeric retry statuses propagate without another attempt',async()=>{
   for(const error of [Object.assign(new Error('EA 401'),{status:401}),Object.assign(new Error('EA 500'),{status:500}),
-    new Error('Timeout'),Object.assign(new Error('not numeric'),{status:'429'})]) {
+    new Error('Timeout'),...['429','521',new Number(521),true,undefined].map(status=>transient(status))]) {
     let calls=0;const f=fixture({request:async()=>{calls++;throw error;}});
     await assert.rejects(Retry.read(f.options),e=>e===error);assert.equal(calls,1);assert.deepEqual(f.sleeps,[]);
   }
-  let calls=0;const error=limited(1),f=fixture({request:async()=>{calls++;throw error;}});
-  await assert.rejects(Retry.read(f.options),e=>e===error);assert.equal(calls,2);
-  assert.equal(f.sleeps.reduce((sum,ms)=>sum+ms,0),1000);
+});
+test('a second failure ends the read even when 429 and 521 alternate',async()=>{
+  for(const firstStatus of [429,521])for(const secondStatus of [429,521,500]) {
+    let calls=0;const first=transient(firstStatus,1),second=transient(secondStatus,1);
+    const f=fixture({request:async()=>{throw ++calls===1?first:second;}});
+    await assert.rejects(Retry.read(f.options),e=>e===second);assert.equal(calls,2);
+    assert.equal(f.sleeps.reduce((sum,ms)=>sum+ms,0),1000);
+    assert.ok(f.progress.every(event=>event.status===firstStatus));
+  }
 });
 test('guard failures before dispatch and during waiting stop immediately without becoming retries',async()=>{
-  const stop=Object.assign(new Error('Stopped'),{status:429});
-  const before=fixture({guard:()=>{throw stop;}});
-  await assert.rejects(Retry.read(before.options),e=>e===stop);assert.equal(before.calls,0);assert.deepEqual(before.sleeps,[]);
-  let stopped=false,calls=0;
-  const waiting=fixture({request:async()=>{calls++;throw limited();},guard:async()=>{if(stopped)throw stop;}});
-  const sleep=waiting.options.sleep;
-  waiting.options.sleep=async ms=>{await sleep(ms);stopped=true;};
-  await assert.rejects(Retry.read(waiting.options),e=>e===stop);assert.equal(calls,1);assert.deepEqual(waiting.sleeps,[500]);
+  for(const status of [429,521]) {
+    const stop=Object.assign(new Error('Stopped'),{status});
+    const before=fixture({guard:()=>{throw stop;}});
+    await assert.rejects(Retry.read(before.options),e=>e===stop);assert.equal(before.calls,0);assert.deepEqual(before.sleeps,[]);
+    let stopped=false,calls=0;
+    const waiting=fixture({request:async()=>{calls++;throw transient(status);},guard:async()=>{if(stopped)throw stop;}});
+    const sleep=waiting.options.sleep;
+    waiting.options.sleep=async ms=>{await sleep(ms);stopped=true;};
+    await assert.rejects(Retry.read(waiting.options),e=>e===stop);assert.equal(calls,1);assert.deepEqual(waiting.sleeps,[500]);
+  }
 });
 test('stop on the final countdown prevents the second dispatch',async()=>{
-  const stop=new Error('Stopped at deadline');let stopped=false,calls=0;
-  const f=fixture({request:async()=>{calls++;throw limited(1);},guard:()=>{if(stopped)throw stop;},
-    onWait:event=>{if(event.remainingMs===0)stopped=true;}});
-  await assert.rejects(Retry.read(f.options),e=>e===stop);assert.equal(calls,1);
+  for(const status of [429,521]) {
+    const stop=new Error('Stopped at deadline');let stopped=false,calls=0;
+    const f=fixture({request:async()=>{calls++;throw transient(status,1);},guard:()=>{if(stopped)throw stop;},
+      onWait:event=>{if(event.remainingMs===0)stopped=true;}});
+    await assert.rejects(Retry.read(f.options),e=>e===stop);assert.equal(calls,1);
+  }
 });
 test('a stop while the first read is in flight rejects its eventual result',async()=>{
   const stop=new Error('Stopped'),f=fixture();let stopped=false;

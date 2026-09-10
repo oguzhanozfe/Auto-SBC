@@ -2,11 +2,14 @@
 import json
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
+from unittest.mock import patch
 
 import pytest
 
 from backend.setup import runAutoSBC
-from backend.solver_model import normalize_sbc, squad_rating
+from backend import solver_model
+from backend.solver_model import calculate_chemistry, normalize_sbc, satisfies, squad_rating
 from backend.solver_policy import SolverInputError, prepare_players
 
 
@@ -357,6 +360,135 @@ def test_global_type_two_profile_remains_explicitly_unsupported():
     result = solve([unknown], challenge(1, [requirement("CHEMISTRY_POINTS", 1)]))
     assert result["status_code"] == 0
     assert result["status_key"] == "UNSUPPORTED_CHEMISTRY"
+
+
+def chemistry_objective(result):
+    if not result["solution"]:
+        return None
+    return (round(result["summary"]["weightedCost"] * 100) * 408
+            - result["summary"]["chemistry"] * 12
+            - sum(row["Is_Pos"] for row in result["solution"]))
+
+
+@pytest.mark.parametrize("key,scope,target,proved,status,out_of_position", [
+    ("CHEMISTRY_POINTS", "GREATER", 31, True, 4, False),
+    ("CHEMISTRY_POINTS", "EXACT", 31, True, 4, False),
+    ("CHEMISTRY_POINTS", "GREATER", 30, False, 4, True),
+    ("CHEMISTRY_POINTS", "EXACT", 30, False, 4, True),
+    ("CHEMISTRY_POINTS", "LOWER", 31, False, 4, True),
+    ("CHEMISTRY_POINTS", "LOWER", 33, False, 4, True),
+    ("CHEMISTRY_POINTS", "GREATER", 34, True, 3, False),
+    ("CHEMISTRY_POINTS", "EXACT", 34, True, 3, False),
+    ("ALL_PLAYERS_CHEMISTRY_POINTS", "GREATER", 1, True, 4, False),
+    ("ALL_PLAYERS_CHEMISTRY_POINTS", "EXACT", 3, True, 4, False),
+    ("ALL_PLAYERS_CHEMISTRY_POINTS", "LOWER", 3, False, 4, True),
+    ("ALL_PLAYERS_CHEMISTRY_POINTS", "GREATER", 0, False, 4, True),
+])
+def test_chemistry_domains_match_former_full_position_model(key, scope, target, proved, status, out_of_position):
+    # Ten linked STs, two legal GK options, a cheaper out-of-position card,
+    # and a separately linked GK/ST pair make 30, 31 and 33 attainable.
+    rows = [player(i, possiblePositions=[25], marketPrice=100 + i) for i in range(1, 11)]
+    rows += [player(11, possiblePositions=[0], marketPrice=500),
+             player(12, possiblePositions=[0], teamId=99, nationId=99, leagueId=99, marketPrice=600),
+             player(13, possiblePositions=[99], marketPrice=1),
+             player(14, possiblePositions=[25], teamId=99, nationId=99, leagueId=99, marketPrice=700)]
+    sbc = challenge(requirements=[requirement(key, target, scope, count=-1)], formation=[0] + [25] * 10)
+    optimized = solve(rows, sbc)
+    # Disabling only the proof restores the original all-position variables
+    # and separate in_position booleans; requirements/objective stay identical.
+    with patch.object(solver_model, "all_players_in_position_proved", return_value=False):
+        reference = solve(rows, sbc)
+    assert optimized["status_code"] == reference["status_code"] == status
+    assert chemistry_objective(optimized) == chemistry_objective(reference)
+    assert optimized["diagnostics"]["candidateCount"] == len(rows)
+    assert optimized["diagnostics"]["allPlayersInPositionProved"] is proved
+    assert optimized["diagnostics"]["assignmentVariableCount"] == (13 if proved else 28)
+    if status == 4:
+        assert any(not row["Is_Pos"] for row in optimized["solution"]) is out_of_position
+        assert (13 in ids(optimized)) is out_of_position
+        assert optimized["diagnostics"]["objectiveCost"] == reference["diagnostics"]["objectiveCost"]
+        assert optimized["diagnostics"]["objectiveBound"] == reference["diagnostics"]["objectiveBound"]
+
+
+@pytest.mark.parametrize("size", [1, 2, 3])
+@pytest.mark.parametrize("key", ["CHEMISTRY_POINTS", "ALL_PLAYERS_CHEMISTRY_POINTS"])
+@pytest.mark.parametrize("scope", ["GREATER", "EXACT", "LOWER"])
+def test_sparse_chemistry_matches_exhaustive_legal_assignments_with_bricks_and_local_boosts(size, key, scope):
+    # Enumerate all physical-card assignments, including out-of-position
+    # placements. This oracle uses the independent result recalculation, not
+    # CP-SAT assignment domains or its proof helper.
+    rows = [player(1, possiblePositions=[0, 5], marketPrice=100, **profile(full=True)),
+            player(2, possiblePositions=[0], marketPrice=110, **profile((2, 2, 2))),
+            player(3, possiblePositions=[5], marketPrice=120, **profile((0, 2, 1), full=True)),
+            player(4, possiblePositions=[], marketPrice=1, **profile(full=True))]
+    normalized, _, _ = prepare_players(rows)
+    formation = [0, 5, 0][:size] + [-1] * (11 - size)
+    for target in range((3 * size if key == "CHEMISTRY_POINTS" else 3) + 2):
+        sbc = challenge(size, [requirement(key, target, scope, count=-1)], formation)
+        objectives = []
+        for assignment in permutations(normalized, size):
+            squad = [dict(row, squadPosition=index, originalPossiblePositions=row["possiblePositions"])
+                     for index, row in enumerate(assignment)]
+            chemistry = calculate_chemistry(squad, sbc)
+            values = [sum(chemistry)] if key == "CHEMISTRY_POINTS" else chemistry
+            if all(satisfies(value, scope, target) for value in values):
+                in_position = sum(formation[index] in row["possiblePositions"] for index, row in enumerate(assignment))
+                objectives.append(sum(row["solverCost"] for row in assignment) * 408 - sum(chemistry) * 12 - in_position)
+        result = solve(rows, sbc)
+        assert result["status_code"] == (4 if objectives else 3), (size, key, scope, target)
+        assert chemistry_objective(result) == (min(objectives) if objectives else None), (size, key, scope, target)
+        assert result["diagnostics"]["candidateCount"] == len(rows)
+
+
+def test_positive_per_player_proof_survives_additional_upper_limit_and_duplicate_position_capacity():
+    rows = [player(1, possiblePositions=[0, 5]), player(2, possiblePositions=[0]), player(3, possiblePositions=[5])]
+    sbc = challenge(3, [requirement("ALL_PLAYERS_CHEMISTRY_POINTS", 1),
+                        requirement("CHEMISTRY_POINTS", 9, "LOWER")], [0, 5, 0] + [-1] * 8)
+    result = solve(rows, sbc)
+    assert result["status_code"] == 4
+    assert result["diagnostics"]["allPlayersInPositionProved"] is True
+    assert result["diagnostics"]["assignmentVariableCount"] == 4
+    assert [row["possiblePositions"] for row in result["solution"]].count(0) == 2
+
+
+@pytest.mark.parametrize("positions", [[], [99], None])
+def test_required_card_without_a_legal_position_is_retained_and_proves_infeasible(positions):
+    invalid = player(3, **profile(full=True))
+    if positions is None:
+        invalid.pop("possiblePositions")
+    else:
+        invalid["possiblePositions"] = positions
+    rows = [player(1, possiblePositions=[0]), player(2, possiblePositions=[5]), invalid]
+    sbc = challenge(2, [requirement("ALL_PLAYERS_CHEMISTRY_POINTS", 1)], [0, 5] + [-1] * 9)
+    result = solve(rows, sbc, {"requiredItemIds": [3]})
+    assert result["status_code"] == 3
+    assert result["diagnostics"]["candidateCount"] == 3
+    assert result["diagnostics"]["assignmentVariableCount"] == 2
+    assert "unsupportedChemistryItemIds" not in result["diagnostics"]
+
+
+def test_sparse_domains_preserve_unknown_profile_status_instead_of_claiming_global_infeasibility():
+    row = player(1, **profile(full=True))
+    row["leagueChem"]["calculationType"] = 2
+    sbc = challenge(1, [requirement("CHEMISTRY_POINTS", 1)])
+    optimized = solve([row], sbc)
+    with patch.object(solver_model, "all_players_in_position_proved", return_value=False):
+        reference = solve([row], sbc)
+    assert optimized["status_code"] == reference["status_code"] == 0
+    assert optimized["status_key"] == reference["status_key"] == "UNSUPPORTED_CHEMISTRY"
+    assert optimized["diagnostics"]["unsupportedChemistryItemIds"] == reference["diagnostics"]["unsupportedChemistryItemIds"]
+
+
+def test_warm_start_hints_handle_sparse_and_empty_domains_without_dropping_required_identity():
+    rows = [player(i, possiblePositions=[0], marketPrice=100 + i) for i in range(1, 400)]
+    rows += [player(400, possiblePositions=[5], marketPrice=1000), player(401, possiblePositions=[], marketPrice=1)]
+    sbc = challenge(2, [requirement("ALL_PLAYERS_CHEMISTRY_POINTS", 2)], [0, 5] + [-1] * 9)
+    result = solve(rows, sbc, {"requiredItemIds": [400]})
+    assert result["status_code"] == 4
+    assert ids(result) == {1, 400}
+    assert result["diagnostics"]["candidateCount"] == 401
+    assert result["diagnostics"]["assignmentVariableCount"] == 400
+    assert result["diagnostics"]["warmStart"]["foundSolution"] is True
 
 
 def test_identity_symmetry_never_orders_a_required_or_multiversion_athlete():

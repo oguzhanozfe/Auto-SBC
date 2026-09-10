@@ -30,7 +30,7 @@ Concepts need a positive, fresh quote for the selected season and platform. Miss
 
 The current release uses a local service. Your club payload is processed in memory on your computer; EA credentials and account actions stay in the Web App. See [Privacy](PRIVACY.md).
 
-Live FC 26 evidence includes ten earlier Daily Silver solve/Apply flows and native concept placement using a current EA price. The newer automatic queue has completed **nine parts**. Across the selected five-set test, progress is **2/5 sets and 12/17 parts**, including 10x85+ and the complete 98+ FOF/FUTTIES pick. The latest queue stopped on a 409 response at Yan Diomandé; that submission is not counted as completed. The new daily preset still needs a full account-level run. Full evidence and limits are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+Live FC 26 evidence includes ten earlier Daily Silver solve/Apply flows and native concept placement using a current EA price. Auto-SBC has since completed **eleven SBC parts/cycles fully automatically**: ten selected-set parts and one Bronze daily. Across the selected five-set test, progress is **2/5 sets and 13/17 parts**, including 10x85+ and the complete 98+ FOF/FUTTIES pick. The rejected Yan Diomandé attempt was reconciled without completion credit; a fresh protected solve later completed that part. Its next 92-rated part reached the 30-second solve limit before saving. The daily preset verified its first cycle, then stopped on a 521 list read before the next squad; full-plan validation remains pending. Full evidence and limits are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 FC 27 catalog metadata is available, but usable prices and live Web App compatibility are separate checks. FC 26 prices are never substituted for FC 27. Combined same-player conditions, OR expressions and unsupported chemistry profiles remain launch gates; see [QUALITY-PLAN.md](docs/QUALITY-PLAN.md).
 
@@ -67,7 +67,7 @@ node --check backend/static/app.js
 
 Browser files are generated from `frontend/`; edit source modules instead of generated scripts. `VERSION` supplies the release number. CI tests the solver, catalog, API and browser adapter, then builds downloadable browser artifacts. Mocks are distinct from live account evidence. The old scripts are preserved under `legacy/` and are not part of startup.
 
-Product journeys and release gates: [PRODUCT.md](docs/PRODUCT.md). Architecture and test evidence: [VERIFICATION.md](docs/VERIFICATION.md).
+Product journeys and release gates: [PRODUCT.md](docs/PRODUCT.md). Observed account scenarios and acceptance criteria: [REAL-WORLD-CASES.md](docs/REAL-WORLD-CASES.md). Architecture and test evidence: [VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Attribution
 

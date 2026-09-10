@@ -198,19 +198,45 @@ def normalized_club(row):
         return row["teamId"]
 
 
+def all_players_in_position_proved(sbc):
+    """Whether chemistry requirements rule out every out-of-position card.
+
+    This model gives each selected card 0..3 chemistry, and exactly zero out
+    of position, including supported maxChem profiles. One such card caps
+    the total at 3*(open slots-1). Upper bounds alone never prove this.
+    """
+    open_slots = 11 - len(sbc["brickIndices"])
+    for req in sbc["constraints"]:
+        if req["scope"] not in ("GREATER", "EXACT"):
+            continue
+        key, target = req["requirementKey"], req["eligibilityValues"][0]
+        if key == "CHEMISTRY_POINTS" and target > 3 * (open_slots - 1):
+            return True
+        if key == "ALL_PLAYERS_CHEMISTRY_POINTS" and target > 0:
+            return True
+    return False
+
+
 def add_chemistry(model, rows, selected, sbc):
     slots = [(index, pos) for index, pos in enumerate(sbc["formation"]) if index not in sbc["brickIndices"]]
     capacities = Counter(position for _, position in slots)
+    all_in_position = all_players_in_position_proved(sbc)
     assignments, in_position = [], []
     for i, row in enumerate(rows):
-        choices = {position: model.NewBoolVar(f"slot_{i}_{position}") for position in capacities}
+        choices = {position: model.NewBoolVar(f"slot_{i}_{position}") for position in capacities
+                   if not all_in_position or position in row["possiblePositions"]}
+        # An empty legal domain forces selected[i] to zero; the candidate and
+        # its identity/required-card constraints remain in the complete model.
         model.Add(sum(choices.values()) == selected[i])
-        in_pos = model.NewBoolVar(f"in_position_{i}")
-        model.Add(in_pos == sum(var for position, var in choices.items() if position in row["possiblePositions"]))
+        if all_in_position:
+            in_pos = selected[i]
+        else:
+            in_pos = model.NewBoolVar(f"in_position_{i}")
+            model.Add(in_pos == sum(var for position, var in choices.items() if position in row["possiblePositions"]))
         assignments.append(choices)
         in_position.append(in_pos)
     for position, capacity in capacities.items():
-        model.Add(sum(choices[position] for choices in assignments) == capacity)
+        model.Add(sum(choices.get(position, 0) for choices in assignments) == capacity)
     group_levels = {}
     profiles = [chemistry_profile(row) for row in rows]
     for dimension, (field, thresholds) in enumerate(CHEMISTRY_TIERS.items()):
@@ -340,6 +366,26 @@ def warm_start_pool(rows, policy):
     return [rows[i] for i in sorted(chosen)]
 
 
+def rating_warm_start_pool(rows, policy):
+    """Cheap rating coverage for feasibility only; never trim the final model.
+
+    Repeated physical copies of one athlete must not fill a rating bucket.
+    Required identities retain every matching version even beyond that bucket.
+    """
+    ordered = sorted(range(len(rows)), key=lambda i: (rows[i]["solverCost"], rows[i]["marketPrice"], identifier(rows[i]["id"])))
+    chosen, athletes_by_rating = set(), defaultdict(set)
+    for i in ordered:
+        row = rows[i]
+        if any(identifier(row[field]) in policy[f"required{name}Ids"] for field, name in (("id", "Item"), ("assetId", "Asset"), ("definitionId", "Definition"))):
+            chosen.add(i)
+        athletes = athletes_by_rating[row["rating"]]
+        athlete = identifier(row["assetId"])
+        if athlete not in athletes and len(athletes) < 11:
+            chosen.add(i)
+            athletes.add(athlete)
+    return [rows[i] for i in sorted(chosen)]
+
+
 def solve_rows(rows, sbc, policy, max_solve_time, diagnostics, _warm_start=True):
     started = time.monotonic()
     try:
@@ -411,6 +457,8 @@ def solve_rows(rows, sbc, policy, max_solve_time, diagnostics, _warm_start=True)
             diagnostics["warnings"].append(f"{len(unsupported)} cards with unrecognized or global chemistry profiles were excluded; optimality/infeasibility is not claimed across those cards.")
         diagnostics["chemistryModel"] = "ea-tiers-local-profile-v1"
         assignments, chemistry = add_chemistry(model, rows, selected, sbc)
+        diagnostics["allPlayersInPositionProved"] = all_players_in_position_proved(sbc)
+        diagnostics["assignmentVariableCount"] = sum(len(choices) for choices in assignments)
     rating_var = None
     for req in sbc["constraints"]:
         key, scope, target = req["requirementKey"], req["scope"], req["eligibilityValues"][0]
@@ -464,22 +512,28 @@ def solve_rows(rows, sbc, policy, max_solve_time, diagnostics, _warm_start=True)
     else:
         model.Minimize(cost_expression)
     warm_solution = []
-    if _warm_start and chemistry_mode and len(rows) > 400 and max_solve_time >= 3:
-        warm_rows = warm_start_pool(rows, policy)
-        if len(warm_rows) < len(rows):
+    rating_only = bool(sbc["constraints"]) and all(req["requirementKey"] == "TEAM_RATING" for req in sbc["constraints"])
+    if _warm_start and (chemistry_mode or rating_only) and len(rows) > 400 and max_solve_time >= 3:
+        warm_rows = warm_start_pool(rows, policy) if chemistry_mode else rating_warm_start_pool(rows, policy)
+        remaining = max_solve_time - (time.monotonic() - started)
+        warm_time = min(2.0, max_solve_time * 0.3, max(0.0, remaining - 0.05))
+        if len(warm_rows) < len(rows) and warm_time > 0:
             warm_diagnostics = {"warnings": []}
-            warm_time = min(2.0, max_solve_time * 0.3)
             warm_solution, _, _ = solve_rows(warm_rows, sbc, policy, warm_time, warm_diagnostics, _warm_start=False)
-            diagnostics["warmStart"] = {"candidateCount": len(warm_rows), "foundSolution": bool(warm_solution), "solveTimeSeconds": warm_diagnostics.get("solveTimeSeconds", 0)}
+            diagnostics["warmStart"] = {"strategy": "chemistry" if chemistry_mode else "rating-only",
+                                        "candidateCount": len(warm_rows), "foundSolution": bool(warm_solution),
+                                        "budgetSeconds": warm_time, "solveTimeSeconds": warm_diagnostics.get("solveTimeSeconds", 0)}
             if warm_solution:
+                verify_solution(warm_solution, sbc, policy, chemistry_mode)
                 by_id = {identifier(row["id"]): row for row in warm_solution}
                 model.Add(cost_expression <= sum(row["solverCost"] for row in warm_solution))
                 for i, row in enumerate(rows):
                     warm_row = by_id.get(identifier(row["id"]))
                     model.AddHint(selected[i], int(warm_row is not None))
-                    for position, var in assignments[i].items():
-                        model.AddHint(var, int(warm_row is not None and warm_row["possiblePositions"] == position))
-                    model.AddHint(chemistry[i], warm_row["Chemistry"] if warm_row else 0)
+                    if chemistry_mode:
+                        for position, var in assignments[i].items():
+                            model.AddHint(var, int(warm_row is not None and warm_row["possiblePositions"] == position))
+                        model.AddHint(chemistry[i], warm_row["Chemistry"] if warm_row else 0)
     validation = model.Validate()
     if validation:
         raise SolverInputError(f"Invalid solver model: {validation}", "MODEL_INVALID")

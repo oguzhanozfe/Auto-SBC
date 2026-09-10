@@ -318,3 +318,71 @@ validation. Version 27.0.10 separates native squad identifiers from physical car
 IDs and adds bounded typed diagnostics; the actual original mismatch is not
 attributed without live evidence. Native squad zero is supported while returned
 identity must still match exactly. The correction adds five adapter regressions.
+
+## First verified automatic daily (27.0.11)
+
+The 27.0.10 all-saved-squad read passed live. Its first Bronze daily saved a
+valid one-player squad, but the pre-submit guard rejected the ten fixed empty
+slots because EA gives their null items type `PLAYER`. Native EA showed 2/2
+requirements satisfied; no manual exchange was used.
+
+Version 27.0.11 checks the actual fixed-slot layout and native regular-brick
+marker, zero physical/definition IDs, nonconcept status and invalid null item.
+Unexpected owned cards are rejected even inside a brick. The complete squad is
+checked after saving and immediately before dispatch. One-player/ten-brick
+Bronze and Silver regressions, malformed placeholders and a final-dispatch
+mutation passed; the full suites passed 177 Python and 308 browser tests.
+
+At 2026-09-10T00:34:41.089Z, the extension automatically submitted Bronze daily
+3968, with the exact successful receipt and zero-game check. Fresh counters
+verified the cycle at 00:34:43 UTC. The daily report records **1/60 cycles
+completed**; the next cycle stopped on a returned 521 during its initial set-list
+read, before any save or submission. No completion was lost or replayed.
+
+This brings the fully automatic total to **ten SBC parts/cycles**: nine selected
+set parts plus one Bronze daily. The separate five-set request remains 2/5 groups
+and 12/17 parts. Balance remained 577,251; no cards were bought and reward packs
+remain unopened. One completed daily does not establish full-plan readiness.
+
+The subsequent 27.0.11 selected-set queue completed Yan Diomandé 4152 at
+00:48:58.593 UTC with a successful receipt and fresh counter verification.
+This was a fresh protected solve after the earlier no-completion proof, not a
+replay of the rejected 409 submission. The next part, 4153 (92-rated), returned
+UNKNOWN after its 30-second solve budget before any save. The selected-set
+total advanced to **2/5 groups and 13/17 parts**; the automatic total reached
+**eleven**, comprising ten selected-set parts and the separate Bronze daily.
+
+## Optimizations from observed requests (27.0.12)
+
+The historical 3,000-card all-position chemistry benchmark is a synthetic stress
+case. It is not a product acceptance case or sufficient grounds for a hosting
+decision. The benchmarking command now requires either an actual exported
+request or explicit synthetic mode. It runs the production planner locally and
+reports anonymous pool, policy, time and memory aggregates. Four captured
+request shapes and their limitations are documented in [HOSTING.md](HOSTING.md).
+
+For 11 players and at least 31 chemistry, even one out-of-position player's zero
+would cap the squad at 30. Version 27.0.12 therefore omits impossible assignment
+choices only when the requirements prove all players must be in position. It
+keeps all candidate identities and constraints, including required cards with
+no legal slot. Lower chemistry requirements retain out-of-position choices.
+129 solver regressions passed, including comparison against the old assignment
+domains and exhaustive small formations. The real Pre-Season 6 replay remained
+FEASIBLE with 3,121 candidates: one run measured 2,046.7 MiB peak versus the
+earlier 2,817.8 MiB. Both used approximately 30 seconds; neither was an EA save
+or submission, and this is not a guaranteed performance or cloud capacity result.
+
+Owned-only Apply and batch pre-write checks now refresh Club ownership for the
+reviewed full definition IDs. They clear native caches, validate physical IDs
+and full revisions, then refresh Storage and every saved-squad lock. Solve,
+concept and no-completion recovery reads remain complete. A filtered ownership
+proof is explicitly marked incomplete for the whole Club. Adapter regressions
+cover missing/swapped cards, off-filter revisions, cumulative pages, stale squad
+hydration, changed locks and Stop. Live validation of this narrower read follows
+separately; mocks alone do not establish the native query behavior.
+
+The allowlisted SBC set/challenge list reads also retry a numeric 521 once with
+the same bounded, cancellable cooldown as 429. Mixed failures still permit only
+two total attempts. Save, load and submit are outside the retry allowlist. Daily
+tests preserve a completed first cycle across a next-cycle transient failure,
+repeated failure and Stop during the countdown, without duplicate submissions.

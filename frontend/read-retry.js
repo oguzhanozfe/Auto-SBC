@@ -6,6 +6,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
   const READ_KINDS = new Set(['requestSets','requestChallengesForSet']);
+  const RETRY_STATUSES = new Set([429,521]);
   const DEFAULT_DELAY_MS = 60000, MAX_DELAY_SECONDS = 300, WAIT_CHUNK_MS = 500;
   const timer = ms => new Promise(resolve => setTimeout(resolve,ms));
 
@@ -20,21 +21,22 @@
     };
     for (let attempt=0;attempt<2;attempt++) {
       // Keep guards outside the request catch: a guard/progress failure must
-      // never be interpreted as an EA rate-limit response.
+      // never be interpreted as a retryable EA list response.
       await guard();
-      let result, rateLimit;
+      let result, retryableError;
       try { result = await request(); }
       catch (error) {
-        if (attempt !== 0 || error?.status !== 429) throw error;
-        rateLimit = error;
+        if (attempt !== 0 || !RETRY_STATUSES.has(error?.status)) throw error;
+        retryableError = error;
       }
-      if (!rateLimit) { await guard(); return result; }
+      if (!retryableError) { await guard(); return result; }
 
       await guard();
-      const seconds = rateLimit.retryAfterSeconds;
+      const status = retryableError.status, reason = status === 429 ? 'rate-limit' : 'list-unavailable';
+      const seconds = retryableError.retryAfterSeconds;
       if (typeof seconds === 'number' && seconds > MAX_DELAY_SECONDS) {
-        const error = new Error('EA requested a retry delay longer than five minutes; automatic read retry stopped.', {cause:rateLimit});
-        error.status = 429; error.retryAfterSeconds = seconds;
+        const error = new Error('EA requested a retry delay longer than five minutes; automatic read retry stopped.', {cause:retryableError});
+        error.status = status; error.retryAfterSeconds = seconds;
         throw error;
       }
       // EA's SBC service often omits Retry-After. Sixty seconds is our bounded
@@ -44,7 +46,7 @@
       for (;;) {
         await guard();
         const remainingMs = Math.max(0,deadline-time());
-        if (onWait) await onWait({kind,attempt:2,delayMs,remainingMs});
+        if (onWait) await onWait({kind,status,reason,attempt:2,delayMs,remainingMs});
         await guard();
         if (remainingMs === 0) break;
         await sleep(Math.min(WAIT_CHUNK_MS,remainingMs));
