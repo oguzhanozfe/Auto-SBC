@@ -83,7 +83,7 @@ def plan(body, catalog, progress=None):
     diagnostics["optimalityScope"] = "Eligible club cards and supported market cards in the evaluated pool."
     warnings = diagnostics.setdefault("warnings", [])
     if any(flag(p.get("concept")) for p in body.clubPlayers):
-        warnings.append("İçe aktarılan konsept fiyatları kullanılmadı; seçili sezonun veritabanından güncel adaylar alındı.")
+        warnings.append("Imported concept prices were excluded. Current candidates came from the selected season’s catalog.")
     if coverage is not None:
         diagnostics["conceptCoverage"] = best_coverage if best else coverage
         diagnostics["largestConceptPool"] = coverage
@@ -92,18 +92,18 @@ def plan(body, catalog, progress=None):
         metadata_missing = any(excluded.get(key, 0) for key in ("unknownRarityGroups", "unsupportedChemistryProfile"))
         incomplete = not chosen_coverage.get("complete", False) or not chosen_coverage.get("catalogComplete", True)
         if incomplete or metadata_missing:
-            warnings.append("Konsept araması kademeli bir havuzla sınırlı; tüm piyasadaki en ucuz kadro olduğu kanıtlanmadı.")
+            warnings.append("Concept search covers the evaluated player pool. The lowest price across the entire market is not proven.")
             if result.get("status_code") == 4:
                 result.update(status_code=2, status_key="FEASIBLE_POOL", status="Feasible squad in the evaluated market pool")
             elif result.get("status_code") == 3:
                 result.update(status_code=0, status_key="POOL_INCOMPLETE", status="No squad found in the evaluated market pool; increase solve time or adjust filters")
         if metadata_missing:
-            warnings.append("Bazı piyasa kartlarının gerekli kimya/kart grubu bilgisi eksik; bu kartlar aramaya alınamadı.")
+            warnings.append("Some market cards were excluded because required chemistry or rarity-group information is missing.")
             if not best and result.get("status_key") in ("INFEASIBLE", "POOL_INCOMPLETE"):
                 result.update(status_code=0, status_key="UNKNOWN_METADATA", status="Some market cards lack required chemistry or rarity-group metadata; infeasibility is not proven")
     database = catalog.status()
     if policy.get("allowConcept") and not database.get("readyForConcepts", database.get("pricedCount", 0) > 0):
-        warnings.append(f"FC {catalog.game_year} / {catalog.platform}: kullanılabilir güncel piyasa fiyatı yok. Satın alınacak kart önerilmedi.")
+        warnings.append(f"FC {catalog.game_year} / {catalog.platform}: no usable current market prices. No purchase recommendations were made.")
         if not best:
             result.update(status_code=0, status_key="MARKET_UNAVAILABLE", status="Selected season/platform has no usable market quotes; refresh the database or solve with owned cards")
     result["conceptCandidates"] = best_proof

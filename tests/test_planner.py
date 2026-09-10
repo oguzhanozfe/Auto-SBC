@@ -77,7 +77,7 @@ def test_imported_concepts_are_replaced_by_server_catalog_quotes():
     body['solverPolicy'] = {'allowConcept': True}
     result = planner.plan(SolveRequest(**body), MarketFixture(cards))
     assert result['summary']['purchaseCost'] == 4400
-    assert any('İçe aktarılan' in text for text in result['diagnostics']['warnings'])
+    assert any('Imported concept' in text for text in result['diagnostics']['warnings'])
 
 
 def test_partial_pool_never_claims_market_optimal_or_global_infeasible():

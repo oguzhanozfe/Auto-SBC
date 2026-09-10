@@ -138,11 +138,11 @@ def plan_live(body, catalog, owned, policy, sbc, progress=None):
     diagnostics.update(conceptCoverage=coverage, largestConceptPool=coverage,
                        optimalityScope=coverage["optimalityScope"], elapsedSeconds=round(time.monotonic() - start, 2))
     warnings = diagnostics.setdefault("warnings", [])
-    warnings.append("Canlı EA fiyatları yalnızca okunan arama sayfalarındaki ilanları kapsar; tüm piyasadaki en ucuz kadro olduğu kanıtlanmadı. Satın alma yapılmadı.")
+    warnings.append("Live EA quotes cover only the observed search results. The lowest price across the entire market is not proven. No players were purchased.")
     if coverage["unknownDefinitionIds"]:
-        warnings.append(f"{len(coverage['unknownDefinitionIds'])} canlı fiyatın kart tanımı yerel katalogda eksik; fiyat veya oyuncu bilgisi tahmin edilmedi.")
+        warnings.append(f"{len(coverage['unknownDefinitionIds'])} live quotes have no matching card definition in the local catalog. Missing prices or player details were not guessed.")
     if any(flag(row.get("concept")) for row in body.clubPlayers):
-        warnings.append("İçe aktarılan konseptler kullanılmadı; bu çözüm yalnızca gönderilen canlı EA ilan fiyatlarını kullanır.")
+        warnings.append("Imported concepts were excluded. This solution uses only the supplied live EA listing prices.")
     proof = {identifier(row["definitionId"]): row for row in pool["players"]}
     selected = [row for row in result.get("solution", []) if flag(row.get("concept"))]
     result["conceptCandidates"] = [deepcopy(proof[identifier(row["definitionId"])]) for row in selected]

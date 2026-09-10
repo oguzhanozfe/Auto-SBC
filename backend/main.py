@@ -1,12 +1,14 @@
-"""Local Auto-SBC service. Club data stays in memory and EA submits stay manual."""
+"""Auto-SBC service. Club data stays in memory; the browser controls EA actions."""
 from __future__ import annotations
 
 import json
+import io
 import logging
 import os
 import re
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Literal
@@ -22,8 +24,8 @@ from . import logger, setup, planner
 from .catalog import Catalog
 from .live_market import LiveMarket
 
-VERSION = "27.0.0-preview"
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 EA_ORIGINS = {"https://www.ea.com", "https://www.easports.com"}
 LOCAL_ORIGINS = {"http://127.0.0.1:8000", "http://localhost:8000"}
 MAX_BODY_BYTES = 24 * 1024 * 1024
@@ -119,7 +121,7 @@ def create_app(data_dir=None):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store"
-        if request.url.path == "/":
+        if request.url.path in {"/", "/privacy"}:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -129,6 +131,29 @@ def create_app(data_dir=None):
     @app.get("/")
     def dashboard():
         return FileResponse(ROOT / "backend/static/index.html")
+
+    @app.get("/privacy")
+    def privacy():
+        return FileResponse(ROOT / "backend/static/privacy.html")
+
+    @app.get("/download/chrome-extension")
+    def download_extension():
+        directory = ROOT / "dist/chrome-extension"
+        names = ("manifest.json", "companion.js", "bridge.js", "worker.js", "LICENSE")
+        if any(not (directory / name).is_file() for name in names):
+            raise HTTPException(404, "The Chrome extension has not been built. Run node frontend/build.mjs first.")
+        try:
+            built_version = json.loads((directory / "manifest.json").read_text())["version"]
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(409, "The extension manifest is unreadable. Rebuild the browser extension.")
+        if built_version != VERSION:
+            raise HTTPException(409, "The extension build does not match Studio. Run node frontend/build.mjs to update it.")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name in names:
+                archive.write(directory / name, f"Auto-SBC-Chrome/{name}")
+        return Response(buffer.getvalue(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="Auto-SBC-Chrome-{VERSION}.zip"'})
 
     @app.get("/static/{filename}")
     def static_file(filename: str):

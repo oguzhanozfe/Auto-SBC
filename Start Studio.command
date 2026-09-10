@@ -11,7 +11,7 @@ elif [ -x "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python
 elif command -v python3 >/dev/null 2>&1; then
   studio_python=$(command -v python3)
 else
-  echo 'Python 3.12 veya daha yenisi bulunamadı. Python’u kurup yeniden açın.'
+  echo 'Python 3.12 or newer was not found. Install Python and try again.'
   exit 1
 fi
 exec "$studio_python" "$studio_dir/scripts/start_studio.py" "$@"

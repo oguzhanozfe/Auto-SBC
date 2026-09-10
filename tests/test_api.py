@@ -108,7 +108,7 @@ def test_dashboard_and_empty_catalog(client):
     response = client.get('/')
     assert response.status_code == 200
     assert 'frame-ancestors' in response.headers['content-security-policy']
-    assert 'Her karta doğru yer' in response.text
+    assert 'Build your next SBC.' in response.text
     assert client.get('/static/app.js').status_code == 200
     assert client.get('/static/missing.js').status_code == 404
     assert client.get('/api/players?limit=1000').json()['players'] == []
@@ -197,3 +197,30 @@ def test_empty_club_waits_for_selected_market_prices(client):
     assert data['solution'] == []
     assert data['database']['gameYear'] == 27
     assert data['shoppingList'] == []
+
+
+def test_extension_download_contains_only_built_browser_files(client, tmp_path, monkeypatch):
+    import io
+    import zipfile
+    from backend import main
+
+    monkeypatch.setattr(main, 'ROOT', tmp_path)
+    assert client.get('/download/chrome-extension').status_code == 404
+    directory = tmp_path / 'dist/chrome-extension'
+    directory.mkdir(parents=True)
+    names = {'manifest.json', 'companion.js', 'bridge.js', 'worker.js', 'LICENSE'}
+    for name in names:
+        (directory / name).write_text('built fixture')
+    assert client.get('/download/chrome-extension').status_code == 409
+    (directory / 'manifest.json').write_text(json.dumps({'version': '0.0.1'}))
+    assert client.get('/download/chrome-extension').status_code == 409
+    (directory / 'manifest.json').write_text(json.dumps({'version': main.VERSION}))
+    (directory / 'club-export.json').write_text('private fixture: never distribute')
+    response = client.get('/download/chrome-extension')
+    assert response.status_code == 200
+    assert response.headers['content-type'] == 'application/zip'
+    assert f'Auto-SBC-Chrome-{main.VERSION}.zip' in response.headers['content-disposition']
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {f'Auto-SBC-Chrome/{name}' for name in names}
+        assert json.loads(archive.read('Auto-SBC-Chrome/manifest.json'))['version'] == main.VERSION
+        assert all(archive.read(name) == b'built fixture' for name in archive.namelist() if not name.endswith('manifest.json'))

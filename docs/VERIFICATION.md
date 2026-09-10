@@ -87,8 +87,8 @@ was sent to My Packs were verified. The pack remained unopened and the coin
 balance remained 577,251.
 
 Two 91-rated parts of the 98+ FOF/FUTTIES Pick subsequently completed through
-Auto-SBC solve/Apply followed by native submission. The current five-group task
-therefore stands at **1/5 groups and 3/17 segments**: 10x 85+ is complete and the
+Auto-SBC solve/Apply followed by native submission. At that point, the five-group task
+stood at **1/5 groups and 3/17 segments**: 10x 85+ is complete and the
 pick has 2/7 parts complete. Its other five parts, Yan Diomande, Provisions, and
 Ultimate Rewind remain pending. These completions predate the new batch runner.
 The successful storage-containing save is evidence for that run, not proof that
@@ -187,7 +187,7 @@ part, persistence failures and prevention of duplicate submission. Final counts
 are recorded in the release report. On 10 September, the live batch started set
 1420 / challenge 4116, then stopped on EA 429 while redundantly rereading the set
 list before solving. The exported journal contains no save or submit receipts.
-The current live task count stays at 1/5 groups and 3/17 segments.
+After that first attempt, the task count remained at 1/5 groups and 3/17 segments.
 
 ## Daily automation and read pacing (27.0.6; live test pending)
 
@@ -213,7 +213,7 @@ The native SBC list then showed 3/7 parts, up from 2/7; balance stayed 577,251.
 All eleven selected cards passed the zero-games gate. The immediate post-submit
 list refresh returned EA 521, so the queue stopped with claim verification
 uncertain and displayed zero fully reconciled parts. The actual task total is
-1/5 groups and 4/17 parts. Read-only journal reconciliation is being added; the
+1/5 groups and 4/17 parts. Read-only journal reconciliation was not yet available in that build; the
 successful submission must not be repeated.
 
 ## Known limitations
@@ -264,3 +264,44 @@ All 221 browser tests passed, including finite daily rights, cancellation, exact
 receipt/counter reconciliation, persistence failures and repeatable queue removal.
 The generated extension passed syntax validation. The unchanged backend was
 previously validated with 176 tests; current commit CI is recorded separately.
+
+## Automatic account run and English beta (10 September 2026)
+
+Version 27.0.6 automatically saved and submitted challenge 4116 of the 98+
+FOF/FUTTIES pick. Its exact EA award receipt was successful, but the following
+set-list read returned 521. The 27.0.7 read-only reconciliation verified the
+completion counter without resubmitting that squad.
+
+The following 27.0.7 queue run completed eight more parts with matching native
+submission receipts and fresh completion counters:
+
+| Set | Completed challenge IDs | Group result |
+| --- | --- | --- |
+| 98+ FOF/FUTTIES T1–T4 Pick (1420) | 4117, 4118, 4121, 4122 | Complete |
+| Yan Diomandé (1427) | 4148, 4149, 4150, 4151 | 4/7 parts complete |
+
+A set-list 429 during the transition used the bounded read retry successfully.
+The next Yan Diomandé part, 4152, had a confirmed save followed by a returned 409
+from native submit. It has no successful submission receipt and is not counted.
+That extension version did not preserve detailed item violations, so the exact
+409 cause is unknown. The queue stopped without retrying the write.
+
+Across these runs, **nine parts completed fully automatically**. Including the
+three earlier solve/Apply plus native-submit parts, the selected five-set test is
+**2/5 sets and 12/17 parts**. Coin balance remained **577,251**, all automatic
+receipts recorded zero-game checks, and no packs or player picks were opened.
+The new daily preset has not yet completed its account-level validation.
+
+Version 27.0.9 makes the companion, dashboard and launcher English, adds an
+in-panel report viewer, and retains only bounded, validated saved-squad conflict
+names and physical IDs when EA provides those details. A bare 409 is not labeled
+as a saved-squad conflict. `VERSION` is shared by the service, launcher and build.
+The English dashboard was inspected in a real browser; regression tests use
+synthetic fixtures and do not replace live validation.
+
+FC 27 public price snapshots were refreshed again on 10 September at
+00:17:46 UTC (console) and 00:17:52 UTC (PC). Both fetched successfully but still
+contained zero usable/fresh prices. Their provider publication timestamp remained
+3 September, 08:58:19 UTC. The UI correctly reports `awaiting_market_prices`;
+fresh retrieval does not make that provider snapshot current. This price-only
+check did not scan more catalog pages or access an EA account.

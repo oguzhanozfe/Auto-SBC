@@ -1,4 +1,4 @@
-/* Auto-SBC Local. EA adapter adapted from TitiroMonkey's MIT Auto-SBC.
+/* Auto-SBC Studio. EA adapter adapted from TitiroMonkey's MIT Auto-SBC.
  * Single previews save only. Explicit finite batch runs may submit owned squads;
  * neither mode purchases players, opens packs, or chooses player-pick rewards.
  */
@@ -51,6 +51,28 @@
     }).finally(() => clearTimeout(timer));
   }
 
+  function itemViolations(value) {
+    // EA submit failures expose data.itemViolations as saved-squad names and
+    // item IDs. These are diagnostic bounds, not EA protocol constants.
+    if (!Array.isArray(value) || !value.length || value.length > 30) return null;
+    const allIds = new Set(), rows = [];
+    for (const row of value) {
+      if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.name !== 'string' || row.name.length > 120 ||
+          !Array.isArray(row.itemIds) || !row.itemIds.length || row.itemIds.length > 32) return null;
+      const name = row.name.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g,'').trim();
+      if (!name) return null;
+      const ids = new Set();
+      for (const raw of row.itemIds) {
+        if (typeof raw !== 'number' && !(typeof raw === 'string' && /^\d{1,16}$/.test(raw))) return null;
+        const id = Number(raw);
+        if (!Number.isSafeInteger(id) || id <= 0) return null;
+        ids.add(id); allIds.add(id);
+        if (allIds.size > 330) return null;
+      }
+      rows.push({name,itemIds:[...ids]});
+    }
+    return rows;
+  }
   function observe(request, label) {
     return new Promise((resolve, reject) => {
       if (!request || typeof request.observe !== 'function') { reject(new Error(`${label}: EA adapter unavailable.`)); return; }
@@ -65,6 +87,12 @@
           const error = new Error(`${label}: EA returned ${statusCode || 'an error'}${code !== undefined ? ` (${code})` : ''}.`);
           if (statusCode !== undefined) error.status = statusCode;
           if (code !== undefined) error.code = code;
+          const conflicts = itemViolations(result?.data?.itemViolations);
+          if (conflicts) {
+            error.itemViolations = conflicts;
+            const names = conflicts.slice(0,5).map(row => row.name).join(', ');
+            error.message += ` EA reports cards assigned to saved squads: ${names}${conflicts.length > 5 ? ` and ${conflicts.length - 5} more` : ''}. Remove the listed cards from those saved squads in EA. Review the run report before starting another queue.`;
+          }
           if (typeof result?.retryAfter === 'number' && Number.isFinite(result.retryAfter) && result.retryAfter > 0) error.retryAfterSeconds = result.retryAfter;
           error.operation = label; reject(error); return;
         }
@@ -92,10 +120,15 @@
     if (!context) return;
     const current = activeChallengeContext();
     if (!current || String(current.setId) !== String(context.setId) || String(current.challengeId) !== String(context.challengeId)) {
-      throw new Error('SBC ekranı değişti. Eski görevin çözümü uygulanmadı; açık görev için yeniden çözün.');
+      throw new Error('The SBC screen changed. Solve the current challenge again before applying.');
     }
   }
-  async function pages(storage) {
+  function physicalId(value) {
+    return (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value)) &&
+      Number.isSafeInteger(Number(value)) && Number(value) > 0 ? String(value) : null;
+  }
+  async function pages(storage, guard) {
+    guard();
     if (!storage) {
       // The upstream EA adapter refreshes club statistics before every inventory
       // traversal. Otherwise a second traversal can return the already cached
@@ -104,46 +137,106 @@
         throw new Error('Club cache refresh: EA adapter unavailable. Nothing was applied.');
       }
       services.Club.clubDao.resetStatsCache();
-      const refreshed = services.Club.getStats();
-      if (refreshed && typeof refreshed.observe === 'function') await observe(refreshed, 'Refresh club statistics');
+      await observe(services.Club.getStats(), 'Refresh club statistics'); guard();
     }
     const found = new Map();
     for (let offset = 0, page = 0; page < 500; page++, offset += 91) {
+      guard();
       const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
       criteria.count = 91; criteria.offset = offset;
       const response = await observe(storage ? services.Item.searchStorageItems(criteria) : services.Club.search(criteria), storage ? 'SBC storage' : 'Club players');
-      if (!Array.isArray(response.items)) throw new Error('EA player response format changed.');
+      guard();
+      if (!Array.isArray(response.items) || ['retrievedAll','endOfList'].some(key => response[key] !== undefined && typeof response[key] !== 'boolean')) throw new Error('EA player response format changed.');
       const before = found.size;
-      response.items.forEach(item => { if (item?.id && (!item.isPlayer || item.isPlayer())) found.set(String(item.id), item); });
-      status(`Kulüp okunuyor: ${found.size} ${storage ? 'depo' : 'kulüp'} kartı`);
-      if (response.retrievedAll || response.endOfList || response.items.length === 0) return [...found.values()];
+      for (const item of response.items) {
+        if (typeof item?.isPlayer !== 'function') throw new Error('EA inventory item type is unreadable.');
+        if (!item.isPlayer()) continue;
+        if (!physicalId(item.id) || item.concept !== false) throw new Error('EA inventory ownership is unreadable.');
+        found.set(physicalId(item.id),item);
+      }
+      status(`Reading inventory: ${found.size} ${storage ? 'storage' : 'club'} cards`);
+      if (response.retrievedAll === true || response.endOfList === true || response.items.length === 0) return [...found.values()];
       if (before === found.size) throw new Error(`EA pagination stopped advancing. ${storage ? 'SBC storage' : 'Club players'}: offset=${offset}, rows=${response.items.length}, unique=${found.size}, retrievedAll=${response.retrievedAll ?? 'missing'}, endOfList=${response.endOfList ?? 'missing'}. Refresh the Web App and try again.`);
     }
     throw new Error('Club pagination limit reached.');
   }
-  async function inventory() {
-    // Sequential to avoid competing EA service/cache operations.
-    const club = await pages(false);
-    const storage = await pages(true);
-    const unassigned = await observe(services.Item.requestUnassignedItems(), 'Unassigned items');
-    const duplicates = new Set((unassigned.items || []).filter(item => item.duplicateId > 0).map(item => String(item.duplicateId)));
+  function inventoryGuard() {
+    const version = state.cancel, selected = scope();
+    return () => {
+      const current = scope();
+      if (state.cancel !== version || current.gameYear !== selected.gameYear || current.platform !== selected.platform) throw new Error('Inventory refresh cancelled or the game edition changed.');
+      assertNativeContext(state.nativeActive);
+    };
+  }
+  async function freshOwnership(guard) {
+    guard();
+    const itemRepo = typeof repositories !== 'undefined' ? repositories.Item : null;
+    if (typeof itemRepo?.getClub !== 'function' || typeof itemRepo?.setDirty !== 'function' ||
+        typeof ItemPile === 'undefined' || ItemPile.STORAGE === undefined ||
+        typeof services.Club.clubDao?.resetStatsCache !== 'function' || typeof services.Club.getStats !== 'function' ||
+        typeof services.Club.search !== 'function' || typeof services.Item.searchStorageItems !== 'function') throw new Error('Fresh club and storage reads are unavailable. No stale inventory will be used.');
+    const clubRepo = itemRepo.getClub();
+    if (typeof clubRepo?.reset !== 'function') throw new Error('Fresh club cache reset is unavailable.');
+    // Both operations invalidate local caches; they do not change the account.
+    clubRepo.reset();
+    const club = await pages(false,guard); guard();
+    itemRepo.setDirty(ItemPile.STORAGE);
+    const storage = await pages(true,guard); guard();
     const storageIds = new Set(storage.map(item => String(item.id)));
-    const unique = new Map([...club, ...storage].map(item => [String(item.id), item]));
+    const unique = new Map(), proof = [];
+    for (const [source,items] of [['club',club],['storage',storage]]) for (const item of items) {
+      const id = physicalId(item.id);
+      if (unique.has(id)) throw new Error('The same item appeared in both club and storage. Ownership could not be verified.');
+      unique.set(id,item); proof.push(Object.freeze({id,source,concept:false,isPlayer:true}));
+    }
+    // Squad hydration can repopulate the item repository from saved references.
+    // Freeze the physical ownership proof before making any squad-list request.
+    const ownership = Object.freeze({cacheReset:true,clubComplete:true,storageComplete:true,
+      items:Object.freeze(proof),observedAt:new Date().toISOString()});
+    return {items:[...unique.values()],storageIds,ownership};
+  }
+  function savedSquadAdapter() {
     const squadService = services.Squad;
-    if (!squadService || typeof squadService.requestSquadList !== 'function' ||
-        typeof squadService.getActiveSquadId !== 'function' || typeof squadService.requestSquadById !== 'function') {
-      throw new Error('Aktif kadro okunamıyor. Kadronuzdaki oyuncuları korumak için işlem durduruldu.');
+    if (!squadService || typeof squadService.resetSquadsCache !== 'function' ||
+        typeof squadService.requestSquadList !== 'function' || typeof squadService.requestSquadById !== 'function') {
+      throw new Error('Cannot read all saved squads. Stopped to protect their players.');
     }
-    await observe(squadService.requestSquadList(), 'Active squad list');
-    const activeId = squadService.getActiveSquadId();
-    if (activeId == null || String(activeId).trim() === '') throw new Error('Aktif kadro kimliği okunamadı. İşlem durduruldu.');
-    const active = await observe(squadService.requestSquadById(activeId), 'Active squad players');
-    const slots = active.squad?._players;
-    if (!Array.isArray(slots) || slots.some(slot => !slot?._item || slot._item.id == null)) {
-      throw new Error('Aktif kadro oyuncuları okunamadı. İşlem durduruldu.');
+    return squadService;
+  }
+  async function savedSquadLocks(guard) {
+    guard(); const squadService = savedSquadAdapter();
+    squadService.resetSquadsCache();
+    const listed = await observe(squadService.requestSquadList(),'Saved squad list'); guard();
+    if (!Array.isArray(listed.squads) || !listed.squads.length || !physicalId(listed.activeSquadId)) throw new Error('Cannot read the complete saved squad list.');
+    const ids = listed.squads.map(squad => typeof squad?.getId === 'function' ? physicalId(squad.getId()) : null);
+    if (ids.some(id => !id) || new Set(ids).size !== ids.length || !ids.includes(physicalId(listed.activeSquadId))) throw new Error('Saved squad identities or the active squad are missing.');
+    const locked = new Set();
+    for (const id of ids) {
+      guard(); const response = await observe(squadService.requestSquadById(Number(id)),`Saved squad ${id}`); guard();
+      const squad = response.squad;
+      if (typeof squad?.getId !== 'function' || physicalId(squad.getId()) !== id || typeof squad.getPlayers !== 'function') throw new Error('Cannot read saved squad players or match the squad identity.');
+      const slots = squad.getPlayers();
+      // EA models contain 23 player slots, including bench and reserves. The
+      // native factory fills empty slots; this checks its reported model shape.
+      if (!Array.isArray(slots) || slots.length !== 23) throw new Error('Cannot read the full saved squad roster.');
+      for (const slot of slots) {
+        if (typeof slot?.getItem !== 'function') throw new Error('Cannot read a saved squad slot.');
+        const item = slot.getItem();
+        if (!item || item.id == null || !physicalId(item.id) && item.id !== 0 && item.id !== '0') throw new Error('Cannot read a saved squad item ID.');
+        if (physicalId(item.id)) locked.add(physicalId(item.id));
+      }
     }
-    const activeSquadIds = new Set(slots.map(slot => String(slot._item.id)).filter(id => id !== '0' && id !== ''));
-    return { items: [...unique.values()], storageIds, duplicates, activeSquadIds };
+    return locked;
+  }
+  async function inventory(guard = inventoryGuard()) {
+    // Sequential reads avoid competing EA service/cache operations.
+    guard(); savedSquadAdapter();
+    const owned = await freshOwnership(guard); guard();
+    const unassigned = await observe(services.Item.requestUnassignedItems(), 'Unassigned items'); guard();
+    if (!Array.isArray(unassigned.items)) throw new Error('Cannot read unassigned items.');
+    const duplicates = new Set(unassigned.items.filter(item => item.duplicateId > 0).map(item => String(item.duplicateId)));
+    const activeSquadIds = await savedSquadLocks(guard); guard();
+    return {...owned,duplicates,activeSquadIds};
   }
   function athleteId(item) {
     // EA databaseId is the athlete ID (definitionId & ItemIdMask.DATABASE).
@@ -207,19 +300,19 @@
     return util;
   }
   async function liveMarketQuotes(selectedScope, currentPolicy, pale, assertCurrent) {
-    if (!currentPolicy.allowConcept || currentPolicy.onlyStorage) throw new Error('Anlık piyasa için konseptleri açın ve yalnızca depo seçeneğini kapatın.');
+    if (!currentPolicy.allowConcept || currentPolicy.onlyStorage) throw new Error('Enable concept players and turn off storage-only mode to use live market prices.');
     if (typeof UTSearchCriteriaDTO === 'undefined' || typeof ItemSearchFeature === 'undefined' || typeof ItemType === 'undefined' ||
         typeof SearchLevel === 'undefined' || typeof ItemRatingTier === 'undefined' ||
         typeof services.Item.searchTransferMarket !== 'function' || typeof services.Item.clearTransferMarketCache !== 'function') {
-      throw new Error('EA anlık piyasa araması henüz hazır değil.');
+      throw new Error('EA live market search is not ready.');
     }
     const quality = ui.marketQuality.value, qualityKey = quality.toUpperCase();
-    if (!['bronze','silver','gold'].includes(quality) || SearchLevel[qualityKey] === undefined || ItemRatingTier[qualityKey] === undefined) throw new Error('Piyasa kart kalitesini seçin.');
+    if (!['bronze','silver','gold'].includes(quality) || SearchLevel[qualityKey] === undefined || ItemRatingTier[qualityKey] === undefined) throw new Error('Select a market card quality.');
     const requestedCeiling = Number(ui.marketCeiling.value);
-    if (!Number.isSafeInteger(requestedCeiling) || requestedCeiling < 1 || requestedCeiling > 15000000) throw new Error('Anlık arama fiyat tavanı 1–15.000.000 arasında tam sayı olmalı.');
+    if (!Number.isSafeInteger(requestedCeiling) || requestedCeiling < 1 || requestedCeiling > 15000000) throw new Error('Live search price ceiling must be a whole number from 1 to 15,000,000.');
     const limits = [currentPolicy.maxPlayerPrice,currentPolicy.maxPurchasePrice,currentPolicy.maxTotalPrice].filter(value => value > 0);
     const ceiling = Math.min(requestedCeiling,...limits);
-    if (!Number.isSafeInteger(ceiling) || ceiling < 1) throw new Error('Piyasa fiyat limiti pozitif bir tam sayı olmalı.');
+    if (!Number.isSafeInteger(ceiling) || ceiling < 1) throw new Error('Market price limit must be a positive whole number.');
     const thresholds = [...new Set([150,200,250,300,400,600,1000,1500,ceiling].filter(value => value <= ceiling))].sort((a,b)=>a-b);
     let pagesRead = 0, observedAt = null, searchedMaxBuy = 0;
     const quotes = new Map();
@@ -238,11 +331,11 @@
         model.updateSearchCriteria(criteria);
         const query = model.searchCriteria;
         query.disableOverrides = true; // Paletools' documented read-only lookup path.
-        status(`EA anlık piyasa: ${quality} · en fazla ${maxBuy.toLocaleString()} coin · arama ${pagesRead + 1}/9`);
-        const response = await observe(services.Item.searchTransferMarket(query, page), 'EA anlık piyasa');
+        status(`EA live market: ${quality} · up to ${maxBuy.toLocaleString()} coins · search ${pagesRead + 1}/9`);
+        const response = await observe(services.Item.searchTransferMarket(query, page), 'EA live market');
         const receivedAt = new Date().toISOString();
         pagesRead++; searchedMaxBuy = maxBuy; assertCurrent();
-        if (!Array.isArray(response.items)) throw new Error('EA piyasa yanıtı okunamadı.');
+        if (!Array.isArray(response.items)) throw new Error('Cannot read the EA market response.');
         for (const item of response.items) {
           if (typeof item?.getTier !== 'function' || item.getTier() !== ItemRatingTier[qualityKey] || typeof item.getAuctionData !== 'function') continue;
           const auction = item.getAuctionData();
@@ -269,7 +362,7 @@
       }
       if (pagesRead >= 9) break;
     }
-    if (!quotes.size) throw new Error('Taranan EA ilanlarında politikaya uygun fiyatlı kart bulunamadı. Fiyat limiti veya kart kalitesini değiştirin.');
+    if (!quotes.size) throw new Error('No eligible cards were found in the EA listings searched. Adjust the price limit or card quality.');
     return {...selectedScope,observedAt,quality,searchMaxBuy:searchedMaxBuy,pagesRead,quotes:[...quotes.values()]};
   }
   async function challengeData(challenge, set) {
@@ -328,7 +421,7 @@
   async function action(callback) {
     if (state.busy) return;
     state.busy = true;
-    [ui.refresh,ui.solve,ui.liveSolve,ui.apply,ui.batchAdd,ui.batchStart,ui.batchClear,ui.batchReconcile,ui.dailyPlan,ui.dailyStart].filter(Boolean).forEach(button => { button.disabled = true; });
+    [ui.refresh,ui.solve,ui.liveSolve,ui.apply,ui.batchAdd,ui.batchStart,ui.batchClear,ui.batchReconcile,ui.batchReplan,ui.dailyPlan,ui.dailyStart].filter(Boolean).forEach(button => { button.disabled = true; });
     try { await callback(); } catch (error) { fail(error); }
     finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.liveSolve.disabled = false; ui.apply.disabled = !state.preview; renderBatch(); renderDaily(); }
   }
@@ -336,14 +429,14 @@
   function scope(required = true) {
     const value = { gameYear: Number(ui.season.value), platform: ui.platform.value };
     if (![26,27].includes(value.gameYear) || !['ps5','pc'].includes(value.platform)) {
-      if (required) throw new Error('Önce oynadığınız sezonu ve fiyat platformunu seçin.');
+      if (required) throw new Error('Select your game edition and market platform first.');
       return null;
     }
     localStorage.setItem(SCOPE_STORAGE, JSON.stringify(value));
     return value;
   }
   async function health() {
-    ui.health.textContent = 'Yerel sunucu kontrol ediliyor…';
+    ui.health.textContent = 'Checking the local server…';
     try {
       const selected = scope(false);
       const result = await http('/health' + (selected ? `?gameYear=${selected.gameYear}&platform=${selected.platform}` : ''));
@@ -351,14 +444,14 @@
       if (`${selected?.gameYear}:${selected?.platform}` !== `${currentScope?.gameYear}:${currentScope?.platform}`) return result;
       state.backendScope = result.status === 'ok' && selected ? `${selected.gameYear}:${selected.platform}` : null;
       const db = result.database || {};
-      ui.health.textContent = selected ? `Sunucu bağlı · FC ${selected.gameYear} / ${selected.platform.toUpperCase()} · ${db.count ?? '?'} kart · ${db.pricedCount ?? '?'} piyasa fiyatı${result.solverBusy ? ' · çözücü meşgul' : ''}` : 'Sunucu bağlı. Sezon ve platform seçimini yapın.';
-      if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} için FUT.GG fiyatları henüz hazır değil. Veri tabanı modunda fiyatlı konsept önerilmez; Anlık piyasadan çöz açık EA ilanlarını ayrı arar. Diğer sezonun fiyatları kullanılmaz.`;
-      else ui.marketNotice.textContent = selected ? `Fiyatlar yalnızca FC ${selected.gameYear} / ${selected.platform.toUpperCase()} kaynağından alınır.` : '';
+      ui.health.textContent = selected ? `Server connected · FC ${selected.gameYear} / ${selected.platform.toUpperCase()} · ${db.count ?? '?'} cards · ${db.pricedCount ?? '?'} market prices${result.solverBusy ? ' · solver busy' : ''}` : 'Server connected. Select your game edition and platform.';
+      if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} FUT.GG prices are not available yet. Database mode cannot suggest priced concepts. Solve with live prices searches current EA listings separately. Prices from other editions are excluded.`;
+      else ui.marketNotice.textContent = selected ? `Prices are specific to FC ${selected.gameYear} / ${selected.platform.toUpperCase()}.` : '';
       return result;
-    } catch (error) { state.backendScope = null; ui.health.textContent = 'Yerel sunucuya bağlanılamadı'; throw error; }
+    } catch (error) { state.backendScope = null; ui.health.textContent = 'Cannot connect to the local server'; throw error; }
   }
   async function loadSets() {
-    if (!ready()) throw new Error('EA Web App hesabına giriş yapıp kulüp ekranının yüklenmesini bekleyin.');
+    if (!ready()) throw new Error('Sign in to the EA Web App and wait for your club to load.');
     invalidate();
     const data = await observe(services.SBC.requestSets(), 'SBC sets');
     state.sets = (data.sets || []).filter(set => typeof set.isComplete !== 'function' || !set.isComplete());
@@ -372,17 +465,17 @@
     const data = await observe(services.SBC.requestChallengesForSet(set), 'SBC challenges');
     state.challenges = (data.challenges || []).filter(challenge => challenge.status !== 'COMPLETED');
     options(ui.challenge, state.challenges);
-    status(`${state.challenges.length} görev hazır. Kart politikalarını kontrol edip çözebilirsiniz.`);
+    status(`${state.challenges.length} challenges ready. Review your card rules, then solve.`);
   }
   async function solve(nativeContext = null, liveMode = false) {
     invalidate();
     state.nativeActive = nativeContext;
     const version = state.cancel;
-    if (!ready()) throw new Error('EA Web App henüz hazır değil.');
+    if (!ready()) throw new Error('The EA Web App is not ready yet.');
     const selectedScope = scope();
     if (typeof APP_YEAR !== 'undefined') {
       const detectedYear = Number(String(APP_YEAR).slice(-2));
-      if ([26,27].includes(detectedYear) && detectedYear !== selectedScope.gameYear) throw new Error(`EA Web App FC ${detectedYear} bildiriyor. Sezon seçimini düzeltin.`);
+      if ([26,27].includes(detectedYear) && detectedYear !== selectedScope.gameYear) throw new Error(`The EA Web App reports FC ${detectedYear}. Update your game edition selection.`);
     }
     await health();
     assertNativeContext(nativeContext);
@@ -391,7 +484,7 @@
       assertNativeContext(nativeContext);
       state.sets = data.sets || [];
       const selectedSet = state.sets.find(set => String(set.id) === String(nativeContext.setId));
-      if (!selectedSet) throw new Error('Açık SBC seti artık bulunamıyor. EA ekranını yenileyin.');
+      if (!selectedSet) throw new Error('The current SBC set is no longer available. Refresh the EA screen.');
       options(ui.set, state.sets); ui.set.value = selectedSet.id;
       const challenges = await observe(services.SBC.requestChallengesForSet(selectedSet), 'Current SBC challenge');
       assertNativeContext(nativeContext);
@@ -402,10 +495,13 @@
     if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
     const set = state.sets.find(set => String(set.id) === ui.set.value);
     const challenge = state.challenges.find(challenge => String(challenge.id) === ui.challenge.value);
-    if (!set || !challenge) throw new Error('Önce SBC listesini yükleyip bir görev seçin.');
+    if (!set || !challenge) throw new Error('Load SBCs and select a challenge first.');
     const sbcData = await challengeData(challenge, set);
     assertNativeContext(nativeContext);
-    const inv = await inventory(), chem = chemistry();
+    const inv = await inventory(() => {
+      if (version !== state.cancel) throw new Error('Solve cancelled during inventory refresh.');
+      assertNativeContext(nativeContext);
+    }), chem = chemistry();
     assertNativeContext(nativeContext);
     currentPolicy.lockedItemIds = [...new Set([...currentPolicy.lockedItemIds, ...inv.activeSquadIds])];
     let players = inv.items.map(item => card(item, inv, chem));
@@ -418,58 +514,58 @@
     }
     players = players.filter(player => !P.blockedReason(player, currentPolicy, pale));
     const present = new Set(players.map(player => String(player.id)));
-    for (const required of currentPolicy.requiredItemIds) if (!present.has(String(required))) throw new Error(`Must-use kart ${required} mevcut değil veya korunuyor.`);
+    for (const required of currentPolicy.requiredItemIds) if (!present.has(String(required))) throw new Error(`Required card ${required} is unavailable or protected.`);
     // Send explicit Paletools locks too; duplicate preference never overrides locks.
     currentPolicy.lockedDefinitionIds = [...new Set([...currentPolicy.lockedDefinitionIds, ...pale.definitionIds.filter(value => /^\d+$/.test(value))])];
     Object.assign(currentPolicy, { lockedNationIds: pale.nationIds, lockedTeamIds: pale.teamIds,
       lockedLeagueIds: pale.leagueIds, lockedRarityIds: pale.rarityIds });
     const maxSolveTime = Number(ui.time.value);
-    if (!Number.isFinite(maxSolveTime) || maxSolveTime < 1 || maxSolveTime > 120) throw new Error('Çözüm süresi 1–120 saniye olmalı.');
+    if (!Number.isFinite(maxSolveTime) || maxSolveTime < 1 || maxSolveTime > 120) throw new Error('Solve time must be between 1 and 120 seconds.');
     state.input = { clubPlayers: players, sbcData, maxSolveTime, solverPolicy: currentPolicy, ...selectedScope };
     if (liveMode) state.input.liveMarket = await liveMarketQuotes(selectedScope,currentPolicy,pale,() => {
-      if (version !== state.cancel) throw new Error('Piyasa araması iptal edildi.');
+      if (version !== state.cancel) throw new Error('Market search cancelled.');
       assertNativeContext(nativeContext);
     });
     ui.export.disabled = false;
-    status(`${players.length} kulüp adayı; ${inv.items.length - players.length} korunan kart. ${liveMode ? `${state.input.liveMarket.quotes.length} anlık EA fiyatı. ` : currentPolicy.allowConcept ? 'FUT.GG veri tabanından fiyatlı piyasa adayları ekleniyor. ' : ''}Çözüm aranıyor…`);
+    status(`${players.length} club candidates; ${inv.items.length - players.length} protected cards. ${liveMode ? `${state.input.liveMarket.quotes.length} live EA prices. ` : currentPolicy.allowConcept ? 'Adding priced candidates from the FUT.GG database. ' : ''}Solving…`);
     // Short polling requests keep Chrome MV3's worker alive even for long solves.
     // Never retry the creation POST: a lost response must not launch two jobs.
-    if (version !== state.cancel) { status('İptal edildi. Yeni çözüm işi başlatılmadı.'); return; }
+    if (version !== state.cancel) { status('Cancelled. No new solve job was started.'); return; }
     assertNativeContext(nativeContext);
     const job = await http('/api/solve/jobs', 'POST', state.input);
     if (!job.jobId || !/^[a-zA-Z0-9-]+$/.test(job.jobId)) throw new Error('Local server returned an invalid solve job ID.');
     let result;
     const deadline = Date.now() + (state.input.maxSolveTime + 60) * 1000;
     while (Date.now() < deadline) {
-      if (version !== state.cancel) { status('İptal edildi. Sonuç uygulanmadı; yerel çözücü mevcut işini süre sınırına kadar tamamlayabilir.'); return; }
+      if (version !== state.cancel) { status('Cancelled. The result was not applied. The local solver may finish its existing job within the time limit.'); return; }
       const progress = await http(`/api/solve/jobs/${job.jobId}`);
       if (progress.status === 'done') { result = progress.result; break; }
       if (progress.status === 'error') throw new Error(P.errorMessage(progress));
       if (progress.status !== 'running') throw new Error('Local server returned an unknown job status.');
-      if (progress.progress) status(`Çözüm aranıyor: ${progress.progress.ownedCandidates ?? players.length} kulüp kartı + ${progress.progress.conceptCandidates ?? 0} piyasa adayı · ${Math.round(progress.progress.elapsedSeconds || 0)} sn`);
+      if (progress.progress) status(`Solving: ${progress.progress.ownedCandidates ?? players.length} club cards + ${progress.progress.conceptCandidates ?? 0} market candidates · ${Math.round(progress.progress.elapsedSeconds || 0)} s`);
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    if (!result) throw new Error('Yerel çözüm süresi doldu. Sunucu durumunu kontrol edin.');
-    if (version !== state.cancel) { status('İptal edildi. Sonuç uygulanmadı.'); return; }
+    if (!result) throw new Error('The local solve timed out. Check the server status.');
+    if (version !== state.cancel) { status('Cancelled. The result was not applied.'); return; }
     assertNativeContext(nativeContext);
     const conceptCoverage = result.diagnostics?.conceptCoverage ?? result.conceptCoverage ?? result.conceptPool ?? null;
-    if (conceptCoverage) ui.poolInfo.textContent = `Piyasa adayları: ${conceptCoverage.returned ?? conceptCoverage.addedToPool ?? '?'} / ${conceptCoverage.totalEligible ?? '?'} uygun kart. ${conceptCoverage.complete ? 'Politikaya uygun katalog adayları tarandı.' : 'Sınırlı, çeşitlendirilmiş havuz; tüm piyasada en ucuz çözüm garantisi yok.'}`;
+    if (conceptCoverage) ui.poolInfo.textContent = `Market candidates: ${conceptCoverage.returned ?? conceptCoverage.addedToPool ?? '?'} / ${conceptCoverage.totalEligible ?? '?'} eligible cards. ${conceptCoverage.complete ? 'All eligible catalog candidates were checked.' : 'A limited, varied pool was searched. The cheapest solution across the entire market is not guaranteed.'}`;
     const rows = P.validateSolution(result, state.input, currentPolicy, pale);
     state.preview = { rows, set, challenge, input: state.input, policy: currentPolicy, time: Date.now(), result, rejected, conceptCoverage, nativeContext };
     renderReview(state.preview);
-    status('Çözüm hazır. Listeyi inceleyin; Uygula yalnızca SBC kadrosunu kaydeder. Gönderme işlemi EA ekranında size aittir.');
+    status('Solution ready. Review the cards, then apply the squad. This preview only saves the squad; submit it yourself in EA.');
   }
   async function apply(batchGuard = null) {
     const preview = state.preview;
     const version = state.cancel;
-    if (!preview) throw new Error('Önce bir çözüm oluşturun.');
+    if (!preview) throw new Error('Build a solution first.');
     const assertCurrent = () => {
       if (batchGuard) batchGuard();
-      if (version !== state.cancel) throw new Error('Uygulama iptal edildi.');
+      if (version !== state.cancel) throw new Error('Apply cancelled.');
       assertNativeContext(preview.nativeContext);
-      if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('Önizleme 5 dakikadan eski. Kulübü yeniden okuyup çözün.'); }
+      if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('This preview is more than 5 minutes old. Refresh your club and solve again.'); }
       const selected = scope();
-      if (selected.gameYear !== preview.input.gameYear || selected.platform !== preview.input.platform) throw new Error('Sezon veya platform değişti. Yeniden çözün.');
+      if (selected.gameYear !== preview.input.gameYear || selected.platform !== preview.input.platform) throw new Error('Game edition or platform changed. Solve again.');
     };
     assertCurrent();
     const pale = readPaletools();
@@ -478,41 +574,41 @@
     const concepts = preview.rows.filter(row => row.player.concept), resolvedConcepts = new Map();
     for (const row of concepts) {
       const definitionId = Number(row.player.definitionId);
-      if (!Number.isSafeInteger(definitionId) || definitionId <= 0 || typeof services.Item.searchConceptItems !== 'function') throw new Error('EA konsept kart araması kullanılamıyor. Kadro değiştirilmedi.');
+      if (!Number.isSafeInteger(definitionId) || definitionId <= 0 || typeof services.Item.searchConceptItems !== 'function') throw new Error('EA concept search is unavailable. The squad was not changed.');
       const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
       criteria.defId = [definitionId];
-      const response = await observe(services.Item.searchConceptItems(criteria), 'EA konsept kartı');
+      const response = await observe(services.Item.searchConceptItems(criteria), 'EA concept card');
       assertCurrent();
-      if (!Array.isArray(response.items)) throw new Error('EA konsept kart yanıtı okunamadı. Kadro değiştirilmedi.');
+      if (!Array.isArray(response.items)) throw new Error('Cannot read the EA concept response. The squad was not changed.');
       const matches = response.items.filter(item => String(item?.definitionId) === String(definitionId));
-      if (matches.length !== 1) throw new Error(`${row.player.name}: EA tam olarak bir eşleşen konsept kart döndürmedi. Kadro değiştirilmedi.`);
+      if (matches.length !== 1) throw new Error(`${row.player.name}: EA did not return exactly one matching concept card. The squad was not changed.`);
       const item = matches[0];
       // Keep the actual EA search entity. Never turn catalog JSON into an item,
       // mark an owned card as a concept, or substitute another card version.
       const assetId = athleteId(item);
       const rarity = item.rareflag ?? item._rareflag;
       const mismatches = [];
-      const describe = value => value == null ? 'yok' : typeof value === 'boolean' ? String(value) :
-        typeof value === 'number' || typeof value === 'string' ? String(value).slice(0,60) : 'geçersiz';
-      const mismatch = (field, expected, actual) => mismatches.push(`${field}: beklenen ${describe(expected)}, gelen ${describe(actual)}`);
-      if (item.concept !== true) mismatch('konsept', true, item.concept);
-      if (item.id == null) mismatch('EA kart kimliği', 'mevcut', item.id);
+      const describe = value => value == null ? 'missing' : typeof value === 'boolean' ? String(value) :
+        typeof value === 'number' || typeof value === 'string' ? String(value).slice(0,60) : 'invalid';
+      const mismatch = (field, expected, actual) => mismatches.push(`${field}: expected ${describe(expected)}, received ${describe(actual)}`);
+      if (item.concept !== true) mismatch('concept', true, item.concept);
+      if (item.id == null) mismatch('EA item ID', 'present', item.id);
       const isPlayer = typeof item.isPlayer === 'function' ? item.isPlayer() : undefined;
-      if (isPlayer !== true) mismatch('oyuncu kartı', true, isPlayer);
-      if (!Number.isSafeInteger(Number(assetId)) || Number(assetId) <= 0 || String(assetId) !== String(row.player.assetId)) mismatch('oyuncu kimliği', row.player.assetId, assetId);
-      if (item.rating != null && Number(item.rating) !== Number(row.player.rating)) mismatch('reyting', row.player.rating, item.rating);
-      if (rarity != null && Number(rarity) !== Number(row.player.rarityId)) mismatch('nadirlik', row.player.rarityId, rarity);
+      if (isPlayer !== true) mismatch('player card', true, isPlayer);
+      if (!Number.isSafeInteger(Number(assetId)) || Number(assetId) <= 0 || String(assetId) !== String(row.player.assetId)) mismatch('athlete ID', row.player.assetId, assetId);
+      if (item.rating != null && Number(item.rating) !== Number(row.player.rating)) mismatch('rating', row.player.rating, item.rating);
+      if (rarity != null && Number(rarity) !== Number(row.player.rarityId)) mismatch('rarity', row.player.rarityId, rarity);
       if (mismatches.length) {
-        throw new Error(`${row.player.name}: EA konsept kart kimliği uyuşmuyor (${mismatches.join('; ')}). Kadro değiştirilmedi.`);
+        throw new Error(`${row.player.name}: EA concept card identity mismatch (${mismatches.join('; ')}). The squad was not changed.`);
       }
       resolvedConcepts.set(String(row.id), item);
     }
-    const inv = await inventory(), chem = chemistry();
+    const inv = await inventory(assertCurrent), chem = chemistry();
     assertCurrent();
     const currentItems = new Map(inv.items.map(item => [String(item.id), item]));
     const fresh = await challengeData(preview.challenge, preview.set);
     if (JSON.stringify(fresh.constraints) !== JSON.stringify(preview.input.sbcData.constraints) ||
-        JSON.stringify(fresh.formation) !== JSON.stringify(preview.input.sbcData.formation)) throw new Error('SBC koşulları değişti. Yeniden çözün.');
+        JSON.stringify(fresh.formation) !== JSON.stringify(preview.input.sbcData.formation)) throw new Error('SBC requirements changed. Solve again.');
     const controller = new UTSBCSquadOverviewViewController();
     controller.initWithSBCSet(preview.set, preview.challenge.id);
     const { _squad, _challenge } = controller;
@@ -524,18 +620,18 @@
     for (const row of preview.rows) {
       if (row.player.concept) {
         const item = resolvedConcepts.get(String(row.id));
-        if (currentItems.has(String(item.id)) || inv.items.includes(item)) throw new Error(`${row.player.name}: EA konsept araması bir kulüp kartı döndürdü. Kadro değiştirilmedi.`);
+        if (currentItems.has(String(item.id)) || inv.items.includes(item)) throw new Error(`${row.player.name}: EA concept search returned an owned card. The squad was not changed.`);
         if (currentPolicy.protectSpecial && typeof item.isSpecial === 'function' && item.isSpecial() === true ||
             currentPolicy.protectEvolutions && (item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution() === true)) {
-          throw new Error(`${row.player.name}: EA kart koruması bu konsepti engelliyor. Kadro değiştirilmedi.`);
+          throw new Error(`${row.player.name}: EA card protection blocks this concept. The squad was not changed.`);
         }
       } else {
         const item = currentItems.get(String(row.id));
-        if (!item) throw new Error(`${row.player.name} kulüpte artık yok. Yeniden çözün.`);
+        if (!item) throw new Error(`${row.player.name} is no longer in your club. Solve again.`);
         const current = card(item, inv, chem);
-        if (String(current.definitionId) !== String(row.player.definitionId) || String(current.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: kulüp kartı değişti. Yeniden çözün.`);
+        if (String(current.definitionId) !== String(row.player.definitionId) || String(current.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: The owned card changed. Solve again.`);
         const reason = P.blockedReason(current, currentPolicy, currentLocks);
-        if (reason) throw new Error(`${row.player.name}: ${reason}. Yeniden çözün.`);
+        if (reason) throw new Error(`${row.player.name}: ${reason}. Solve again.`);
       }
     }
     const oldItems = (_squad._players || []).map(slot => slot?._item);
@@ -546,10 +642,10 @@
     for (const row of preview.rows) {
       const selected = squad[row.squadPosition];
       for (const reserve of reserves) {
-        if (typeof selected.compareResourceTo !== 'function' || selected.compareResourceTo(reserve)) throw new Error('Seçilen kart yedekteki korunan oyuncuyla çakışıyor veya karşılaştırılamıyor. Kadro değiştirilmedi.');
+        if (typeof selected.compareResourceTo !== 'function' || selected.compareResourceTo(reserve)) throw new Error('A selected card conflicts with a protected reserve or cannot be compared safely. The squad was not changed.');
       }
     }
-    if (typeof _squad.removeAllItems !== 'function') throw new Error('EA kadro temizleme yöntemi kullanılamıyor. Kadro değiştirilmedi.');
+    if (typeof _squad.removeAllItems !== 'function') throw new Error('EA squad clearing is unavailable. The squad was not changed.');
     const sameItem = (expected, actual) => {
       const expectedPlayer = typeof expected?.isPlayer === 'function' && expected.isPlayer();
       const actualPlayer = typeof actual?.isPlayer === 'function' && actual.isPlayer();
@@ -561,7 +657,7 @@
       // of an existing reserve. Clear players explicitly while keeping manager.
       _squad.removeAllItems(true);
       _squad.setPlayers(squad, true);
-      if (!squad.every((item,index) => sameItem(item,_squad._players?.[index]?._item))) throw new Error('EA kadroyu beklenen kartlarla dolduramadı; kayıt gönderilmedi.');
+      if (!squad.every((item,index) => sameItem(item,_squad._players?.[index]?._item))) throw new Error('EA could not place the expected cards. The squad was not saved.');
       assertCurrent();
       await observe(services.SBC.saveChallenge(_challenge), 'Save SBC squad');
     } catch (error) {
@@ -578,19 +674,19 @@
       const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
       current.rootController.getRootNavigationController().pushViewController(view);
     } } catch { /* The saved squad remains accessible via EA's own SBC screen. */ }
-    status(concepts.length ? 'Konseptler SBC kadrosuna yerleştirildi. Coin harcanmadı. Konseptler gerçek kartlarla değiştirilmeden kadro teslim edilemez.' : 'Kadronuz SBC’ye kaydedildi. EA ekranında koşulları kontrol edip isterseniz kendiniz gönderin.');
+    status(concepts.length ? 'Concept players were placed in the SBC squad. No coins were spent. Replace concepts with owned cards before submitting.' : 'Your squad was saved to the SBC. Check the requirements in EA before submitting it yourself.');
     return {setId:preview.set.id,challengeId:preview.challenge.id,saved:true,preview,challenge:_challenge,squad:_squad};
   }
 
   function assertSubmitAllowed(challenge, set) {
-    if (typeof challenge.canSubmit !== 'function' || challenge.canSubmit() !== true) throw new Error('EA kadronun teslim koşullarını onaylamadı. Sıra durduruldu.');
+    if (typeof challenge.canSubmit !== 'function' || challenge.canSubmit() !== true) throw new Error('EA did not approve the submission requirements. The queue stopped.');
     if (typeof UTEventTokenUtils === 'undefined' || typeof UTEventTokenUtils.hasEventTokenReward !== 'function' ||
         typeof services.EventToken?.isEventTokenEarningDisabled !== 'function' ||
         typeof services.Configuration?.getFeatureSetting !== 'function' ||
         typeof UTServerSettingsRepository === 'undefined' || !UTServerSettingsRepository.KEY?.SBC_ALLOW_UNTRADEABLE ||
-        typeof challenge.hasUntradeableItems !== 'function') throw new Error('EA teslim güvenlik kontrolleri kullanılamıyor.');
-    if ((UTEventTokenUtils.hasEventTokenReward(set.awards) || UTEventTokenUtils.hasEventTokenReward(challenge.awards)) && services.EventToken.isEventTokenEarningDisabled()) throw new Error('EA etkinlik ödüllerini geçici olarak kapattı.');
-    if (!services.Configuration.getFeatureSetting(UTServerSettingsRepository.KEY.SBC_ALLOW_UNTRADEABLE) && challenge.hasUntradeableItems()) throw new Error('EA satılamaz kart teslimini geçici olarak kapattı.');
+        typeof challenge.hasUntradeableItems !== 'function') throw new Error('EA submission safety checks are unavailable.');
+    if ((UTEventTokenUtils.hasEventTokenReward(set.awards) || UTEventTokenUtils.hasEventTokenReward(challenge.awards)) && services.EventToken.isEventTokenEarningDisabled()) throw new Error('EA has temporarily disabled event rewards.');
+    if (!services.Configuration.getFeatureSetting(UTServerSettingsRepository.KEY.SBC_ALLOW_UNTRADEABLE) && challenge.hasUntradeableItems()) throw new Error('EA has temporarily disabled untradeable card submissions.');
   }
   function hasUncertainBatch(report) {
     return Boolean(report?.snapshot?.queue?.some(set => set.steps?.some(step => ['save-pending','submit-pending','submitted','claim-pending','uncertain'].includes(step.status))));
@@ -601,13 +697,15 @@
     if (Number.isSafeInteger(error?.code) || typeof error?.code === 'string' && /^[A-Z0-9_-]{1,80}$/.test(error.code)) details.code = error.code;
     if (Number.isFinite(error?.retryAfterSeconds) && error.retryAfterSeconds > 0) details.retryAfterSeconds = error.retryAfterSeconds;
     if (typeof error?.operation === 'string') details.operation = error.operation.replace(/[\r\n\x00-\x1f]/g,' ').slice(0,160);
+    const conflicts = itemViolations(error?.itemViolations);
+    if (conflicts) details.itemViolations = conflicts;
     return details;
   }
   function readSBCList(kind,request,guard) {
     const retry = window.AutoSBCReadRetry;
-    if (!retry) throw new Error('EA okuma modülü yüklenmedi. Uzantıyı yenileyin.');
+    if (!retry) throw new Error('The EA read module did not load. Reload the extension.');
     return retry.read({kind,request,guard,onWait:({remainingMs}) => {
-      status(`EA liste isteğini sınırladı. ${Math.ceil(remainingMs/1000)} saniye sonra bir kez yeniden okunacak. Durdur ile iptal edebilirsiniz.`);
+      status(`EA limited the list request. One retry in ${Math.ceil(remainingMs/1000)} seconds. Select Stop to cancel.`);
     }});
   }
   async function waitForRewardRead(guard) {
@@ -619,11 +717,11 @@
   }
   async function runBatch({queueOverride = null,dailyParent = null,dailyEntry = null} = {}) {
     const B = window.AutoSBCBatchPolicy, R = window.AutoSBCBatchRunner;
-    if (!B || !R) throw new Error('Otomatik sıra modülü yüklenmedi. Uzantıyı ve EA sayfasını yenileyin.');
+    if (!B || !R) throw new Error('The queue module did not load. Reload the extension and EA page.');
     if (dailyParent) assertDailyRun(dailyParent);
-    else if (!ui.batchConsent.checked || !state.batchQueue.length) throw new Error('Teslim edilecek setleri sıraya ekleyip otomatik teslim seçimini işaretleyin.');
-    if (state.batchReportUnreadable || hasUncertainBatch(state.batchReport)) throw new Error('Önceki çalışmada okunamayan veya tamamlanma doğrulaması eksik bir EA kaydı var. Aynı teslim tekrarlanmayacak; önce EA tamamlanma kaydını kontrol edin.');
-    if (!ready() || typeof services.SBC.reset !== 'function' || typeof services.SBC.submitChallenge !== 'function' || typeof services.Chemistry?.isFeatureEnabled !== 'function') throw new Error('EA otomatik teslim servisi hazır değil.');
+    else if (!ui.batchConsent.checked || !state.batchQueue.length) throw new Error('Add SBC sets to the queue and confirm automatic submission first.');
+    if (state.batchReportUnreadable || hasUncertainBatch(state.batchReport)) throw new Error('A previous run has an unreadable or unverified submission record. Check completion in EA before starting another queue.');
+    if (!ready() || typeof services.SBC.reset !== 'function' || typeof services.SBC.submitChallenge !== 'function' || typeof services.Chemistry?.isFeatureEnabled !== 'function') throw new Error('EA automatic submission is not ready.');
     // Batch permission is scoped to owned cards and these mandatory protections.
     ui.settings.protectPlayed.checked = true; ui.settings.protectEvolutions.checked = true; ui.settings.allowConcept.checked = false;
     const selectedScope = scope(), selectedQueue = (queueOverride || state.batchQueue).map(entry => ({...entry}));
@@ -635,12 +733,12 @@
     config.forEach(control => { control.disabled = true; });
     ui.batchStop.disabled = false;
     const guard = () => {
-      if (state.batchRun !== run || run.stopped || controller.snapshot().status !== 'running') throw new Error('Otomatik sıra durduruldu; yeni işlem başlatılmadı.');
+      if (state.batchRun !== run || run.stopped || controller.snapshot().status !== 'running') throw new Error('The queue stopped. No new action was started.');
       if (dailyParent) assertDailyRun(dailyParent);
-      if ((!dailyParent && !ui.batchConsent.checked) || !ui.settings.protectPlayed.checked || !ui.settings.protectEvolutions.checked || ui.settings.allowConcept.checked) throw new Error('Otomatik sıra kart koruması değişti.');
-      if (dailyParent && (!ui.settings.protectSpecial.checked || Number(ui.settings.maxRating.value) !== dailyRating(dailyEntry.kind) || Number(ui.settings.maxPlayerPrice.value) !== dailyParent.cardLimit)) throw new Error('Daily kart sınırları değişti.');
+      if ((!dailyParent && !ui.batchConsent.checked) || !ui.settings.protectPlayed.checked || !ui.settings.protectEvolutions.checked || ui.settings.allowConcept.checked) throw new Error('Queue card protections changed.');
+      if (dailyParent && (!ui.settings.protectSpecial.checked || Number(ui.settings.maxRating.value) !== dailyRating(dailyEntry.kind) || Number(ui.settings.maxPlayerPrice.value) !== dailyParent.cardLimit)) throw new Error('Daily card limits changed.');
       const current = scope();
-      if (current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Otomatik sıra sezonu veya platformu değişti.');
+      if (current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('The queue game edition or platform changed.');
     };
     const record = phase => {
       const report = {runId:run.runId,scope:selectedScope,selectedSets:selectedQueue,updatedAt:new Date().toISOString(),phase,snapshot:controller.snapshot(),receipts:run.receipts,...(run.lastError ? {lastError:run.lastError} : {})};
@@ -648,26 +746,27 @@
       if (dailyParent) recordDailyChild(dailyParent,report);
       localStorage.setItem(BATCH_STORAGE,JSON.stringify(report)); state.batchReport = report;
       const p = report.snapshot.progress;
-      const labels = {snapshot:'Set kontrol ediliyor',solve:'Kadro çözülüyor',save:'Kadro kaydediliyor','save-confirmed':'Kadro kaydedildi',submit:'Kadro teslim ediliyor','submit-confirmed':'Teslim doğrulandı',claim:'Ödül ve sayaç kontrol ediliyor','claim-confirmed':'Ödül doğrulandı','set-completed':'Set tamamlandı','set-skipped':'Tamamlanan veya hakkı biten set atlandı',finished:'Sıra sona erdi',failed:'Sıra durdu'};
+      const labels = {snapshot:'Checking set',solve:'Solving squad',save:'Saving squad','save-confirmed':'Squad saved',submit:'Submitting squad','submit-confirmed':'Submission confirmed',claim:'Checking rewards and completion counters','claim-confirmed':'Rewards verified','set-completed':'Set completed','set-skipped':'Skipped completed or exhausted set',finished:'Queue finished',failed:'Queue stopped'};
       const active = selectedQueue.find(entry => String(entry.id) === report.snapshot.currentSetId);
       const submitted = report.receipts.filter(receipt => receipt.completed === true && receipt.rewardsGranted === true).length;
-      ui.batchStatus.textContent = `${p.completed}/${p.total} set tamamlandı · ${submitted} teslim onayı · ${p.confirmedChallenges} sayaç doğrulaması${active ? `\n${active.name}` : ''}\n${labels[phase] || phase}`;
+      ui.batchStatus.textContent = `${p.completed}/${p.total} sets completed · ${submitted} submission receipts · ${p.confirmedChallenges} counter verifications${active ? `\n${active.name}` : ''}\n${labels[phase] || phase}`;
       ui.batchExport.disabled = false;
+      ui.batchDetails.show.disabled = false;
     };
     const freshSet = async setId => {
       guard(); services.SBC.reset();
-      const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(), 'Sıradaki SBC setleri'),guard); guard();
-      if (!Array.isArray(data.sets)) throw new Error('EA set listesi okunamadı.');
+      const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(), 'Queue SBC sets'),guard); guard();
+      if (!Array.isArray(data.sets)) throw new Error('Cannot read the EA set list.');
       const set = data.sets.find(item => String(item.id) === String(setId));
-      if (!set) throw new Error(`SBC seti ${setId} artık mevcut değil.`);
+      if (!set) throw new Error(`SBC set ${setId} is no longer available.`);
       if (dailyParent) nativeDailySnapshot(set);
-      const data2 = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set), 'Sıradaki SBC parçaları'),guard); guard();
-      if (!Array.isArray(data2.challenges)) throw new Error('EA görev listesi okunamadı.');
+      const data2 = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set), 'Queue SBC challenges'),guard); guard();
+      if (!Array.isArray(data2.challenges)) throw new Error('Cannot read the EA challenge list.');
       const context = {set,challenges:data2.challenges,sets:data.sets}; run.contexts.set(String(setId),context); return context;
     };
     const choose = (step, context) => {
       const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
-      if (!challenge || challenge.status === 'COMPLETED') throw new Error('Sıradaki görev değişti veya zaten tamamlandı.');
+      if (!challenge || challenge.status === 'COMPLETED') throw new Error('The queued challenge changed or is already complete.');
       state.sets = context.sets; state.challenges = context.challenges.filter(item => item.status !== 'COMPLETED');
       options(ui.set,state.sets); ui.set.value = step.setId;
       options(ui.challenge,state.challenges); ui.challenge.value = step.challengeId;
@@ -680,7 +779,7 @@
       P.validateSolution(solution.preview.result,solution.preview.input,currentPolicy,pale);
       const fresh = solution.preview.rows.map(row => {
         const player = players.get(String(row.id));
-        if (!player || String(player.definitionId) !== String(row.player.definitionId) || String(player.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: envanter kartı değişti.`);
+        if (!player || String(player.definitionId) !== String(row.player.definitionId) || String(player.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: The inventory card changed.`);
         const reason = P.blockedReason(player,currentPolicy,pale); if (reason) throw new Error(`${player.name}: ${reason}`);
         return player;
       });
@@ -692,32 +791,32 @@
         const context = await freshSet(step.setId), challenge = choose(step,context);
         if (dailyParent) window.AutoSBCDailyPlan.assertCycle(dailyEntry,nativeDailySnapshot(context.set));
         const data = await challengeData(challenge,context.set); guard();
-        if (JSON.stringify(data.constraints) !== JSON.stringify(solution.preview.input.sbcData.constraints) || JSON.stringify(data.formation) !== JSON.stringify(solution.preview.input.sbcData.formation)) throw new Error('Teslim öncesinde SBC koşulları değişti.');
+        if (JSON.stringify(data.constraints) !== JSON.stringify(solution.preview.input.sbcData.constraints) || JSON.stringify(data.formation) !== JSON.stringify(solution.preview.input.sbcData.formation)) throw new Error('SBC requirements changed before submission.');
         const slots = challenge.squad?._players;
-        if (!Array.isArray(slots)) throw new Error('EA kaydedilmiş kadroyu döndürmedi.');
+        if (!Array.isArray(slots)) throw new Error('EA did not return the saved squad.');
         const expected = new Map(solution.preview.rows.map(row => [row.squadPosition,row.player]));
         for (let index=0;index<11;index++) {
           const item = slots[index]?._item, wanted = expected.get(index);
-          if (wanted ? !item || String(item.id) !== String(wanted.id) || String(item.definitionId) !== String(wanted.definitionId) || item.concept : typeof item?.isPlayer === 'function' && item.isPlayer()) throw new Error('EA’daki kaydedilmiş kadro çözümle aynı değil; teslim durduruldu.');
+          if (wanted ? !item || String(item.id) !== String(wanted.id) || String(item.definitionId) !== String(wanted.definitionId) || item.concept : typeof item?.isPlayer === 'function' && item.isPlayer()) throw new Error('The saved squad in EA does not match the solution. Submission stopped.');
         }
         assertSubmitAllowed(challenge,context.set);
-        if (!Number.isSafeInteger(challenge.timesCompleted) || !Number.isSafeInteger(context.set.timesCompleted)) throw new Error('EA tamamlanma sayacı okunamadı.');
+        if (!Number.isSafeInteger(challenge.timesCompleted) || !Number.isSafeInteger(context.set.timesCompleted)) throw new Error('Cannot read the EA completion counter.');
         submissionCheck = {...context,challenge,beforeChallenge:challenge.timesCompleted,beforeSet:context.set.timesCompleted};
       }
       // Read inventory/active squad after all challenge-loading awaits. Keep its
       // live entities so getters and locks can be rechecked at dispatch too.
-      const inv = await inventory(), chem = chemistry(); guard();
+      const inv = await inventory(guard), chem = chemistry(); guard();
       const fresh = checkPlayersNow(solution,inv,chem);
       if (submissionCheck) run.checks.set(String(step.challengeId),{...submissionCheck,inv,chem});
       guard(); return fresh;
     };
     try {
-      invalidate(); record('Başlatıldı');
+      invalidate(); record('Started');
       await R.run({controller,onProgress:event => record(event.phase),adapter:{
         snapshotSet:async setId => {
           const {set,challenges} = await freshSet(setId);
           if (dailyParent) window.AutoSBCDailyPlan.assertCycle(dailyEntry,nativeDailySnapshot(set));
-          if (typeof set.isComplete !== 'function' || typeof set.isRepeatable !== 'boolean' || typeof set.isLimitedRepeatable !== 'boolean') throw new Error('EA tekrar hakkı okunamadı.');
+          if (typeof set.isComplete !== 'function' || typeof set.isRepeatable !== 'boolean' || typeof set.isLimitedRepeatable !== 'boolean') throw new Error('Cannot read the EA repeat allowance.');
           const remaining = set.isLimitedRepeatable ? set.getRepeatsRemaining() : null;
           return {setId:String(set.id),completed:set.isComplete(),repeatable:set.isRepeatable,remaining,
             challenges:challenges.map(challenge => ({challengeId:String(challenge.id),completed:challenge.status === 'COMPLETED'}))};
@@ -727,32 +826,32 @@
           // current here. Avoid another reset/GET before any intervening write.
           const context = run.contexts.get(String(step.setId)) || await freshSet(step.setId); choose(step,context); guard();
           await solve(); guard(); const preview = state.preview;
-          if (!preview || String(preview.set.id) !== String(step.setId) || String(preview.challenge.id) !== String(step.challengeId)) throw new Error('Sıradaki görev için yeni çözüm oluşmadı.');
+          if (!preview || String(preview.set.id) !== String(step.setId) || String(preview.challenge.id) !== String(step.challengeId)) throw new Error('No fresh solution was created for the queued challenge.');
           B.assertBatchPlayers(preview.rows.map(row => row.player));
           return {players:preview.rows.map(row => row.player),preview};
         },
         freshPlayers:verifyPlayers,
         apply:async (step,solution) => {
-          guard(); if (state.preview !== solution.preview) throw new Error('Sıra önizlemesi değişti.');
+          guard(); if (state.preview !== solution.preview) throw new Error('The queue preview changed.');
           const receipt = await apply(guard); return receipt;
         },
         submit:async (step,solution) => {
           guard(); const check = run.checks.get(String(step.challengeId));
-          if (!check || String(check.set.id) !== String(step.setId)) throw new Error('Teslim öncesi doğrulama eksik.');
+          if (!check || String(check.set.id) !== String(step.setId)) throw new Error('Pre-submission verification is missing.');
           checkPlayersNow(solution,check.inv,check.chem);
           for (const row of solution.preview.rows) {
             const item = check.challenge.squad?._players?.[row.squadPosition]?._item;
-            if (!item || item.concept || String(item.id) !== String(row.id) || String(item.definitionId) !== String(row.player.definitionId)) throw new Error('Teslim anında kadro değişti.');
+            if (!item || item.concept || String(item.id) !== String(row.id) || String(item.definitionId) !== String(row.player.definitionId)) throw new Error('The squad changed at submission time.');
           }
           assertSubmitAllowed(check.challenge,check.set);
-          const response = await observe(services.SBC.submitChallenge(check.challenge,check.set,false,services.Chemistry.isFeatureEnabled()), 'Otomatik SBC teslimi');
+          const response = await observe(services.SBC.submitChallenge(check.challenge,check.set,false,services.Chemistry.isFeatureEnabled()), 'Automatic SBC submission');
           // Validate the response, not resettable local challenge.status.
-          if (String(response.challengeId) !== String(step.challengeId) || String(response.setId) !== String(step.setId) || typeof response.setCompleted !== 'boolean' || !Array.isArray(response.grantedChallengeAwards)) throw new Error('EA teslim yanıtı doğrulanamadı; aynı kadro tekrar gönderilmeyecek.');
+          if (String(response.challengeId) !== String(step.challengeId) || String(response.setId) !== String(step.setId) || typeof response.setCompleted !== 'boolean' || !Array.isArray(response.grantedChallengeAwards)) throw new Error('Cannot validate the EA submission response. This squad will not be submitted again.');
           const receipt = {setId:String(step.setId),challengeId:String(step.challengeId),completed:true,setCompleted:response.setCompleted,rewardsGranted:true,
             at:new Date().toISOString(),beforeChallenge:check.beforeChallenge,beforeSet:check.beforeSet,
             cardIds:solution.players.map(player => String(player.id)),zeroGames:solution.players.every(player => player.gamesPlayed === 0),
             coinSpent:0,grantedChallengeAwards:response.grantedChallengeAwards};
-          run.receipts.push(receipt); record('EA teslim yanıtı alındı'); return receipt;
+          run.receipts.push(receipt); record('EA submission response received'); return receipt;
         },
         verifyRewards:async (step,receipt) => {
           // Rewards are granted by submitChallenge. This read verifies counters;
@@ -761,15 +860,15 @@
           const context = await freshSet(step.setId);
           const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
           if (!challenge || !Number.isSafeInteger(challenge.timesCompleted) || challenge.timesCompleted <= receipt.beforeChallenge ||
-              receipt.setCompleted && (!Number.isSafeInteger(context.set.timesCompleted) || context.set.timesCompleted <= receipt.beforeSet)) throw new Error('EA tamamlanma sayacı teslim yanıtını henüz doğrulamadı. Sıra durdu.');
+              receipt.setCompleted && (!Number.isSafeInteger(context.set.timesCompleted) || context.set.timesCompleted <= receipt.beforeSet)) throw new Error('EA completion counters have not confirmed the submission yet. The queue stopped.');
           if (typeof repositories.Item?.setDirty === 'function' && typeof ItemPile !== 'undefined') repositories.Item.setDirty(ItemPile.PURCHASED);
           return {setId:receipt.setId,challengeId:receipt.challengeId,rewardsGranted:true,setCompleted:receipt.setCompleted};
         }
       }});
-      record(controller.snapshot().status === 'completed' ? 'Seçili sıra tamamlandı' : 'Durduruldu');
-      status('Otomatik sıra sona erdi. Teslim edilen parçalar çalışma kaydında; ödül paketleri açılmadı.');
+      record(controller.snapshot().status === 'completed' ? 'Selected queue completed' : 'Stopped');
+      status('Queue finished. Submitted challenges are in the run report. Reward packs remain unopened.');
       return {snapshot:controller.snapshot(),receipts:run.receipts};
-    } catch (error) { run.lastError = errorDetails(error); record(`Durdu: ${error.message || error}`); throw error; }
+    } catch (error) { run.lastError = errorDetails(error); record(`Stopped: ${error.message || error}`); throw error; }
     finally {
       state.batchRun = null; config.forEach(control => { control.disabled = Boolean(dailyParent); });
       if (!dailyParent) {
@@ -783,42 +882,42 @@
 
   async function reconcileLastSubmission() {
     const helper = window.AutoSBCBatchReconcile;
-    if (!helper || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Teslim doğrulama modülü veya EA oturumu hazır değil.');
-    if (state.batchRun || state.dailyRun) throw new Error('Önce çalışan sırayı durdurun.');
+    if (!helper || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Submission verification or the EA session is not ready.');
+    if (state.batchRun || state.dailyRun) throw new Error('Stop the current queue first.');
     const originalBatchText = localStorage.getItem(BATCH_STORAGE), originalDailyText = localStorage.getItem(DAILY_STORAGE);
     let original, daily;
     try { original = JSON.parse(originalBatchText || 'null'); daily = JSON.parse(originalDailyText || 'null'); }
-    catch { throw new Error('Önceki çalışma kaydı okunamadı. Hiçbir kayıt değişmedi.'); }
+    catch { throw new Error('Cannot read the previous run report. No records were changed.'); }
     const planned = helper.plan(original), selectedScope = scope();
-    if (original.scope?.gameYear !== selectedScope.gameYear || original.scope?.platform !== selectedScope.platform) throw new Error('Teslim kaydının sezonu veya platformu seçili hesapla uyuşmuyor.');
+    if (original.scope?.gameYear !== selectedScope.gameYear || original.scope?.platform !== selectedScope.platform) throw new Error('The submission record does not match the selected game edition or platform.');
     let dailyCycle = -1;
     if (originalDailyText) {
-      if (!daily?.runId || !Array.isArray(daily.cycles) || !Array.isArray(daily.plan?.entries) || !Number.isSafeInteger(daily.plan?.totalCycles)) throw new Error('Daily kaydı doğrulanamadı. Hiçbir kayıt değişmedi.');
+      if (!daily?.runId || !Array.isArray(daily.cycles) || !Array.isArray(daily.plan?.entries) || !Number.isSafeInteger(daily.plan?.totalCycles)) throw new Error('Cannot validate the daily report. No records were changed.');
       const matches = daily.cycles.map((cycle,index) => cycle.child?.runId === original.runId ? index : -1).filter(index => index >= 0);
-      if (matches.length > 1) throw new Error('Aynı teslim birden fazla daily döngüsüne bağlı. Hiçbir kayıt değişmedi.');
+      if (matches.length > 1) throw new Error('The same submission belongs to multiple daily cycles. No records were changed.');
       if (matches.length) {
         dailyCycle = matches[0]; const cycle = daily.cycles[dailyCycle];
         if (JSON.stringify(cycle.child) !== JSON.stringify(original) || String(cycle.entry?.setId) !== planned.setId ||
-            daily.scope?.gameYear !== selectedScope.gameYear || daily.scope?.platform !== selectedScope.platform) throw new Error('Daily ve SBC teslim kayıtları uyuşmuyor. Hiçbir kayıt değişmedi.');
+            daily.scope?.gameYear !== selectedScope.gameYear || daily.scope?.platform !== selectedScope.platform) throw new Error('Daily and SBC submission reports do not match. No records were changed.');
       }
     }
     invalidate(); const version = state.cancel;
     const guard = () => {
       const current = scope();
-      if (state.cancel !== version || state.batchRun || state.dailyRun || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Son teslimi doğrulama iptal edildi.');
-      if (localStorage.getItem(BATCH_STORAGE) !== originalBatchText || localStorage.getItem(DAILY_STORAGE) !== originalDailyText) throw new Error('Çalışma kaydı doğrulama sırasında değişti. Hiçbir kayıt değiştirilmedi.');
+      if (state.cancel !== version || state.batchRun || state.dailyRun || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Last submission verification cancelled.');
+      if (localStorage.getItem(BATCH_STORAGE) !== originalBatchText || localStorage.getItem(DAILY_STORAGE) !== originalDailyText) throw new Error('The run report changed during verification. No records were changed.');
     };
-    status('Son teslim yalnızca okunarak doğrulanıyor; kadro yeniden gönderilmeyecek.');
+    status('Checking the last submission without resubmitting the squad.');
     guard(); services.SBC.reset();
-    const sets = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Teslim doğrulama: SBC setleri'),guard); guard();
-    if (!Array.isArray(sets.sets)) throw new Error('EA set listesi doğrulanamadı.');
+    const sets = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Submission verification: SBC sets'),guard); guard();
+    if (!Array.isArray(sets.sets)) throw new Error('Cannot validate the EA set list.');
     const matches = sets.sets.filter(set => String(set.id) === planned.setId);
-    if (matches.length !== 1) throw new Error('Teslim edilen SBC seti tam olarak eşleşmedi.');
+    if (matches.length !== 1) throw new Error('The submitted SBC set did not match exactly.');
     const set = matches[0];
-    const data = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set),'Teslim doğrulama: SBC parçaları'),guard); guard();
-    if (!Array.isArray(data.challenges)) throw new Error('EA görev listesi doğrulanamadı.');
+    const data = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set),'Submission verification: SBC challenges'),guard); guard();
+    if (!Array.isArray(data.challenges)) throw new Error('Cannot validate the EA challenge list.');
     const challenges = data.challenges.filter(challenge => String(challenge.id) === planned.challengeId && String(challenge.setId) === planned.setId);
-    if (challenges.length !== 1) throw new Error('Teslim edilen SBC parçası tam olarak eşleşmedi.');
+    if (challenges.length !== 1) throw new Error('The submitted SBC challenge did not match exactly.');
     const reconciled = helper.reconcile(original,{setId:planned.setId,challengeId:planned.challengeId,
       challengeTimesCompleted:challenges[0].timesCompleted,setTimesCompleted:set.timesCompleted,observedAt:new Date().toISOString()});
     let reconciledDaily = null;
@@ -828,7 +927,7 @@
       const setEntry = reconciled.snapshot.queue.find(entry => entry.setId === planned.setId);
       cycle.status = setEntry?.status === 'completed' ? 'completed' : 'blocked';
       reconciledDaily.status = 'stopped'; reconciledDaily.updatedAt = new Date().toISOString();
-      reconciledDaily.phase = 'Son teslim yalnızca okunarak doğrulandı. Otomatik devam edilmedi.';
+      reconciledDaily.phase = 'Last submission verified with a read-only check. The run was not resumed.';
       reconciledDaily.progress = {completedCycles:reconciledDaily.cycles.filter(entry => entry.status === 'completed').length,totalCycles:reconciledDaily.plan.totalCycles,
         confirmedParts:reconciledDaily.cycles.reduce((sum,entry) => sum + (entry.child?.snapshot?.progress?.confirmedChallenges || 0),0)};
     }
@@ -843,17 +942,89 @@
     const completedSets = new Set(reconciled.snapshot.queue.filter(entry => entry.status === 'completed').map(entry => entry.setId));
     state.batchQueue = state.batchQueue.filter(entry => !completedSets.has(String(entry.id)));
     ui.batchConsent.checked = false; ui.dailyConsent.checked = false; state.dailyPlan = null;
-    ui.batchStatus.textContent = `Son teslim doğrulandı · ${reconciled.snapshot.progress.confirmedChallenges} parça kayıtlı. Sıra durduruldu; otomatik devam edilmedi.`;
-    if (reconciledDaily) ui.dailyStatus.textContent = `${reconciledDaily.progress.completedCycles}/${reconciledDaily.progress.totalCycles} daily tekrarı · ${reconciledDaily.progress.confirmedParts} parça doğrulandı. Otomatik devam kapalı.`;
-    status('Son teslim EA tamamlanma sayaçlarından doğrulandı. Kadro tekrar gönderilmedi; devam etmek için güncel bir sıra başlatın.');
+    ui.batchStatus.textContent = `Last submission verified · ${reconciled.snapshot.progress.confirmedChallenges} challenges recorded. The queue is stopped and was not resumed.`;
+    if (reconciledDaily) ui.dailyStatus.textContent = `${reconciledDaily.progress.completedCycles}/${reconciledDaily.progress.totalCycles} daily cycles · ${reconciledDaily.progress.confirmedParts} challenges verified. Automatic resume is disabled.`;
+    status('Last submission verified against EA completion counters. Start a fresh queue to continue.');
+    renderBatch(); renderDaily();
+  }
+
+  async function verifyCardsForReplan() {
+    const helper = window.AutoSBCBatchReplan;
+    if (!helper || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Card verification or the EA session is not ready.');
+    if (state.batchRun || state.dailyRun) throw new Error('Stop the current queue first.');
+    const originalBatchText = localStorage.getItem(BATCH_STORAGE), originalDailyText = localStorage.getItem(DAILY_STORAGE);
+    let original, daily;
+    try { original = JSON.parse(originalBatchText || 'null'); daily = JSON.parse(originalDailyText || 'null'); }
+    catch { throw new Error('Cannot read the previous run report. No records were changed.'); }
+    const planned = helper.plan(original), selectedScope = scope();
+    if (planned.scope.gameYear !== selectedScope.gameYear || planned.scope.platform !== selectedScope.platform) throw new Error('The submission record does not match the selected game edition or platform.');
+    let dailyCycle = -1;
+    if (originalDailyText) {
+      if (!daily?.runId || !Array.isArray(daily.cycles) || !Array.isArray(daily.plan?.entries) || !Number.isSafeInteger(daily.plan?.totalCycles)) throw new Error('Cannot validate the daily report. No records were changed.');
+      const matches = daily.cycles.map((cycle,index) => cycle.child?.runId === original.runId ? index : -1).filter(index => index >= 0);
+      if (matches.length > 1) throw new Error('The same submission belongs to multiple daily cycles. No records were changed.');
+      if (matches.length) {
+        dailyCycle = matches[0]; const cycle = daily.cycles[dailyCycle];
+        if (JSON.stringify(cycle.child) !== JSON.stringify(original) || String(cycle.entry?.setId) !== planned.setId ||
+            daily.scope?.gameYear !== selectedScope.gameYear || daily.scope?.platform !== selectedScope.platform) throw new Error('Daily and SBC submission reports do not match. No records were changed.');
+      }
+    }
+    invalidate(); const version = state.cancel;
+    const guard = () => {
+      const current = scope();
+      if (state.cancel !== version || state.batchRun || state.dailyRun || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Card verification cancelled.');
+      if (localStorage.getItem(BATCH_STORAGE) !== originalBatchText || localStorage.getItem(DAILY_STORAGE) !== originalDailyText) throw new Error('The run report changed during verification. No records were changed.');
+    };
+    const readState = async () => {
+      guard(); services.SBC.reset();
+      const sets = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Card verification: SBC sets'),guard); guard();
+      if (!Array.isArray(sets.sets)) throw new Error('Cannot validate the EA set list.');
+      const matching = sets.sets.filter(set => String(set.id) === planned.setId);
+      if (matching.length !== 1 || typeof matching[0].isComplete !== 'function') throw new Error('Cannot match the submitted SBC set.');
+      const set = matching[0];
+      const data = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set),'Card verification: SBC challenges'),guard); guard();
+      if (!Array.isArray(data.challenges)) throw new Error('Cannot validate the EA challenge list.');
+      const challenges = data.challenges.filter(challenge => String(challenge.id) === planned.challengeId && String(challenge.setId) === planned.setId);
+      if (challenges.length !== 1 || typeof challenges[0].isCompleted !== 'function') throw new Error('Cannot match the submitted SBC challenge.');
+      const challenge = challenges[0], setCompleted = set.isComplete(), challengeCompleted = challenge.isCompleted();
+      // Native status is resettable, so this path accepts only the narrow
+      // nonrepeatable, never-completed case on both sides of the ownership read.
+      if (set.isRepeatable !== false || setCompleted !== false || challengeCompleted !== false ||
+          !['IN_PROGRESS','NOT_STARTED'].includes(challenge.status) || set.timesCompleted !== 0 || challenge.timesCompleted !== 0) throw new Error('Replanning requires a nonrepeatable, incomplete challenge with zero completion counters.');
+      return {setId:planned.setId,challengeId:planned.challengeId,isRepeatable:false,setCompleted,challengeCompleted,
+        challengeStatus:challenge.status,setTimesCompleted:set.timesCompleted,challengeTimesCompleted:challenge.timesCompleted,observedAt:new Date().toISOString()};
+    };
+    status('Checking challenge status and fresh card ownership. No squad will be saved or submitted.');
+    const initial = await readState(); guard();
+    const owned = await freshOwnership(guard); guard();
+    const final = await readState(); guard();
+    const reconciled = helper.reconcile(original,{runId:planned.runId,scope:selectedScope,initial,inventory:owned.ownership,final});
+    let reconciledDaily = null;
+    if (dailyCycle >= 0) {
+      reconciledDaily = JSON.parse(JSON.stringify(daily));
+      reconciledDaily.cycles[dailyCycle].child = reconciled;
+      reconciledDaily.cycles[dailyCycle].status = 'blocked';
+      reconciledDaily.status = 'stopped'; reconciledDaily.updatedAt = new Date().toISOString();
+      reconciledDaily.phase = 'Fresh reads confirmed no completion and all saved cards still owned. Build a new plan to continue.';
+      reconciledDaily.progress = {completedCycles:reconciledDaily.cycles.filter(entry => entry.status === 'completed').length,totalCycles:reconciledDaily.plan.totalCycles,
+        confirmedParts:reconciledDaily.cycles.reduce((sum,entry) => sum + (entry.child?.snapshot?.progress?.confirmedChallenges || 0),0)};
+    }
+    guard();
+    // Preserve the original attempt in both journals. A failed second write
+    // leaves a detectable parent/child mismatch and never resumes either run.
+    if (reconciledDaily) { localStorage.setItem(DAILY_STORAGE,JSON.stringify(reconciledDaily)); state.dailyReport = reconciledDaily; }
+    localStorage.setItem(BATCH_STORAGE,JSON.stringify(reconciled)); state.batchReport = reconciled;
+    ui.batchConsent.checked = false; ui.dailyConsent.checked = false; state.dailyPlan = null;
+    status('All 11 saved cards are still owned and EA reports no completion. The run stays stopped. Review a fresh queue and confirm it to continue.');
+    if (reconciledDaily) ui.dailyStatus.textContent = reconciledDaily.phase;
     renderBatch(); renderDaily();
   }
 
   function nativeDailySnapshot(set) {
     if (!set || typeof set.isComplete !== 'function' || typeof set.hasExpired !== 'function' || typeof set.getTimeRemaining !== 'function' ||
-        typeof set.getRepeatsRemaining !== 'function' || !Number.isSafeInteger(set.endTime) || set.endTime < 0) throw new Error(`${set?.name || 'Daily'}: Daily bitiş zamanı veya tekrar hakkı okunamadı.`);
+        typeof set.getRepeatsRemaining !== 'function' || !Number.isSafeInteger(set.endTime) || set.endTime < 0) throw new Error(`${set?.name || 'Daily'}: Cannot read the daily expiry time or repeat allowance.`);
     const expired = set.hasExpired(false), timeRemaining = set.getTimeRemaining(), completed = set.isComplete();
-    if (typeof expired !== 'boolean' || typeof completed !== 'boolean' || !Number.isFinite(timeRemaining)) throw new Error('Daily bitiş durumu okunamadı.');
+    if (typeof expired !== 'boolean' || typeof completed !== 'boolean' || !Number.isFinite(timeRemaining)) throw new Error('Cannot read the daily expiry status.');
     return {id:set.id,name:set.name,isRepeatable:set.isRepeatable,isLimitedRepeatable:set.isLimitedRepeatable,
       repeats:set.repeats,timesCompleted:set.timesCompleted,remaining:set.getRepeatsRemaining(),completed,
       expired:expired || set.endTime > 0 && timeRemaining <= 0};
@@ -867,28 +1038,28 @@
   function assertDailyHistory() {
     if (state.batchReportUnreadable || state.batchReport && (!state.batchReport.snapshot || !Array.isArray(state.batchReport.snapshot.queue) ||
         !['running','completed','stopped','blocked'].includes(state.batchReport.snapshot.status) ||
-        state.batchReport.snapshot.status === 'running' || hasUncertainBatch(state.batchReport))) throw new Error('Önceki SBC çalışmasının sonucu belirsiz. Daily başlamadan EA kaydını kontrol edin.');
-    if (unresolvedDaily()) throw new Error('Önceki daily çalışmasının sonucu belirsiz. Otomatik devam veya tekrar yapılmayacak.');
+        state.batchReport.snapshot.status === 'running' || hasUncertainBatch(state.batchReport))) throw new Error('The previous SBC run has an unresolved outcome. Check the EA record before starting dailies.');
+    if (unresolvedDaily()) throw new Error('The previous daily run has an unresolved outcome. It will not resume or repeat automatically.');
   }
   async function prepareDailies() {
     const D = window.AutoSBCDailyPlan;
-    if (!D || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Daily plan modülü veya EA oturumu hazır değil.');
+    if (!D || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Daily planning or the EA session is not ready.');
     assertDailyHistory(); state.dailyPlan = null; ui.dailyConsent.checked = false; invalidate();
     const selectedScope = scope(), version = state.cancel;
-    const guard = () => { const current = scope(); if (state.cancel !== version || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Daily planı iptal edildi veya sezon değişti.'); };
+    const guard = () => { const current = scope(); if (state.cancel !== version || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Daily planning was cancelled or the game edition changed.'); };
     services.SBC.reset();
-    const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Daily SBC setleri'),guard); guard();
-    if (!Array.isArray(data.sets)) throw new Error('EA daily setlerini döndürmedi.');
+    const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Daily SBC sets'),guard); guard();
+    if (!Array.isArray(data.sets)) throw new Error('EA did not return daily SBC sets.');
     const selected = data.sets.filter(set => D.dailyKind(set?.name));
     const plan = D.createPlan(selected.map(nativeDailySnapshot));
     state.dailyPlan = {plan,scope:selectedScope,day:new Date().toDateString(),createdAt:new Date().toISOString()};
-    ui.dailyStatus.textContent = `${plan.totalCycles} daily tekrarı planlandı. Başlatmadan önce aşağıdaki hakları kontrol edin.`;
+    ui.dailyStatus.textContent = `${plan.totalCycles} daily cycles planned. Review the remaining allowances below before starting.`;
     renderDaily();
   }
   function assertDailyRun(run) {
-    if (state.dailyRun !== run || run.stopped || !ui.dailyConsent.checked) throw new Error('Daily sırası durduruldu; yeni işlem başlatılmadı.');
+    if (state.dailyRun !== run || run.stopped || !ui.dailyConsent.checked) throw new Error('The daily plan stopped. No new action was started.');
     const current = scope();
-    if (current.gameYear !== run.scope.gameYear || current.platform !== run.scope.platform || new Date().toDateString() !== run.day) throw new Error('Daily planının günü, sezonu veya platformu değişti. Planı yeniden oluşturun.');
+    if (current.gameYear !== run.scope.gameYear || current.platform !== run.scope.platform || new Date().toDateString() !== run.day) throw new Error('The daily plan date, game edition or platform changed. Build a new plan.');
   }
   function recordDaily(run,phase) {
     const progress = {completedCycles:run.cycles.filter(cycle => cycle.status === 'completed').length,totalCycles:run.plan.totalCycles,
@@ -896,16 +1067,17 @@
     const report = {runId:run.runId,scope:run.scope,day:run.day,plan:run.plan,status:run.status,phase,updatedAt:new Date().toISOString(),
       currentCycle:run.currentCycle,cycles:run.cycles,progress,...(run.lastError ? {lastError:run.lastError} : {})};
     localStorage.setItem(DAILY_STORAGE,JSON.stringify(report)); state.dailyReport = report;
-    ui.dailyStatus.textContent = `${progress.completedCycles}/${progress.totalCycles} daily tekrarı tamamlandı · ${progress.confirmedParts} parça doğrulandı\n${phase}`;
+    ui.dailyStatus.textContent = `${progress.completedCycles}/${progress.totalCycles} daily cycles completed · ${progress.confirmedParts} challenges verified\n${phase}`;
     ui.dailyExport.disabled = false;
+    ui.dailyDetails.show.disabled = false;
   }
   function recordDailyChild(run,report) {
     const cycle = run.cycles[run.currentCycle];
-    if (!cycle) throw new Error('Daily döngü kaydı bulunamadı; işlem başlatılmadı.');
+    if (!cycle) throw new Error('The daily cycle record is missing. No action was started.');
     cycle.child = report;
     if (report.snapshot.status === 'completed' && report.snapshot.progress.completed === 1) cycle.status = 'completed';
     else settleDailyFailure(cycle);
-    recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle}. tekrar · ${report.phase}`);
+    recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle} cycle · ${report.phase}`);
   }
   function settleDailyFailure(cycle) {
     if (!cycle || cycle.status === 'completed') return;
@@ -917,8 +1089,8 @@
   async function runDailies() {
     assertDailyHistory();
     const prepared = state.dailyPlan;
-    if (!prepared?.plan.totalCycles || !ui.dailyConsent.checked) throw new Error('Önce daily haklarını planlayıp otomatik teslim seçimini işaretleyin.');
-    if (new Date().toDateString() !== prepared.day) throw new Error('Daily planının günü değişti. Yeniden planlayın.');
+    if (!prepared?.plan.totalCycles || !ui.dailyConsent.checked) throw new Error('Build a daily plan and confirm automatic submission first.');
+    if (new Date().toDateString() !== prepared.day) throw new Error('The daily plan date changed. Build a new plan.');
     const config = [ui.set,ui.challenge,ui.season,ui.platform,...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling];
     const savedControls = config.map(control => ({control,value:control.value,checked:control.checked,disabled:control.disabled}));
     const savedPolicy = localStorage.getItem(STORAGE), savedQueue = state.batchQueue.map(entry => ({...entry}));
@@ -928,30 +1100,30 @@
       cycles:prepared.plan.entries.map(entry => ({entry,status:'planned',child:null}))};
     state.dailyRun = run; config.forEach(control => { control.disabled = true; }); renderDaily();
     try {
-      assertDailyRun(run); recordDaily(run,'Daily planı başlatıldı');
+      assertDailyRun(run); recordDaily(run,'Daily plan started');
       for (let index=0;index<run.cycles.length;index++) {
         assertDailyRun(run);
         run.currentCycle = index; const cycle = run.cycles[index]; cycle.status = 'pending';
-        recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle}. tekrar hazırlanıyor`);
+        recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle} cycle preparing`);
         assertDailyRun(run);
         ui.settings.protectPlayed.checked = true; ui.settings.protectEvolutions.checked = true; ui.settings.protectSpecial.checked = true; ui.settings.allowConcept.checked = false;
         ui.settings.maxRating.value = dailyRating(cycle.entry.kind); ui.settings.maxPlayerPrice.value = run.cardLimit;
         const result = await runBatch({queueOverride:[{id:cycle.entry.setId,name:cycle.entry.name}],dailyParent:run,dailyEntry:cycle.entry});
         if (result.snapshot.status === 'completed' && result.snapshot.progress.completed === 1) cycle.status = 'completed';
-        recordDaily(run,cycle.status === 'completed' ? `${cycle.entry.name} · tekrar doğrulandı` : 'Daily tekrarı tamamlanmadı');
+        recordDaily(run,cycle.status === 'completed' ? `${cycle.entry.name} · cycle verified` : 'Daily cycle incomplete');
         if (run.stopped) break;
         assertDailyRun(run);
-        if (cycle.status !== 'completed') throw new Error('Daily tekrarının tamamlandığı doğrulanmadı. Sonraki tekrara geçilmedi.');
+        if (cycle.status !== 'completed') throw new Error('Daily cycle completion could not be verified. The next cycle was not started.');
         // A separate await between finite cycles lets stop/next-cycle pacing
         // intervene without rebuilding or extending the approved plan.
         await new Promise(resolve => setTimeout(resolve,0));
       }
       run.status = run.stopped ? 'stopped' : 'completed';
-      recordDaily(run,run.stopped ? 'Daily sırası durduruldu' : 'Planlanan daily tekrarları tamamlandı');
+      recordDaily(run,run.stopped ? 'Daily plan stopped' : 'Planned daily cycles completed');
     } catch (error) {
       run.status = run.stopped ? 'stopped' : 'blocked'; run.lastError = errorDetails(error);
       settleDailyFailure(run.cycles[run.currentCycle]);
-      try { recordDaily(run,`Durdu: ${error.message || error}`); } catch { /* Preserve the original error if persistence also failed. */ }
+      try { recordDaily(run,`Stopped: ${error.message || error}`); } catch { /* Preserve the original error if persistence also failed. */ }
       throw error;
     } finally {
       state.dailyRun = null; state.dailyPlan = null;
@@ -967,21 +1139,22 @@
     if (!ui.dailyList) return;
     ui.dailyList.replaceChildren();
     const plan = state.dailyPlan?.plan;
-    for (const entry of plan?.sets || []) el('li',`${entry.name}: ${entry.repetitions} tekrar`,ui.dailyList);
-    for (const entry of plan?.skipped || []) el('li',`${entry.name}: plana alınmadı (${entry.reason})`,ui.dailyList);
-    if (!plan) el('li','Önce bugünkü hakları oku.',ui.dailyList);
+    for (const entry of plan?.sets || []) el('li',`${entry.name}: ${entry.repetitions} cycles`,ui.dailyList);
+    for (const entry of plan?.skipped || []) el('li',`${entry.name}: omitted from plan (${entry.reason})`,ui.dailyList);
+    if (!plan) el('li','Build a plan to check current daily allowances.',ui.dailyList);
     ui.dailyPlan.disabled = state.busy;
     ui.dailyStart.disabled = state.busy || !plan?.totalCycles || !ui.dailyConsent.checked;
     ui.dailyStop.disabled = !state.dailyRun;
     ui.dailyExport.disabled = !state.dailyReport;
+    ui.dailyDetails.show.disabled = !state.dailyReport;
   }
   function stopDaily() {
     const run = state.dailyRun;
     if (run) { run.stopped = true; run.status = 'stopped'; }
     if (state.batchRun) { state.batchRun.stopped = true; state.batchRun.controller.stop(); }
     invalidate();
-    if (run) { try { recordDaily(run,'Daily sırası durduruldu; yeni işlem başlatılmayacak'); } catch (error) { fail(error); } }
-    status('Daily sırası durduruldu. EA’ya gönderilmiş işlem tamamlanabilir; sonraki tekrara geçilmeyecek.');
+    if (run) { try { recordDaily(run,'The daily plan stopped. No new action will start'); } catch (error) { fail(error); } }
+    status('The daily plan stopped. An action already sent to EA may complete; the next cycle will not start.');
   }
 
   function el(tag, text, parent) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (parent) parent.append(node); return node; }
@@ -990,19 +1163,30 @@
     if (!ui.batchList) return;
     ui.batchList.replaceChildren();
     for (const entry of state.batchQueue) el('li', entry.name, ui.batchList);
-    if (!state.batchQueue.length) el('li', 'Henüz set eklenmedi.', ui.batchList);
+    if (!state.batchQueue.length) el('li', 'No sets added yet.', ui.batchList);
     ui.batchAdd.disabled = state.busy;
     ui.batchClear.disabled = state.busy || !state.batchQueue.length;
     ui.batchStart.disabled = state.busy || !state.batchQueue.length || !ui.batchConsent.checked;
     ui.batchStop.disabled = !state.batchRun;
     ui.batchExport.disabled = !state.batchReport;
-    ui.batchReconcile.disabled = state.busy || !state.batchReport;
+    const eligible = helper => { try { return Boolean(helper?.plan(state.batchReport)); } catch { return false; } };
+    ui.batchReconcile.disabled = state.busy || !eligible(window.AutoSBCBatchReconcile);
+    ui.batchReplan.disabled = state.busy || !eligible(window.AutoSBCBatchReplan);
+    ui.batchDetails.show.disabled = !state.batchReport;
+    const report = state.batchReport, p = report?.snapshot?.progress;
+    if (!state.batchRun && p && Array.isArray(report.snapshot.queue)) {
+      const current = report.snapshot.queue.find(entry => entry && String(entry.setId) === String(report.snapshot.currentSetId));
+      const selected = Array.isArray(report.selectedSets) ? report.selectedSets.find(entry => entry && String(entry.id) === String(current?.setId)) : null;
+      const step = Array.isArray(current?.steps) ? current.steps.at(-1) : null;
+      const submitted = Array.isArray(report.receipts) ? report.receipts.filter(receipt => receipt.completed === true && receipt.rewardsGranted === true).length : 0;
+      ui.batchStatus.textContent = `${p.completed}/${p.total} sets completed · ${submitted} submission receipts · ${p.confirmedChallenges} counter verifications${current ? `\n${selected?.name || `Set ${current.setId}`}${step ? ` · Challenge ${step.challengeId}` : ''}` : ''}\n${report.phase || report.snapshot.status}`;
+    }
   }
   function stopBatch() {
     if (state.dailyRun) { stopDaily(); return; }
     if (state.batchRun) { state.batchRun.stopped = true; state.batchRun.controller.stop(); }
     invalidate();
-    status('Durduruldu. Başlatılan kadronun teslimi EA’da tamamlanabilir; sonraki kadroya geçilmeyecek.');
+    status('Stopped. A submission already sent to EA may complete; the next squad will not start.');
   }
   function settingsChanged() { if (state.dailyRun) stopDaily(); else if (state.batchRun) stopBatch(); else { state.dailyPlan = null; if (ui.dailyConsent) ui.dailyConsent.checked = false; invalidate(); renderDaily(); } }
   function downloadJSON(value, filename) {
@@ -1010,55 +1194,68 @@
     const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
     setTimeout(() => URL.revokeObjectURL(url),1000);
   }
+  function reportDetails(parent,title,buttonLabel,fieldLabel,getReport) {
+    const details = el('details',undefined,parent); el('summary',title,details);
+    el('p','Show the current report. Select the button again to refresh it.',details).className = 'muted';
+    const show = el('button',buttonLabel,details); show.disabled = true;
+    const field = el('textarea',undefined,el('label',fieldLabel,details));
+    field.readOnly = true; field.rows = 12; field.value = ''; field.spellcheck = false;
+    show.addEventListener('click',() => {
+      const report = getReport();
+      if (!report) return;
+      field.value = JSON.stringify(report,null,2); details.open = true;
+    });
+    return {show,field};
+  }
   function renderReview(preview) {
     ui.review.replaceChildren();
     el('h3', preview.input.sbcData.challengeName, ui.review);
-    el('p', `FC ${preview.input.gameYear} · ${preview.input.platform.toUpperCase()} · Kulüp + piyasa kadrosu`, ui.review).className = 'muted';
-    if (preview.input.liveMarket) el('p', `Anlık EA piyasası · ${preview.input.liveMarket.pagesRead} aramada gözlenen ${preview.input.liveMarket.quotes.length} fiyat. Yalnızca taranan ilanlar karşılaştırıldı; tüm piyasadaki en ucuz kart garantisi yok. Fiyatlar en fazla 120 saniye geçerlidir.`, ui.review);
+    el('p', `FC ${preview.input.gameYear} · ${preview.input.platform.toUpperCase()} · Club and market squad`, ui.review).className = 'muted';
+    if (preview.input.liveMarket) el('p', `Live EA market · ${preview.input.liveMarket.quotes.length} prices observed across ${preview.input.liveMarket.pagesRead} searches. Only those listings were compared; the cheapest card across the entire market is not guaranteed. Prices expire after 120 seconds.`, ui.review);
     const table = el('table', undefined, ui.review), head = el('tr', undefined, table);
-    ['Slot','Oyuncu','RTG','Maç','Tür','Fiyat'].forEach(label => el('th', label, head));
+    ['Slot','Player','RTG','Games','Type','Price'].forEach(label => el('th', label, head));
     for (const row of preview.rows) {
       const tr = el('tr', undefined, table);
-      const type = row.player.concept ? 'Konsept' : row.player.tradeabilityKnown === false ? 'Kulüp · satış durumu bilinmiyor' : row.player.isStorage ? 'Depo' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Kulüp · satılamaz' : 'Kulüp · satılabilir';
+      const type = row.player.concept ? 'Concept' : row.player.tradeabilityKnown === false ? 'Club · tradeability unknown' : row.player.isStorage ? 'Storage' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Club · untradeable' : 'Club · tradeable';
       const price = Number(row.marketPrice ?? row.futggPrice ?? row.player.marketPrice);
-      const played = row.player.concept ? '—' : Number.isSafeInteger(row.player.gamesPlayed) && row.player.gamesPlayed >= 0 ? row.player.gamesPlayed : 'Bilinmiyor';
-      [row.squadPosition + 1, row.player.name, row.player.rating, played, type, price > 0 ? Math.round(price).toLocaleString() : 'Tahmini'].forEach(value => el('td', String(value), tr));
+      const played = row.player.concept ? '—' : Number.isSafeInteger(row.player.gamesPlayed) && row.player.gamesPlayed >= 0 ? row.player.gamesPlayed : 'Unknown';
+      [row.squadPosition + 1, row.player.name, row.player.rating, played, type, price > 0 ? Math.round(price).toLocaleString() : 'Estimated'].forEach(value => el('td', String(value), tr));
     }
     const shopping = preview.result.shoppingList || [];
     const purchase = shopping.reduce((sum,item) => sum + Number(item.marketPrice) * Number(item.quantity), 0);
     const owned = preview.rows.filter(row => !row.player.concept);
     const ownedCost = owned.reduce((sum,row) => sum + (Number(row.marketPrice ?? row.futggPrice) || 0),0);
-    el('p', `${owned.length} kulüp kartı + ${shopping.length} alınacak kart · Satın alma toplamı: ${purchase.toLocaleString()} coin`, ui.review);
-    el('p', `Kulüp kartlarının tahmini piyasa değeri: ${ownedCost.toLocaleString()} coin. Bu tutar satın alma harcaması değildir. Önizleme 5 dakika geçerlidir.`, ui.review);
+    el('p', `${owned.length} club cards + ${shopping.length} cards to buy · Purchase total: ${purchase.toLocaleString()} coin`, ui.review);
+    el('p', `Estimated market value of club cards: ${ownedCost.toLocaleString()} coins. This is their value, not a purchase charge. The preview expires after 5 minutes.`, ui.review);
     if (shopping.length) {
-      el('h3', 'Alışveriş listesi', ui.review);
+      el('h3', 'Shopping list', ui.review);
       for (const item of shopping) {
         const box = el('div', undefined, ui.review);
         el('p', `${item.quantity} × ${item.name} (${item.rating}) — ${Number(item.marketPrice).toLocaleString()} coin`, box);
         const age = Math.max(0, Math.round((Date.now() - Date.parse(item.priceSnapshotAt))/60000));
-        el('p', `${item.source} · FC ${item.gameYear} / ${item.platform.toUpperCase()} · Kaynak fiyatı ${age} dk önce · ${new Date(item.priceSnapshotAt).toLocaleString()}`, box).className = 'muted';
+        el('p', `${item.source} · FC ${item.gameYear} / ${item.platform.toUpperCase()} · Source price ${age} minutes ago · ${new Date(item.priceSnapshotAt).toLocaleString()}`, box).className = 'muted';
         try {
           const url = new URL(item.url);
           if (url.protocol === 'https:' && ['www.fut.gg','fut.gg'].includes(url.hostname)) {
-            const link = el('a', preview.input.liveMarket ? 'Kart bilgilerini aç ↗' : 'Kart ve fiyat kaynağını aç ↗', box); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+            const link = el('a', preview.input.liveMarket ? 'View card details ↗' : 'View card and price source ↗', box); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
           }
         } catch { /* A missing source link never becomes an arbitrary navigation. */ }
       }
-      el('p', 'Konseptleri kadroya yerleştir düğmesi gerçek EA konsept kartlarını SBC’ye kaydeder. Bu işlem coin harcamaz. Konseptler gerçek kartlarla değiştirilmeden kadro teslim edilemez; alışveriş listesi yalnızca fiyat bilgisidir.', ui.review);
-    } else el('p', 'Alınacak kart yok; çözüm kulübünüzdeki kartlardan oluşuyor.', ui.review);
-    if (preview.conceptCoverage) el('p', `Piyasa havuzu: ${preview.conceptCoverage.returned ?? preview.conceptCoverage.addedToPool ?? '?'} / ${preview.conceptCoverage.totalEligible ?? '?'} uygun aday. ${preview.conceptCoverage.complete ? 'Politikaya uygun katalog adayları tarandı.' : 'Sınırlı aday seçimi: tüm piyasadaki en ucuz çözüm garantisi değildir.'}`, ui.review);
+      el('p', 'Place concept players saves EA concept cards to the SBC without spending coins. Replace them with owned cards before submitting. The shopping list provides prices only.', ui.review);
+    } else el('p', 'All cards in this solution are already in your club.', ui.review);
+    if (preview.conceptCoverage) el('p', `Market pool: ${preview.conceptCoverage.returned ?? preview.conceptCoverage.addedToPool ?? '?'} / ${preview.conceptCoverage.totalEligible ?? '?'} eligible candidates. ${preview.conceptCoverage.complete ? 'All eligible catalog candidates were checked.' : 'A limited pool was searched. The cheapest solution across the entire market is not guaranteed.'}`, ui.review);
     if (preview.result.summary) {
       const summary = preview.result.summary;
-      el('p', `Takım reytingi: ${summary.estimatedRating ?? '?'} · Kimya: ${summary.chemistry ?? '?'} · Dupe: ${summary.duplicatesUsed ?? 0} · Politika maliyeti: ${Math.round(summary.weightedCost || 0).toLocaleString()}`, ui.review);
-      if (Number.isFinite(summary.marketCost)) el('p', `Tahmini toplam piyasa değeri: ${Math.round(summary.marketCost).toLocaleString()} coin`, ui.review);
+      el('p', `Squad rating: ${summary.estimatedRating ?? '?'} · Chemistry: ${summary.chemistry ?? '?'} · Dupe: ${summary.duplicatesUsed ?? 0} · Weighted cost: ${Math.round(summary.weightedCost || 0).toLocaleString()}`, ui.review);
+      if (Number.isFinite(summary.marketCost)) el('p', `Estimated total market value: ${Math.round(summary.marketCost).toLocaleString()} coin`, ui.review);
     }
     const diagnostics = preview.result.diagnostics;
     if (diagnostics && (Array.isArray(diagnostics) ? diagnostics.length : true)) el('pre', JSON.stringify(diagnostics, null, 2), ui.review);
-    const details = el('details', undefined, ui.review); el('summary', 'Korunan kartlar ve Paletools', details);
+    const details = el('details', undefined, ui.review); el('summary', 'Protected cards and Paletools', details);
     el('pre', JSON.stringify(preview.rejected, null, 2), details);
-    el('p', 'Aktif kadrodaki kartlar korunur. Maç sayısı EA Oyuncu Bilgileri ekranının kullandığı veriden okunur; EA’nın sıfır gösterdiği kayıtlar bağımsız olarak doğrulanmaz. Oynanmış kart koruması açıkken maç sayısı pozitif veya okunamayan kulüp kartları kullanılmaz. Uygula öncesi kartlar yeniden okunur. Satış bilgisi bilinmeyen kartlar satılabilir kart politikasıyla değerlendirilir.', details);
-    el('p', 'Paletools kayıtlı kart/ülke/takım/lig/nadirlik kilitleri okunur. Farklı hesapların kayıtlı kilitleri de korunur. Paletools ayarları değiştirilmez.', details);
-    ui.apply.textContent = shopping.length ? 'Konseptleri kadroya yerleştir' : 'İnceledim · Kadroyu SBC’ye uygula';
+    el('p', 'Cards in every saved squad are protected, including inactive squads, bench and reserves, as reported by EA. Match counts use the same EA data as Player Bio; EA-reported zero counts are not independently verified. Played-card protection excludes cards with positive or unreadable match counts. Fresh club, storage and saved squad reads are required before applying. Cards with unknown tradeability follow the tradeable-card rule.', details);
+    el('p', 'Saved Paletools locks for cards, nations, clubs, leagues and rarities are respected, including saved locks from other accounts. Paletools settings are left unchanged.', details);
+    ui.apply.textContent = shopping.length ? 'Place concept players' : 'Apply squad';
     ui.apply.disabled = false;
   }
 
@@ -1068,89 +1265,93 @@
   style.textContent = `:host{all:initial;position:fixed;z-index:2147483000;right:18px;bottom:18px;font:13px/1.5 system-ui,sans-serif;color:#ecf6f3}*{box-sizing:border-box}button,input,select,textarea{font:inherit}button{background:#24443d;color:#ecf6f3;border:1px solid #56736b;border-radius:8px;padding:8px 12px;cursor:pointer}button:hover{background:#345c50}button:disabled{opacity:.45;cursor:default}.launch{background:#bdf576;color:#162210;font-weight:700}.panel{width:min(470px,calc(100vw - 36px));max-height:82vh;overflow:auto;background:#10231e;border:1px solid #3c6054;box-shadow:0 12px 50px #0008;border-radius:16px;padding:18px;margin-bottom:8px}.hidden{display:none}h2{font-size:21px;margin:0 0 2px}h3{font-size:16px}p{margin:8px 0}a{color:#bdf576}label{display:block;margin:9px 0}select,textarea,input[type=number]{background:#1c342d;color:#fff;border:1px solid #4e6f62;border-radius:6px;padding:6px;width:100%}input[type=checkbox]{margin-right:8px;accent-color:#bdf576}input[type=number]{width:100px;float:right}.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}details{border-top:1px solid #375348;margin-top:12px;padding-top:10px}summary{cursor:pointer;color:#d6e6de}.muted{font-size:12px;color:#a3c3b6}.status{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;font-size:12px}td,th{text-align:left;padding:5px 3px;border-bottom:1px solid #375348}pre{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}.apply{background:#bdf576;color:#122010;font-weight:700}`;
   const panel = el('section', undefined, root); panel.className = 'panel hidden';
   const ui = { settings: {}, weights: {} };
-  const launch = el('button', 'Auto-SBC Local', root); launch.className = 'launch';
+  const launch = el('button', 'Auto-SBC Studio', root); launch.className = 'launch';
   launch.addEventListener('click', () => { panel.classList.toggle('hidden'); if (!panel.classList.contains('hidden')) health().catch(fail); });
-  el('h2', 'Auto-SBC Local', panel); el('p', 'Kulüp + piyasa · gerçek fiyat · açık alışveriş listesi', panel).className = 'muted';
-  ui.season = el('select', undefined, el('label', 'Oynadığınız sezon', panel));
-  options(ui.season, [{id:'',name:'Sezon seçin'},{id:26,name:'EA FC 26'},{id:27,name:'EA FC 27'}]);
-  ui.platform = el('select', undefined, el('label', 'Fiyat platformu', panel));
-  options(ui.platform, [{id:'',name:'Platform seçin'},{id:'ps5',name:'Konsol piyasası (PS / Xbox)'},{id:'pc',name:'PC piyasası'}]);
+  el('h2', 'Auto-SBC Studio', panel); el('p', 'Build SBC squads with club cards and priced concepts', panel).className = 'muted';
+  if (typeof window.__autoSBCVersion === 'string' && /^\d+(\.\d+){0,3}$/.test(window.__autoSBCVersion)) el('p',`Version ${window.__autoSBCVersion}`,panel).className = 'muted';
+  ui.season = el('select', undefined, el('label', 'Game edition', panel));
+  options(ui.season, [{id:'',name:'Select game edition'},{id:26,name:'EA FC 26'},{id:27,name:'EA FC 27'}]);
+  ui.platform = el('select', undefined, el('label', 'Market platform', panel));
+  options(ui.platform, [{id:'',name:'Select platform'},{id:'ps5',name:'Console market (PS / Xbox)'},{id:'pc',name:'PC market'}]);
   try {
     const selected = JSON.parse(localStorage.getItem(SCOPE_STORAGE) || '{}');
     if ([26,27].includes(Number(selected.gameYear)) && ['ps5','pc'].includes(selected.platform)) {
       ui.season.value = selected.gameYear; ui.platform.value = selected.platform;
     }
   } catch { /* Require explicit selection for missing or malformed saved scope. */ }
-  ui.health = el('p', 'Yerel sunucu kontrol edilmedi.', panel); ui.health.className = 'muted';
+  ui.health = el('p', 'Local server not checked yet.', panel); ui.health.className = 'muted';
   ui.marketNotice = el('p', '', panel); ui.marketNotice.className = 'muted';
-  const dashboard = el('a', 'Yerel kontrol paneli ve veri tabanı ↗', panel); dashboard.href = BASE; dashboard.target = '_blank'; dashboard.rel = 'noopener';
+  const dashboard = el('a', 'Open local dashboard and database ↗', panel); dashboard.href = BASE; dashboard.target = '_blank'; dashboard.rel = 'noopener';
   const top = el('div', undefined, panel); top.className = 'row';
-  ui.refresh = el('button', 'SBC listesini yükle', top);
-  const check = el('button', 'Sunucuyu kontrol et', top); check.addEventListener('click', () => health().catch(fail));
-  ui.set = el('select', undefined, el('label', 'SBC seti', panel));
-  ui.challenge = el('select', undefined, el('label', 'Görev', panel));
-  ui.marketQuality = el('select', undefined, el('label', 'Anlık piyasada kart kalitesi', panel));
-  options(ui.marketQuality,[{id:'bronze',name:'Bronz'},{id:'silver',name:'Gümüş'},{id:'gold',name:'Altın'}]); ui.marketQuality.value = 'silver';
-  ui.marketCeiling = el('input', undefined, el('label','Anlık arama fiyat tavanı (coin)',panel));
+  ui.refresh = el('button', 'Load SBCs', top);
+  const check = el('button', 'Check server', top); check.addEventListener('click', () => health().catch(fail));
+  ui.set = el('select', undefined, el('label', 'SBC set', panel));
+  ui.challenge = el('select', undefined, el('label', 'Challenge', panel));
+  ui.marketQuality = el('select', undefined, el('label', 'Live market card quality', panel));
+  options(ui.marketQuality,[{id:'bronze',name:'Bronze'},{id:'silver',name:'Silver'},{id:'gold',name:'Gold'}]); ui.marketQuality.value = 'silver';
+  ui.marketCeiling = el('input', undefined, el('label','Live search price ceiling (coins)',panel));
   ui.marketCeiling.type='number'; ui.marketCeiling.min=1; ui.marketCeiling.max=15000000; ui.marketCeiling.value=2000;
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(STORAGE) || '{}'); } catch { /* Use safe defaults. */ }
   const settings = { ...P.defaults, ...saved, weights: { ...P.defaults.weights, ...saved.weights } };
-  const policySection = el('details', undefined, panel); policySection.open = true; el('summary', 'Kart politikası', policySection);
-  for (const [name,label] of [['prioritizeDuplicates','Dupe ve satılamaz kartlara öncelik ver'],['onlyStorage','Yalnızca SBC deposu'],['allowTradeable','Satılabilir kartlara izin ver'],['protectSpecial','Özel kartları koru'],['protectEvolutions','Evolution kartlarını koru'],['protectPlayed','Oynanmış kartları koru'],['allowConcept','Eksik yerleri fiyatlı piyasa kartlarıyla tamamla']]) {
+  const policySection = el('details', undefined, panel); policySection.open = true; el('summary', 'Card rules', policySection);
+  for (const [name,label] of [['prioritizeDuplicates','Prioritize duplicates and untradeables'],['onlyStorage','Use SBC storage only'],['allowTradeable','Allow tradeable cards'],['protectSpecial','Protect special cards'],['protectEvolutions','Protect evolved cards'],['protectPlayed','Protect played cards'],['allowConcept','Allow priced concept players']]) {
     const row = el('label', undefined, policySection), input = el('input', undefined, row); input.type = 'checkbox'; input.checked = Boolean(settings[name]); row.append(document.createTextNode(label)); ui.settings[name] = input;
   }
-  for (const [name,label,max] of [['maxRating','En yüksek oyuncu reytingi',99],['maxPlayerPrice','Kart başına değer limiti (0 = limitsiz)',15000000],['maxPurchasePrice','Satın alma bütçesi (0 = limitsiz)',165000000],['maxTotalPrice','Toplam kadro değeri limiti (0 = limitsiz)',165000000]]) {
+  for (const [name,label,max] of [['maxRating','Maximum player rating',99],['maxPlayerPrice','Player value limit (0 = no limit)',15000000],['maxPurchasePrice','Purchase budget (0 = no limit)',165000000],['maxTotalPrice','Squad value limit (0 = no limit)',165000000]]) {
     const labelNode = el('label', label, policySection), input = el('input', undefined, labelNode); input.type = 'number'; input.min = name === 'maxRating' ? 1 : 0; input.max = max; input.value = settings[name]; ui.settings[name] = input;
   }
-  const weights = el('details', undefined, panel); el('summary', 'Maliyet ağırlıkları ve kilitler', weights);
-  el('p', '1 = tam piyasa değeri; 0,1 = maliyetin %10’u. Kilitler ve korumalar her zaman önceliklidir.', weights).className = 'muted';
-  for (const [name,label] of [['duplicateUntradeable','Dupe satılamaz'],['untradeable','Satılamaz'],['tradeable','Satılabilir'],['concept','Konsept']]) {
+  const weights = el('details', undefined, panel); el('summary', 'Cost weights and locks', weights);
+  el('p', '1 = full market value; 0.1 = 10% of that value. Locks and protections always take priority.', weights).className = 'muted';
+  for (const [name,label] of [['duplicateUntradeable','Duplicate untradeable'],['untradeable','Untradeable'],['tradeable','Tradeable'],['concept','Concept']]) {
     const labelNode = el('label', label, weights), input = el('input', undefined, labelNode); input.type = 'number'; input.min = 0; input.max = 100; input.step = .1; input.value = settings.weights[name]; ui.weights[name] = input;
   }
-  ui.locked = el('textarea', undefined, el('label', 'Korunan envanter ID’leri (virgülle ayır)', weights)); ui.locked.rows = 2; ui.locked.value = (settings.lockedItemIds || []).join(', ');
-  ui.required = el('textarea', undefined, el('label', 'Mutlaka kullanılacak envanter ID’leri', weights)); ui.required.rows = 2; ui.required.value = (settings.requiredItemIds || []).join(', ');
-  const timeLabel = el('label', 'En fazla çözüm süresi (saniye)', panel); ui.time = el('input', undefined, timeLabel); ui.time.type = 'number'; ui.time.min = 1; ui.time.max = 120; ui.time.value = 30;
+  ui.locked = el('textarea', undefined, el('label', 'Protected item IDs (comma-separated)', weights)); ui.locked.rows = 2; ui.locked.value = (settings.lockedItemIds || []).join(', ');
+  ui.required = el('textarea', undefined, el('label', 'Required item IDs', weights)); ui.required.rows = 2; ui.required.value = (settings.requiredItemIds || []).join(', ');
+  const timeLabel = el('label', 'Maximum solve time (seconds)', panel); ui.time = el('input', undefined, timeLabel); ui.time.type = 'number'; ui.time.min = 1; ui.time.max = 120; ui.time.value = 30;
   const controls = el('div', undefined, panel); controls.className = 'row';
-  ui.solve = el('button', 'Çöz ve önizle', controls); ui.solve.className = 'launch';
-  ui.liveSolve = el('button', 'Anlık piyasadan çöz', controls);
-  el('p','Çöz ve önizle: FUT.GG veri tabanı. Anlık piyasadan çöz: EA’nın açık ilanları; arama tavanı, kart ve toplam bütçe limitlerinin en düşüğü kullanılır.',panel).className='muted';
-  const cancel = el('button', 'İptal', controls); cancel.addEventListener('click', () => { if (state.dailyRun) stopDaily(); else if (state.batchRun) stopBatch(); else { invalidate(); status('İptal edildi. Bekleyen sonuç uygulanmayacak.'); } });
-  ui.export = el('button', 'İsteği dışa aktar', controls); ui.export.disabled = true;
+  ui.solve = el('button', 'Solve and preview', controls); ui.solve.className = 'launch';
+  ui.liveSolve = el('button', 'Solve with live prices', controls);
+  el('p','Solve and preview uses the FUT.GG database. Solve with live prices searches current EA listings using the lowest of your search ceiling, card limit and total budget limits.',panel).className='muted';
+  const cancel = el('button', 'Cancel', controls); cancel.addEventListener('click', () => { if (state.dailyRun) stopDaily(); else if (state.batchRun) stopBatch(); else { invalidate(); status('Cancelled. The pending result will not be applied.'); } });
+  ui.export = el('button', 'Export solve request', controls); ui.export.disabled = true;
   ui.export.addEventListener('click', () => {
     if (!state.input) return;
     const url = URL.createObjectURL(new Blob([JSON.stringify(state.input,null,2)], {type:'application/json'}));
     const link = document.createElement('a'); link.href = url; link.download = `autosbc-request-${state.input.sbcData.challengeId}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
   });
-  ui.status = el('p', 'EA hesabına giriş yaptıktan sonra SBC listesini yükleyin.', panel); ui.status.className = 'status';
+  ui.status = el('p', 'Sign in to your EA account, then load SBCs.', panel); ui.status.className = 'status';
   ui.poolInfo = el('p', '', panel); ui.poolInfo.className = 'muted';
   ui.review = el('div', undefined, panel);
-  ui.apply = el('button', 'İnceledim · Kadroyu SBC’ye uygula', panel); ui.apply.className = 'apply'; ui.apply.disabled = true;
+  ui.apply = el('button', 'Apply squad', panel); ui.apply.className = 'apply'; ui.apply.disabled = true;
   const batchSection = el('section', undefined, panel);
-  el('h3', 'Otomatik SBC sırası', batchSection);
-  el('p', 'Seçtiğiniz her setin kalan parçalarını bir kez çözer, uygular ve teslim eder. Oynanmış, evolution ve aktif kadro kartları korunur. Coin harcamaz; paket açmaz ve oyuncu seçimi yapmaz. Durdur, sonraki kadroları engeller; EA’ya başlatılmış teslim tamamlanabilir.', batchSection).className = 'muted';
+  el('h3', 'Automatic SBC queue', batchSection);
+  el('p', 'Solve, apply and submit the remaining challenges in each selected set once. Played and evolved cards, plus cards in every saved squad, are protected. No purchases, pack opening or player-pick selection. Stop prevents the next squad; a submission already sent to EA may complete.', batchSection).className = 'muted';
   ui.batchList = el('ol', undefined, batchSection);
   const batchControls = el('div', undefined, batchSection); batchControls.className = 'row';
-  ui.batchAdd = el('button', 'Seçili seti sıraya ekle', batchControls);
-  ui.batchClear = el('button', 'Sırayı temizle', batchControls);
+  ui.batchAdd = el('button', 'Add selected set', batchControls);
+  ui.batchClear = el('button', 'Clear queue', batchControls);
   const consentLabel = el('label', undefined, batchSection);
   ui.batchConsent = el('input', undefined, consentLabel); ui.batchConsent.type = 'checkbox'; ui.batchConsent.checked = false;
-  consentLabel.append(document.createTextNode('Bu sıradaki kadroları otomatik teslim et; kullanılan kartlar kulübümden silinecek.'));
+  consentLabel.append(document.createTextNode('Automatically submit the queued squads. Submitted cards will be removed from my club.'));
   const batchRunControls = el('div', undefined, batchSection); batchRunControls.className = 'row';
-  ui.batchStart = el('button', 'Sırayı otomatik tamamla', batchRunControls); ui.batchStart.className = 'launch';
-  ui.batchStop = el('button', 'Sırayı durdur', batchRunControls);
-  ui.batchExport = el('button', 'Çalışma kaydını indir', batchRunControls);
-  ui.batchReconcile = el('button','Son teslimi doğrula',batchRunControls);
-  ui.batchStatus = el('p', 'Sıra çalışmıyor.', batchSection); ui.batchStatus.className = 'status';
+  ui.batchStart = el('button', 'Start queue', batchRunControls); ui.batchStart.className = 'launch';
+  ui.batchStop = el('button', 'Stop queue', batchRunControls);
+  ui.batchExport = el('button', 'Download run report', batchRunControls);
+  ui.batchReconcile = el('button','Verify last submission',batchRunControls);
+  ui.batchReplan = el('button','Verify cards and replan',batchRunControls);
+  el('p','Recovery buttons are available only for a matching stopped run. Verification checks EA records without resubmitting. A fresh plan always requires your confirmation.',batchSection).className = 'muted';
+  ui.batchStatus = el('p', 'Queue idle.', batchSection); ui.batchStatus.className = 'status';
+  ui.batchDetails = reportDetails(batchSection,'Run details','Show report JSON','SBC run report (JSON)',() => state.batchReport);
   try {
     const raw = localStorage.getItem(BATCH_STORAGE), previous = JSON.parse(raw || 'null');
-    if (previous?.runId) { state.batchReport = previous; ui.batchStatus.textContent = 'Önceki çalışma kaydı mevcut. Sayfa yenilendiğinde otomatik devam edilmez; kaydı ve EA’daki tamamlanma durumunu kontrol edin.'; }
+    if (previous?.runId) { state.batchReport = previous; ui.batchStatus.textContent = 'A previous run report is available. Runs do not resume after a reload. Review the report and completion status in EA.'; }
     if (raw && (!previous?.runId || !previous.snapshot || !Array.isArray(previous.snapshot.queue))) state.batchReportUnreadable = true;
-  } catch { state.batchReportUnreadable = true; ui.batchStatus.textContent = 'Önceki çalışma kaydı okunamadı. Otomatik devam kapalı.'; }
+  } catch { state.batchReportUnreadable = true; ui.batchStatus.textContent = 'Cannot read the previous run report. Automatic resume is disabled.'; }
   ui.batchAdd.addEventListener('click', () => {
     if (state.busy) return;
     const selected = state.sets.find(set => String(set.id) === ui.set.value);
-    if (!selected) { fail(new Error('Önce SBC listesini yükleyip bir set seçin.')); return; }
+    if (!selected) { fail(new Error('Load SBCs and select a set first.')); return; }
     if (!state.batchQueue.some(entry => String(entry.id) === String(selected.id))) state.batchQueue.push({id:String(selected.id),name:selected.name});
     ui.batchConsent.checked = false; renderBatch();
   });
@@ -1160,35 +1361,37 @@
   ui.batchStop.addEventListener('click', stopBatch);
   ui.batchExport.addEventListener('click', () => { if (state.batchReport) downloadJSON(state.batchReport, 'autosbc-batch-report.json'); });
   ui.batchReconcile.addEventListener('click',() => action(reconcileLastSubmission));
+  ui.batchReplan.addEventListener('click',() => action(verifyCardsForReplan));
   renderBatch();
   const dailySection = el('section',undefined,panel);
-  el('h3','Daily’leri otomatik yap',dailySection);
-  el('p','Bugünkü bronz, gümüş, common gold ve rare gold haklarını oku; gösterilen sonlu planı onayladığında tamamla. Özel, oynanmış ve evolution kartları korunur. Paketler açılmaz.',dailySection).className = 'muted';
-  ui.dailyPlan = el('button','Daily’leri otomatik yap',dailySection);
+  el('h3','Complete dailies',dailySection);
+  el('p','Check the current allowances for bronze, silver, common gold and rare gold dailies. Review and start the finite plan. Special, played and evolved cards are protected. Packs stay unopened.',dailySection).className = 'muted';
+  ui.dailyPlan = el('button','Build daily plan',dailySection);
   ui.dailyList = el('ol',undefined,dailySection);
   const dailyConsent = el('label',undefined,dailySection);
   ui.dailyConsent = el('input',undefined,dailyConsent); ui.dailyConsent.type = 'checkbox'; ui.dailyConsent.checked = false;
-  dailyConsent.append(document.createTextNode('Gösterilen daily tekrarlarını otomatik teslim et; kullanılan kartlar kulübümden silinecek.'));
+  dailyConsent.append(document.createTextNode('Automatically submit the daily cycles shown. Submitted cards will be removed from my club.'));
   const dailyControls = el('div',undefined,dailySection); dailyControls.className = 'row';
-  ui.dailyStart = el('button','Daily planını başlat',dailyControls);
-  ui.dailyStop = el('button','Daily sırasını durdur',dailyControls);
-  ui.dailyExport = el('button','Daily kaydını indir',dailyControls);
-  ui.dailyStatus = el('p','Daily planı henüz okunmadı.',dailySection); ui.dailyStatus.className = 'status';
+  ui.dailyStart = el('button','Start daily plan',dailyControls);
+  ui.dailyStop = el('button','Stop daily plan',dailyControls);
+  ui.dailyExport = el('button','Download daily report',dailyControls);
+  ui.dailyStatus = el('p','Build a daily plan to get started.',dailySection); ui.dailyStatus.className = 'status';
+  ui.dailyDetails = reportDetails(dailySection,'Daily run details','Show daily report JSON','Daily run report (JSON)',() => state.dailyReport);
   try {
     const raw = localStorage.getItem(DAILY_STORAGE), previous = JSON.parse(raw || 'null');
     if (previous?.runId && Array.isArray(previous.plan?.entries) && Number.isSafeInteger(previous.plan?.totalCycles) &&
         Array.isArray(previous.cycles) && ['running','completed','stopped','blocked'].includes(previous.status)) {
       state.dailyReport = previous;
-      ui.dailyStatus.textContent = 'Önceki daily kaydı mevcut. Sayfa yenilenince otomatik devam edilmez; plan ve EA durumu yeniden kontrol edilir.';
+      ui.dailyStatus.textContent = 'A previous daily report is available. Runs do not resume after a reload. The plan and EA status are checked again.';
     } else if (raw) state.dailyReportUnreadable = true;
-  } catch { state.dailyReportUnreadable = true; ui.dailyStatus.textContent = 'Daily kaydı okunamadı. Otomatik devam kapalı.'; }
+  } catch { state.dailyReportUnreadable = true; ui.dailyStatus.textContent = 'Cannot read the daily report. Automatic resume is disabled.'; }
   ui.dailyPlan.addEventListener('click',() => action(prepareDailies));
   ui.dailyStart.addEventListener('click',() => action(runDailies));
   ui.dailyConsent.addEventListener('change',() => { if (state.dailyRun && !ui.dailyConsent.checked) stopDaily(); renderDaily(); });
   ui.dailyStop.addEventListener('click',stopDaily);
   ui.dailyExport.addEventListener('click',() => { if (state.dailyReport) downloadJSON(state.dailyReport,'autosbc-daily-report.json'); });
   renderDaily();
-  el('p', 'Tekli önizleme yalnızca kadroyu kaydeder. Otomatik sıra yalnızca açıkça seçilen setleri teslim eder. TitiroMonkey Auto-SBC tabanlı · MIT.', panel).className = 'muted';
+  el('p', 'Single previews save squads. Automatic queues submit only the sets you select. Based on TitiroMonkey Auto-SBC · MIT.', panel).className = 'muted';
   ui.refresh.addEventListener('click', () => action(loadSets));
   ui.set.addEventListener('change', () => action(loadChallenges));
   ui.challenge.addEventListener('change', settingsChanged);
@@ -1203,10 +1406,10 @@
       getPrototype: () => typeof UTSBCSquadDetailPanelView !== 'undefined' ? UTSBCSquadDetailPanelView.prototype : null,
       resolveContext: activeChallengeContext,
       getGate: () => {
-        if (state.busy) return { ready: false, reason: 'Mevcut çözüm işlemi bitene kadar bekleyin.' };
+        if (state.busy) return { ready: false, reason: 'Wait for the current solve to finish.' };
         const gameYear = Number(ui.season.value), platform = ui.platform.value;
-        if (![26,27].includes(gameYear) || !['ps5','pc'].includes(platform)) return { ready: false, reason: 'Auto-SBC panelinden sezon ve platform seçin.' };
-        if (state.backendScope !== `${gameYear}:${platform}`) return { ready: false, reason: 'Auto-SBC panelinden yerel sunucu bağlantısını kontrol edin.' };
+        if (![26,27].includes(gameYear) || !['ps5','pc'].includes(platform)) return { ready: false, reason: 'Select your game edition and platform in Auto-SBC.' };
+        if (state.backendScope !== `${gameYear}:${platform}`) return { ready: false, reason: 'Check the local server connection in Auto-SBC.' };
         return { ready: true };
       },
       onMount: () => { health().catch(fail); },

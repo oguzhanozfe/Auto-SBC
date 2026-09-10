@@ -20,15 +20,15 @@
       try { return options.resolveContext(panel) || null; } catch { return null; }
     }
     function gate(context) {
-      if (!contextKey(context)) return { ready: false, reason: 'EA görevi yükleniyor…' };
-      try { return options.getGate(context) || { ready: false, reason: 'Hazırlanıyor…' }; }
-      catch { return { ready: false, reason: 'EA görevi henüz hazır değil.' }; }
+      if (!contextKey(context)) return { ready: false, reason: 'Loading the EA challenge…' };
+      try { return options.getGate(context) || { ready: false, reason: 'Preparing…' }; }
+      catch { return { ready: false, reason: 'The EA challenge is not ready yet.' }; }
     }
     function showDisabled(reason) {
       if (!button) return;
       button.disabled = true;
-      button.textContent = pending ? 'Auto-SBC · Çözülüyor…' : 'Auto-SBC · Hazırlanıyor…';
-      button.title = reason || 'EA görevi yükleniyor…';
+      button.textContent = pending ? 'Auto-SBC · Solving…' : 'Auto-SBC · Preparing…';
+      button.title = reason || 'Loading the EA challenge…';
     }
     function notifyNavigation(context) {
       const next = contextKey(context);
@@ -39,13 +39,13 @@
       event.preventDefault?.();
       const context = readContext(), key = contextKey(context), ready = gate(context);
       if (pending || button.disabled || !key || key !== observedKey || stableObservations < 2 || !ready.ready) {
-        showDisabled(ready.reason || 'Görev değişti; yeniden hazırlanıyor.');
+        showDisabled(ready.reason || 'The challenge changed; preparing it again.');
         tick();
         return;
       }
       // The current IDs are captured only at the user's click, not panel init.
       pending = true;
-      showDisabled('Çözüm hazırlanıyor; sonucu incelemeden kadro uygulanmaz.');
+      showDisabled('Preparing your solution. Review it before saving the squad.');
       try { await options.onSolveCurrent({ ...context }); }
       catch (error) { options.onError?.(error); }
       finally { pending = false; stableObservations = 0; tick(); }
@@ -60,7 +60,7 @@
         button.type = 'button';
         button.className = 'btn-standard';
         button.setAttribute('data-autosbc-native', 'true');
-        showDisabled('EA görevi yükleniyor…');
+        showDisabled('Loading the EA challenge…');
         // Bind before insertion: a visible button must never lack its handler.
         button.addEventListener('click', clicked);
       }
@@ -102,8 +102,8 @@
       if (pending || !ready.ready || stableObservations < 2) showDisabled(ready.reason);
       else {
         button.disabled = false;
-        button.textContent = 'Auto-SBC ile çöz';
-        button.title = 'Bu görevi yerel motorla çöz; kadroyu uygulamadan önce incele.';
+        button.textContent = 'Solve with Auto-SBC';
+        button.title = 'Solve this challenge and review the squad before saving.';
       }
     }
     hook();

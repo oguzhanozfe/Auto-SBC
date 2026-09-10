@@ -6,13 +6,13 @@ The goal is reliable SBC completion with visible limits and preserved club cards
 
 | Area | Current evidence | Acceptance check |
 | --- | --- | --- |
-| Owned squads | 27.0.1: ten Daily Silver completions. 27.0.4: 10x85+ and two 91-rated parts of the 98+ FOF/FUTTIES Pick, with native submission and zero-game checks; balance stayed 577,251. 27.0.6 added one automatically submitted 90-rated part; selected request: 1/5 groups, 4/17 parts | Complete the remaining four selected FUTBIN sets through the finite queue, recording each exact receipt and protected-card check |
+| Owned squads | Earlier solve/Apply flows plus nine fully automatic parts; selected request: 2/5 groups and 12/17 parts. Played/evolution checks preserved; balance 577,251 | Finish the three remaining groups with exact receipts and protected-card checks |
 | Concept players | 27.0.3: Mason Toye's exact 65-rated EA concept placed using an observed 200-coin listing; no purchase or submission | Preserve identity, source, platform and 120-second live quote age; never pretend a concept is owned |
 | Card protection | Zero-game checks, Evolution, active squad and Paletools locks; pre-Apply reread verified | Recheck at automatic submit; changed/missing stats or locks stop consumption |
-| Finite automation | 27.0.5 live queue stopped on a redundant requestSets 429 while solving challenge 4116, before any save or submit; zero new completions | 27.0.6 automatically submitted challenge 4116; native 3/7 confirms it. Complete the remaining queue and preserve exact receipts |
-| Read recovery | 27.0.6 implements one bounded 429 retry for set-list and challenge-list reads, with cooldown display and Stop checks; 185 browser tests passed | Verify cooldown and cancellation in the account session; never retry save, submit or an uncertain write |
+| Finite automation | 27.0.6 submitted one part; 27.0.7 submitted and verified eight more, including completion of the 98+ FOF/FUTTIES Pick | Resolve the later 409 without repeating an uncertain exchange, then finish the queue |
+| Read recovery | 27.0.7 successfully used one bounded 429 read retry during the transition to Yan Diomandé; Stop checks are covered in tests | Preserve the bounded cooldown and never automatically retry a write |
 | Daily preset | 27.0.6 implements finite Bronze/Silver/Common Gold/Rare Gold plans, low-rating profiles, a whole-job journal and separate child batches; live completion is pending | Read today's finite rights, complete each planned cycle once, stop on changed counters or uncertain results, and preserve the manual queue and settings |
-| Recovery | Confirmed 27.0.6 submit was followed by an immediate requestSets 521; the UI stopped at read verification | Reconcile exact confirmed-submit receipts against later server counters without repeating submission; keep uncertain writes blocked |
+| Recovery | 27.0.7 read-only reconciliation resolved the confirmed-submit/521-read report. The later 4152 submit409 has no receipt and is not counted | Permit a fresh plan only after strict status and fresh physical-ownership proof; preserve the original uncertainty and all receipts |
 | Diagnostics | EA status and solver diagnostics available | Explain exact unsatisfied constraints, stale prices and retry state in ordinary language |
 | FC 27 | Separate catalog exists; prior source had no usable FC 27 market prices | Verify live FC 27 adapter, definitions and market prices after launch; never reuse FC 26 prices |
 
