@@ -37,8 +37,8 @@ queue before opening settings; an already-dispatched request can still finish.
 The single-owner hosted profile accepts owned squads, up to 30 seconds and
 5,000 input cards, with a default 200-card chemistry cap. Larger inputs are
 rejected without trimming. Concepts require local mode. Render configuration is
-prepared but deployment, Docker CI smoke and hosted lifecycle tests remain
-pending; see [the deployment guide](../deploy/README.md).
+prepared and its small synthetic Docker CI smoke passed. Deployment and hosted
+lifecycle tests remain pending; see [the deployment guide](../deploy/README.md).
 
 ## Solve and review
 
