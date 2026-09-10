@@ -1,0 +1,1561 @@
+/* Auto-SBC Studio. EA adapter adapted from TitiroMonkey's MIT Auto-SBC.
+ * Single previews save only. Explicit finite batch runs may submit owned squads;
+ * neither mode purchases players, opens packs, or chooses player-pick rewards.
+ */
+(function () {
+  'use strict';
+  if (window.__autoSBCLocalLoaded) return;
+  window.__autoSBCLocalLoaded = true;
+  const P = window.AutoSBCPolicy;
+  const BASE = 'http://127.0.0.1:8000';
+  const STORAGE = 'autosbc.local.policy.v1';
+  const SCOPE_STORAGE = 'autosbc.local.scope.v1';
+  const BATCH_STORAGE = 'autosbc.local.batch.v1';
+  const DAILY_STORAGE = 'autosbc.local.daily.v1';
+  const state = { busy: false, sets: [], challenges: [], preview: null, input: null, cancel: 0, backendScope: null, nativeActive: null };
+  state.batchQueue = []; state.batchRun = null; state.batchReport = null;
+  state.dailyPlan = null; state.dailyRun = null; state.dailyReport = null;
+  state.batchReportUnreadable = false; state.dailyReportUnreadable = false;
+  let serverInfoPromise;
+  function serverInfo(fresh = false) {
+    if (!window.__autoSBCExtension) return Promise.resolve({origin:BASE,mode:'local',configured:true});
+    const previous = serverInfoPromise;
+    if (!serverInfoPromise || fresh) {
+      const request = new Promise((resolve,reject) => {
+      const id = crypto.randomUUID();
+      const timer = setTimeout(() => { window.removeEventListener('message',receive); reject(new Error('Cannot read extension server settings. Reload the extension and EA page.')); },10000);
+      const receive = event => {
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== 'autosbc-server-info-response' || event.data.id !== id) return;
+        clearTimeout(timer); window.removeEventListener('message',receive);
+        const info = event.data;
+        try {
+          if (info.error) throw new Error(String(info.error));
+          const url = new URL(info.origin);
+          if (info.configured !== true || !['local','hosted'].includes(info.mode) || typeof info.revision !== 'string' || !info.revision || info.revision.length > 200 || url.origin !== info.origin ||
+              url.username || url.password || info.mode === 'local' && info.origin !== BASE ||
+              info.mode === 'hosted' && url.protocol !== 'https:') throw new Error('Invalid server settings. Open Server settings and choose a server.');
+          resolve(Object.freeze({origin:info.origin,mode:info.mode,configured:true,revision:info.revision}));
+        } catch (error) { reject(error); }
+      };
+      window.addEventListener('message',receive);
+      window.postMessage({source:'autosbc-server-info-request',id},location.origin);
+      });
+      if (fresh && previous) return Promise.all([previous,request]).then(([pinned,current]) => {
+        if (current.origin !== pinned.origin || current.mode !== pinned.mode || current.revision !== pinned.revision) throw new Error('Server settings changed. Reload the EA page before continuing.');
+        return current;
+      });
+      serverInfoPromise = request;
+    }
+    return serverInfoPromise;
+  }
+
+  async function http(path, method = 'GET', data, timeout = 15000) {
+    if (!['/health','/api/solve/jobs'].includes(path.split('?')[0]) && !/^\/api\/solve\/jobs\/[a-zA-Z0-9-]+$/.test(path)) throw new Error('Unsupported local endpoint.');
+    const destination = await serverInfo();
+    // The extension's isolated bridge avoids EA's page CSP for localhost requests.
+    if (window.__autoSBCExtension) return new Promise((resolve, reject) => {
+      const id = crypto.randomUUID();
+      const timer = setTimeout(() => { window.removeEventListener('message', receive); reject(new Error('Solver request timed out. Check the server connection.')); }, timeout);
+      const receive = event => {
+        if (event.source !== window || event.origin !== location.origin || event.data?.source !== 'autosbc-local-response' || event.data.id !== id) return;
+        clearTimeout(timer); window.removeEventListener('message', receive);
+        if (event.data.error) reject(new Error(event.data.error));
+        else if (event.data.serverOrigin !== destination.origin) reject(new Error('The server destination changed. Reload the EA page before continuing.'));
+        else if (!event.data.ok) reject(new Error(P.errorMessage(event.data.body, event.data.status)));
+        else resolve(event.data.body);
+      };
+      window.addEventListener('message', receive);
+      window.postMessage({ source: 'autosbc-local-request', id, path, method, data, timeout }, location.origin);
+    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    return fetch(BASE + path, {
+      method, headers: { 'Content-Type': 'application/json' }, credentials: 'omit',
+      body: data === undefined ? undefined : JSON.stringify(data), signal: controller.signal
+    }).then(async response => {
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { throw new Error('Local solver returned a non-JSON response.'); }
+      if (!response.ok) throw new Error(P.errorMessage(body, response.status));
+      return body;
+    }).catch(error => {
+      if (error.name === 'AbortError') throw new Error('Local solver request timed out.');
+      if (error instanceof TypeError) throw new Error('Cannot reach the local solver. Start the local server; if EA blocks access, use the bundled Chrome extension.');
+      throw error;
+    }).finally(() => clearTimeout(timer));
+  }
+
+  function itemViolations(value) {
+    // EA submit failures expose data.itemViolations as saved-squad names and
+    // item IDs. These are diagnostic bounds, not EA protocol constants.
+    if (!Array.isArray(value) || !value.length || value.length > 30) return null;
+    const allIds = new Set(), rows = [];
+    for (const row of value) {
+      if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.name !== 'string' || row.name.length > 120 ||
+          !Array.isArray(row.itemIds) || !row.itemIds.length || row.itemIds.length > 32) return null;
+      const name = row.name.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g,'').trim();
+      if (!name) return null;
+      const ids = new Set();
+      for (const raw of row.itemIds) {
+        if (typeof raw !== 'number' && !(typeof raw === 'string' && /^\d{1,16}$/.test(raw))) return null;
+        const id = Number(raw);
+        if (!Number.isSafeInteger(id) || id <= 0) return null;
+        ids.add(id); allIds.add(id);
+        if (allIds.size > 330) return null;
+      }
+      rows.push({name,itemIds:[...ids]});
+    }
+    return rows;
+  }
+  function observe(request, label) {
+    return new Promise((resolve, reject) => {
+      if (!request || typeof request.observe !== 'function') { reject(new Error(`${label}: EA adapter unavailable.`)); return; }
+      const owner = {};
+      const timer = setTimeout(() => { request.unobserve?.(owner); const error = new Error(`${label}: EA did not respond within 20 seconds.`); error.operation = label; error.code = 'TIMEOUT'; reject(error); }, 20000);
+      request.observe(owner, (sender, result) => {
+        clearTimeout(timer); request.unobserve?.(owner);
+        if (!result || result.success === false || (result.status >= 400)) {
+          const rawStatus = result?.status, rawCode = result?.error?.code;
+          const statusCode = /^(?:[1-5]\d{2})$/.test(String(rawStatus)) ? Number(rawStatus) : undefined;
+          const code = Number.isSafeInteger(rawCode) ? rawCode : typeof rawCode === 'string' && /^[A-Z0-9_-]{1,80}$/.test(rawCode) ? rawCode : undefined;
+          const error = new Error(`${label}: EA returned ${statusCode || 'an error'}${code !== undefined ? ` (${code})` : ''}.`);
+          if (statusCode !== undefined) error.status = statusCode;
+          if (code !== undefined) error.code = code;
+          const conflicts = itemViolations(result?.data?.itemViolations);
+          if (conflicts) {
+            error.itemViolations = conflicts;
+            const names = conflicts.slice(0,5).map(row => row.name).join(', ');
+            error.message += ` EA reports cards assigned to saved squads: ${names}${conflicts.length > 5 ? ` and ${conflicts.length - 5} more` : ''}. Remove the listed cards from those saved squads in EA. Review the run report before starting another queue.`;
+          }
+          if (typeof result?.retryAfter === 'number' && Number.isFinite(result.retryAfter) && result.retryAfter > 0) error.retryAfterSeconds = result.retryAfter;
+          error.operation = label; reject(error); return;
+        }
+        resolve(result.data ?? result.response ?? result);
+      });
+    });
+  }
+  function ready() {
+    return typeof services !== 'undefined' && services.SBC && services.Club && services.Item &&
+      typeof UTBucketedItemSearchViewModel !== 'undefined' && typeof UTSBCSquadOverviewViewController !== 'undefined';
+  }
+  function activeChallengeContext() {
+    try {
+      if (!ready() || typeof getAppMain !== 'function') return null;
+      // This controller path and _challenge are from the MIT upstream adapter.
+      const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
+      const challenge = current.getCurrentController().childViewControllers?.[0]?._challenge;
+      if (!challenge || !challenge.id || !challenge.setId || challenge.status === 'COMPLETED' ||
+          !Array.isArray(challenge.eligibilityRequirements) || !Array.isArray(challenge.squad?._formation?.generalPositions) ||
+          !challenge.squad._formation.generalPositions.length) return null;
+      return { setId: challenge.setId, challengeId: challenge.id };
+    } catch { return null; }
+  }
+  function assertNativeContext(context) {
+    if (!context) return;
+    const current = activeChallengeContext();
+    if (!current || String(current.setId) !== String(context.setId) || String(current.challengeId) !== String(context.challengeId)) {
+      throw new Error('The SBC screen changed. Solve the current challenge again before applying.');
+    }
+  }
+  function physicalId(value) {
+    return (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value)) &&
+      Number.isSafeInteger(Number(value)) && Number(value) > 0 ? String(value) : null;
+  }
+  function savedSquadId(value) {
+    // EA squad entities accept ID 0; physical player item IDs remain positive.
+    return (typeof value === 'number' || typeof value === 'string' && /^(0|[1-9]\d{0,15})$/.test(value)) &&
+      Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? String(value) : null;
+  }
+  function squadIdentityError(message,listed,entries=[]) {
+    const scalar = value => ({type:typeof value,value:
+      value === null ? 'null' : typeof value === 'number' || typeof value === 'boolean' || typeof value === 'undefined' ? String(value) :
+      typeof value === 'string' && /^-?\d{1,16}$/.test(value) ? value : typeof value === 'string' ? '[non-numeric string]' : '[non-scalar]'});
+    const diagnostic = {activeSquadId:scalar(listed?.activeSquadId),count:Array.isArray(listed?.squads) ? listed.squads.length : null,
+      squads:entries.slice(0,30).map(entry => ({getIdPresent:entry.present,...scalar(entry.value),...(entry.failed ? {getterFailed:true} : {})}))};
+    return new Error(`${message} Squad identity details: ${JSON.stringify(diagnostic)}`);
+  }
+  function reviewedDefinitions(preview) {
+    if (!Array.isArray(preview?.rows) || !preview.rows.length || preview.rows.length > 11) throw new Error('The reviewed squad is unreadable. Solve again.');
+    // Concept identity checks still need the complete owned inventory.
+    if (preview.rows.some(row => row.player?.concept !== false)) return null;
+    const ids = preview.rows.map(row => physicalId(row.player?.definitionId));
+    if (ids.some(id => id === null)) throw new Error('A reviewed card definition is unreadable. Solve again.');
+    return Object.freeze([...new Set(ids.map(Number))]);
+  }
+  async function pages(storage, guard, definitionIds = null) {
+    guard();
+    const allowed = !storage && definitionIds ? new Set(definitionIds) : null;
+    if (!storage) {
+      // The upstream EA adapter refreshes club statistics before every inventory
+      // traversal. Otherwise a second traversal can return the already cached
+      // cumulative item list without advancing its retrieval flags.
+      if (typeof services.Club.clubDao?.resetStatsCache !== 'function' || typeof services.Club.getStats !== 'function') {
+        throw new Error('Club cache refresh: EA adapter unavailable. Nothing was applied.');
+      }
+      services.Club.clubDao.resetStatsCache();
+      await observe(services.Club.getStats(), 'Refresh club statistics'); guard();
+    }
+    const found = new Map();
+    for (let offset = 0, page = 0; page < 500; page++, offset += 91) {
+      guard();
+      const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
+      criteria.count = 91; criteria.offset = offset;
+      // Native Club DAO serializes defId as CSV and isExactSearch as filter=exact.
+      // Its cacheable property is a getter; reset the repository instead.
+      if (allowed) { criteria.defId = [...allowed]; criteria.isExactSearch = true; }
+      const response = await observe(storage ? services.Item.searchStorageItems(criteria) : services.Club.search(criteria), storage ? 'SBC storage' : 'Club players');
+      guard();
+      if (!Array.isArray(response.items) || ['retrievedAll','endOfList'].some(key => response[key] !== undefined && typeof response[key] !== 'boolean')) throw new Error('EA player response format changed.');
+      const before = found.size;
+      for (const item of response.items) {
+        if (typeof item?.isPlayer !== 'function') throw new Error('EA inventory item type is unreadable.');
+        if (!item.isPlayer()) continue;
+        if (!physicalId(item.id) || item.concept !== false) throw new Error('EA inventory ownership is unreadable.');
+        // Native repository filtering also matches databaseId (the athlete), so
+        // independently require the reviewed full card revision.
+        if (allowed && (!physicalId(item.definitionId) || !allowed.has(Number(item.definitionId)))) throw new Error('EA returned a different card definition during selected-card verification. Nothing was submitted.');
+        found.set(physicalId(item.id),item);
+      }
+      status(`${allowed ? 'Verifying selected cards' : 'Reading inventory'}: ${found.size} ${storage ? 'storage' : 'club'} cards`);
+      if (response.retrievedAll === true || response.endOfList === true || !allowed && response.items.length === 0) return [...found.values()];
+      if (before === found.size) throw new Error(`EA pagination stopped advancing. ${storage ? 'SBC storage' : 'Club players'}: offset=${offset}, rows=${response.items.length}, unique=${found.size}, retrievedAll=${response.retrievedAll ?? 'missing'}, endOfList=${response.endOfList ?? 'missing'}. Refresh the Web App and try again.`);
+    }
+    throw new Error('Club pagination limit reached.');
+  }
+  function inventoryGuard() {
+    const version = state.cancel, selected = scope();
+    return () => {
+      const current = scope();
+      if (state.cancel !== version || current.gameYear !== selected.gameYear || current.platform !== selected.platform) throw new Error('Inventory refresh cancelled or the game edition changed.');
+      assertNativeContext(state.nativeActive);
+    };
+  }
+  async function freshOwnership(guard, definitionIds = null) {
+    guard();
+    if (definitionIds !== null && (!Array.isArray(definitionIds) || !definitionIds.length || definitionIds.length > 11 ||
+        definitionIds.some(id => !Number.isSafeInteger(id) || id <= 0) || new Set(definitionIds).size !== definitionIds.length)) throw new Error('Selected-card ownership scope is invalid.');
+    const itemRepo = typeof repositories !== 'undefined' ? repositories.Item : null;
+    if (typeof itemRepo?.getClub !== 'function' || typeof itemRepo?.setDirty !== 'function' ||
+        typeof ItemPile === 'undefined' || ItemPile.STORAGE === undefined ||
+        typeof services.Club.clubDao?.resetStatsCache !== 'function' || typeof services.Club.getStats !== 'function' ||
+        typeof services.Club.search !== 'function' || typeof services.Item.searchStorageItems !== 'function') throw new Error('Fresh club and storage reads are unavailable. No stale inventory will be used.');
+    const clubRepo = itemRepo.getClub();
+    if (typeof clubRepo?.reset !== 'function') throw new Error('Fresh club cache reset is unavailable.');
+    // Both operations invalidate local caches; they do not change the account.
+    clubRepo.reset();
+    const club = await pages(false,guard,definitionIds); guard();
+    itemRepo.setDirty(ItemPile.STORAGE);
+    const storage = await pages(true,guard); guard();
+    const storageIds = new Set(storage.map(item => String(item.id)));
+    const unique = new Map(), proof = [];
+    for (const [source,items] of [['club',club],['storage',storage]]) for (const item of items) {
+      const id = physicalId(item.id);
+      if (unique.has(id)) throw new Error('The same item appeared in both club and storage. Ownership could not be verified.');
+      unique.set(id,item); proof.push(Object.freeze({id,source,concept:false,isPlayer:true}));
+    }
+    // Squad hydration can repopulate the item repository from saved references.
+    // Freeze the physical ownership proof before making any squad-list request.
+    const ownership = Object.freeze({cacheReset:true,clubComplete:definitionIds === null,storageComplete:true,
+      ...(definitionIds ? {clubFilter:Object.freeze({definitionIds:Object.freeze([...definitionIds]),exact:true,complete:true})} : {}),
+      items:Object.freeze(proof),observedAt:new Date().toISOString()});
+    return {items:[...unique.values()],storageIds,ownership};
+  }
+  function savedSquadAdapter() {
+    const squadService = services.Squad;
+    if (!squadService || typeof squadService.resetSquadsCache !== 'function' ||
+        typeof squadService.requestSquadList !== 'function' || typeof squadService.requestSquadById !== 'function') {
+      throw new Error('Cannot read all saved squads. Stopped to protect their players.');
+    }
+    return squadService;
+  }
+  async function savedSquadLocks(guard) {
+    guard(); const squadService = savedSquadAdapter();
+    squadService.resetSquadsCache();
+    const listed = await observe(squadService.requestSquadList(),'Saved squad list'); guard();
+    if (!Array.isArray(listed.squads) || !listed.squads.length) throw squadIdentityError('Cannot read the complete saved squad list.',listed);
+    const entries = listed.squads.map(squad => {
+      const present = typeof squad?.getId === 'function';
+      try { return {present,value:present ? squad.getId() : undefined}; }
+      catch { return {present,value:undefined,failed:true}; }
+    });
+    const ids = entries.map(entry => entry.failed ? null : savedSquadId(entry.value));
+    const activeId = savedSquadId(listed.activeSquadId);
+    if (activeId === null || ids.some(id => id === null) || new Set(ids).size !== ids.length || !ids.includes(activeId)) throw squadIdentityError('Saved squad identities or the active squad are missing.',listed,entries);
+    const locked = new Set();
+    for (const id of ids) {
+      guard(); const response = await observe(squadService.requestSquadById(Number(id)),`Saved squad ${id}`); guard();
+      const squad = response.squad;
+      if (typeof squad?.getId !== 'function' || savedSquadId(squad.getId()) !== id || typeof squad.getPlayers !== 'function') throw new Error('Cannot read saved squad players or match the squad identity.');
+      const slots = squad.getPlayers();
+      // EA models contain 23 player slots, including bench and reserves. The
+      // native factory fills empty slots; this checks its reported model shape.
+      if (!Array.isArray(slots) || slots.length !== 23) throw new Error('Cannot read the full saved squad roster.');
+      for (const slot of slots) {
+        if (typeof slot?.getItem !== 'function') throw new Error('Cannot read a saved squad slot.');
+        const item = slot.getItem();
+        if (!item || item.id == null || !physicalId(item.id) && item.id !== 0 && item.id !== '0') throw new Error('Cannot read a saved squad item ID.');
+        if (physicalId(item.id)) locked.add(physicalId(item.id));
+      }
+    }
+    return locked;
+  }
+  async function inventory(guard = inventoryGuard(), definitionIds = null) {
+    // Sequential reads avoid competing EA service/cache operations.
+    guard(); savedSquadAdapter();
+    const owned = await freshOwnership(guard,definitionIds); guard();
+    const unassigned = await observe(services.Item.requestUnassignedItems(), 'Unassigned items'); guard();
+    if (!Array.isArray(unassigned.items)) throw new Error('Cannot read unassigned items.');
+    const duplicates = new Set(unassigned.items.filter(item => item.duplicateId > 0).map(item => String(item.duplicateId)));
+    const activeSquadIds = await savedSquadLocks(guard); guard();
+    return {...owned,duplicates,activeSquadIds};
+  }
+  function athleteId(item) {
+    // EA databaseId is the athlete ID (definitionId & ItemIdMask.DATABASE).
+    // PlayerMeta may be keyed by a full card revision; getAssetId() instead
+    // returns cardassetid, which is not a player identity.
+    return item?.databaseId ?? item?.assetId ?? item?._metaData?.id ?? item?._staticData?.id;
+  }
+  function gamesPlayed(item) {
+    if (item.concept) return null;
+    // Follow the same EA getters as Player Bio. EA initializes missing stats
+    // to zero, so this is EA-reported history, not independent proof that raw
+    // stats were present in a server response. Missing/malformed getters fail closed.
+    try {
+      if (typeof item.getTotalGamesPlayed !== 'function' || typeof item.getLifetimeStats !== 'function' || typeof item.getStats !== 'function') return null;
+      const total = item.getTotalGamesPlayed(), lifetime = item.getLifetimeStats(), current = item.getStats();
+      const validCount = value => Number.isSafeInteger(value) && value >= 0;
+      const validStats = values => Array.isArray(values) && values.length >= 5 && [0,1,2,3,4].every(index => validCount(values[index]));
+      if (!validCount(total) || !validStats(lifetime) || !validStats(current) || total !== lifetime[0]) return null;
+      return Math.max(total, current[0]);
+    } catch { return null; }
+  }
+  function card(item, inventoryState, chem) {
+    const rawRarity = item.rareflag ?? item._rareflag;
+    const rarity = (typeof rawRarity === 'number' || typeof rawRarity === 'string' && /^\d+$/.test(rawRarity)) &&
+      Number.isInteger(Number(rawRarity)) && Number(rawRarity) >= 0 ? Number(rawRarity) : undefined;
+    const reportedSpecial = typeof item.isSpecial === 'function' ? item.isSpecial() : undefined;
+    const special = reportedSpecial === true || (rarity === undefined ? reportedSpecial !== false : rarity > 1);
+    const tier = typeof item.getTier === 'function' ? item.getTier() : (item.rating >= 75 ? 3 : item.rating >= 65 ? 2 : 1);
+    const cardType = rarity === undefined ? 'Unknown rarity' : services.Localization?.localize('item.raretype' + rarity) || String(rarity);
+    const profile = chem?.getChemProfileForPlayer(item);
+    // EA currently exposes `tradable`; older adapters used `untradeable`.
+    // Missing/nonboolean/conflicting metadata never earns an untradeable discount.
+    const tradable = typeof item.tradable === 'boolean' ? item.tradable :
+      typeof item.untradeable === 'boolean' ? !item.untradeable : null;
+    const conflicting = typeof item.tradable === 'boolean' && typeof item.untradeable === 'boolean' && item.tradable === item.untradeable;
+    const tradeabilityKnown = tradable !== null && !conflicting;
+    return {
+      id: item.id, definitionId: item.definitionId, assetId: athleteId(item),
+      name: item._staticData?.name ?? item.name ?? String(item.definitionId), cardType,
+      rating: item.rating, teamId: item.teamId, leagueId: item.leagueId, nationId: item.nationId,
+      rarityId: rarity, ratingTier: tier, isUntradeable: tradeabilityKnown && !tradable, tradeabilityKnown,
+      gamesPlayed: gamesPlayed(item),
+      isLocked: inventoryState.activeSquadIds.has(String(item.id)),
+      isDuplicate: inventoryState.duplicates.has(String(item.id)), isStorage: inventoryState.storageIds.has(String(item.id)),
+      isLoan: !Number.isFinite(Number(item.loans)) || Number(item.loans) >= 0, isTimeLimited: Boolean(item.isTimeLimited?.()),
+      isSpecial: Boolean(special), isEvolution: Boolean(item.upgrades || (typeof item.isEvolution === 'function' && item.isEvolution()) || /evolution/i.test(cardType)),
+      preferredPosition: item.preferredPosition, possiblePositions: item.possiblePositions || [item.preferredPosition],
+      groups: Array.isArray(item.groups) && item.groups.length ? item.groups : undefined,
+      rarityGroupsKnown: Array.isArray(item.groups) && item.groups.length > 0,
+      concept: Boolean(item.concept),
+      // No stale embedded prices: the backend enriches from its local database.
+      price: null, marketPrice: null, futggPrice: null,
+      maxChem: Boolean(profile?.maxChem), teamChem: profile?.rules?.[0], leagueChem: profile?.rules?.[1],
+      nationChem: profile?.rules?.[2], normalizeClubId: chem?.normalizeClubId(item.teamId) ?? item.teamId
+    };
+  }
+  function chemistry() {
+    if (typeof UTSquadChemCalculatorUtils === 'undefined') throw new Error('EA chemistry adapter unavailable. Reload the Web App.');
+    const util = new UTSquadChemCalculatorUtils();
+    util.chemService = services.Chemistry; util.teamConfigRepo = repositories.TeamConfig;
+    return util;
+  }
+  async function liveMarketQuotes(selectedScope, currentPolicy, pale, assertCurrent) {
+    if (!currentPolicy.allowConcept || currentPolicy.onlyStorage) throw new Error('Enable concept players and turn off storage-only mode to use live market prices.');
+    if (typeof UTSearchCriteriaDTO === 'undefined' || typeof ItemSearchFeature === 'undefined' || typeof ItemType === 'undefined' ||
+        typeof SearchLevel === 'undefined' || typeof ItemRatingTier === 'undefined' ||
+        typeof services.Item.searchTransferMarket !== 'function' || typeof services.Item.clearTransferMarketCache !== 'function') {
+      throw new Error('EA live market search is not ready.');
+    }
+    const quality = ui.marketQuality.value, qualityKey = quality.toUpperCase();
+    if (!['bronze','silver','gold'].includes(quality) || SearchLevel[qualityKey] === undefined || ItemRatingTier[qualityKey] === undefined) throw new Error('Select a market card quality.');
+    const requestedCeiling = Number(ui.marketCeiling.value);
+    if (!Number.isSafeInteger(requestedCeiling) || requestedCeiling < 1 || requestedCeiling > 15000000) throw new Error('Live search price ceiling must be a whole number from 1 to 15,000,000.');
+    const limits = [currentPolicy.maxPlayerPrice,currentPolicy.maxPurchasePrice,currentPolicy.maxTotalPrice].filter(value => value > 0);
+    const ceiling = Math.min(requestedCeiling,...limits);
+    if (!Number.isSafeInteger(ceiling) || ceiling < 1) throw new Error('Market price limit must be a positive whole number.');
+    const thresholds = [...new Set([150,200,250,300,400,600,1000,1500,ceiling].filter(value => value <= ceiling))].sort((a,b)=>a-b);
+    let pagesRead = 0, observedAt = null, searchedMaxBuy = 0;
+    const quotes = new Map();
+    search: for (const maxBuy of thresholds) {
+      assertCurrent();
+      // Official EA service cache is indexed by page: reset it when the query changes.
+      services.Item.clearTransferMarketCache();
+      for (let page = 1; pagesRead < 9; page++) {
+        assertCurrent();
+        const criteria = new UTSearchCriteriaDTO();
+        criteria.type = ItemType.PLAYER; criteria.level = SearchLevel[qualityKey]; criteria.maxBuy = maxBuy;
+        if (currentPolicy.protectSpecial) criteria.rarities = [0,1];
+        const model = new UTBucketedItemSearchViewModel();
+        model.searchFeature = ItemSearchFeature.MARKET;
+        model.defaultSearchCriteria.type = criteria.type;
+        model.updateSearchCriteria(criteria);
+        const query = model.searchCriteria;
+        query.disableOverrides = true; // Paletools' documented read-only lookup path.
+        status(`EA live market: ${quality} · up to ${maxBuy.toLocaleString()} coins · search ${pagesRead + 1}/9`);
+        const response = await observe(services.Item.searchTransferMarket(query, page), 'EA live market');
+        const receivedAt = new Date().toISOString();
+        pagesRead++; searchedMaxBuy = maxBuy; assertCurrent();
+        if (!Array.isArray(response.items)) throw new Error('Cannot read the EA market response.');
+        for (const item of response.items) {
+          if (typeof item?.getTier !== 'function' || item.getTier() !== ItemRatingTier[qualityKey] || typeof item.getAuctionData !== 'function') continue;
+          const auction = item.getAuctionData();
+          if (!auction || typeof auction.isActiveTrade !== 'function' || !auction.isActiveTrade() ||
+              typeof auction.getSecondsRemaining !== 'function' || !(auction.getSecondsRemaining() > 0)) continue;
+          const price = Number(auction.buyNowPrice), definitionId = Number(item.definitionId);
+          if (!Number.isSafeInteger(price) || price <= 0 || price > maxBuy || !Number.isSafeInteger(definitionId) || definitionId <= 0) continue;
+          const rawRarity = item.rareflag ?? item._rareflag;
+          const rarity = rawRarity != null && rawRarity !== '' && Number.isInteger(Number(rawRarity)) ? Number(rawRarity) : undefined;
+          const special = typeof item.isSpecial === 'function' ? item.isSpecial() : undefined;
+          const candidate = {id:`concept:${definitionId}`,definitionId,concept:true,assetId:athleteId(item),
+            rating:item.rating,teamId:item.teamId,leagueId:item.leagueId,nationId:item.nationId,rarityId:rarity,marketPrice:price,
+            isSpecial:special === true || (rarity === undefined ? special !== false : rarity > 1),
+            isEvolution:Boolean(item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution()),
+            isLoan:typeof item.isLimitedUse === 'function' && item.isLimitedUse()};
+          if (!Number.isFinite(Number(candidate.rating)) || P.blockedReason(candidate,currentPolicy,pale)) continue;
+          if (!observedAt) observedAt = receivedAt;
+          const prior = quotes.get(definitionId);
+          if (!prior || price < prior.buyNowPrice) quotes.set(definitionId,{definitionId,buyNowPrice:price});
+        }
+        // This is a bounded observed pool, not a claim about every market listing.
+        if (quotes.size) break search;
+        if (response.items.length === 0 || Number.isInteger(query.count) && response.items.length < query.count) break;
+      }
+      if (pagesRead >= 9) break;
+    }
+    if (!quotes.size) throw new Error('No eligible cards were found in the EA listings searched. Adjust the price limit or card quality.');
+    return {...selectedScope,observedAt,quality,searchMaxBuy:searchedMaxBuy,pagesRead,quotes:[...quotes.values()]};
+  }
+  function simpleBricks(squad) {
+    const indices = squad?.simpleBrickIndices;
+    if (!Array.isArray(indices) || indices.some(index => !Number.isInteger(index) || index < 0 || index > 10) || new Set(indices).size !== indices.length) throw new Error('EA simple brick positions are unreadable.');
+    return [...indices];
+  }
+  async function challengeData(challenge, set) {
+    await observe(services.SBC.loadChallenge(challenge), 'Load SBC');
+    const squad = challenge.squad;
+    if (!squad?._formation?.generalPositions || !Array.isArray(challenge.eligibilityRequirements)) throw new Error('EA challenge data format changed.');
+    // EA's factory supplies the string AND by default. OR combines whole
+    // requirements, which the current solver's flat constraint list cannot
+    // represent. Missing/unknown operations must not become an assumed AND.
+    if (challenge.eligibilityOperation === 'OR') throw new Error('This SBC uses alternative (OR) requirements, which Auto-SBC does not support yet.');
+    if (challenge.eligibilityOperation !== 'AND') throw new Error('The SBC requirement operation is missing or unsupported. Solving stopped.');
+    const constraints = [];
+    for (const eligibility of challenge.eligibilityRequirements) {
+      if (!eligibility || typeof eligibility !== 'object' || Array.isArray(eligibility)) throw new Error('EA challenge requirement is unreadable.');
+      const pairs = eligibility.kvPairs?._collection;
+      if (!pairs || typeof pairs !== 'object' || Array.isArray(pairs)) throw new Error('EA challenge requirement is unreadable.');
+      const entries = Object.entries(pairs);
+      // Native combined predicates count their intersection on each player.
+      // Flattening them would count different players for each condition.
+      if (entries.length > 1 || eligibility.isCombinedRequirement === true) throw new Error('This SBC combines multiple conditions on the same players, which Auto-SBC does not support yet.');
+      if (entries.length !== 1 || eligibility.isCombinedRequirement !== undefined && eligibility.isCombinedRequirement !== false) throw new Error('EA challenge requirement is unreadable.');
+      const [id, values] = entries[0];
+      const requirementKey = SBCEligibilityKey[id], scope = SBCEligibilityScope[eligibility.scope];
+      if (!requirementKey || !scope) throw new Error(`Unrecognized EA requirement ${id}.`);
+      constraints.push({ scope, count: eligibility.count, requirementKey, eligibilityValues: values });
+    }
+    const brickIndices = simpleBricks(squad);
+    return { constraints, formation: squad._formation.generalPositions.map((value,index) => brickIndices.includes(index) ? -1 : value),
+      challengeId: challenge.id, setId: set.id, brickIndices, sbcName: set.name, challengeName: challenge.name,
+      currentSolution: (squad._players || []).slice(0,11).map(slot => athleteId(slot?._item) || 0),
+      subs: (squad._players || []).slice(11).map(slot => slot?._item?.definitionId).filter(Boolean) };
+  }
+  function readPaletools() {
+    const entries = [];
+    for (const storage of [localStorage, sessionStorage]) {
+      for (let i = 0; i < storage.length; i++) {
+        const name = storage.key(i);
+        if (name?.startsWith('paletools:') && (name.endsWith(':lockedItems') || name === 'paletools:settings')) entries.push([name, storage.getItem(name)]);
+      }
+    }
+    return P.parsePaletools(entries);
+  }
+  function legacyLocks() {
+    try {
+      const settings = JSON.parse(localStorage.getItem('sbcSolverSettings') || '{}');
+      const old = settings.sbcSettings || {};
+      const set = ui.set.value, challenge = ui.challenge.value;
+      return [...(old[0]?.[0]?.excludePlayers || []), ...(old[set]?.[0]?.excludePlayers || []), ...(old[set]?.[challenge]?.excludePlayers || [])];
+    } catch { throw new Error('Existing Auto-SBC locks could not be read. Repair saved settings before solving.'); }
+  }
+  function policy() {
+    const input = {};
+    for (const [name, control] of Object.entries(ui.settings)) input[name] = control.type === 'checkbox' ? control.checked : Number(control.value);
+    input.weights = {};
+    for (const [name, control] of Object.entries(ui.weights)) input.weights[name] = Number(control.value);
+    const parseIds = value => value.split(/[\s,;]+/).map(value => value.trim()).filter(Boolean);
+    input.lockedItemIds = parseIds(ui.locked.value);
+    input.requiredItemIds = parseIds(ui.required.value);
+    input.lockedDefinitionIds = legacyLocks();
+    const result = P.normalizePolicy(input);
+    localStorage.setItem(STORAGE, JSON.stringify(result));
+    return result;
+  }
+  function status(text, error = false) { ui.status.textContent = text; ui.status.style.color = error ? '#ffb7b7' : '#bbd0cc'; }
+  function fail(error) { status(error?.message || String(error), true); }
+  async function action(callback) {
+    if (state.busy) return;
+    state.busy = true;
+    [ui.refresh,ui.solve,ui.liveSolve,ui.apply,ui.batchAdd,ui.batchStart,ui.batchClear,ui.batchReconcile,ui.batchReplan,ui.dailyPlan,ui.dailyStart].filter(Boolean).forEach(button => { button.disabled = true; });
+    try { await callback(); } catch (error) { fail(error); }
+    finally { state.busy = false; state.nativeActive = null; ui.refresh.disabled = false; ui.solve.disabled = false; ui.liveSolve.disabled = false; ui.apply.disabled = !state.preview; renderBatch(); renderDaily(); }
+  }
+  function invalidate() { state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true; ui.review.replaceChildren(); ui.poolInfo.textContent = ''; }
+  function scope(required = true) {
+    const value = { gameYear: Number(ui.season.value), platform: ui.platform.value };
+    if (![26,27].includes(value.gameYear) || !['ps5','pc'].includes(value.platform)) {
+      if (required) throw new Error('Select your game edition and market platform first.');
+      return null;
+    }
+    localStorage.setItem(SCOPE_STORAGE, JSON.stringify(value));
+    return value;
+  }
+  async function health() {
+    ui.health.textContent = 'Checking the server…';
+    try {
+      const destination = await serverInfo(true);
+      ui.destination.textContent = destination.mode === 'hosted' ? `Hosted solver: ${destination.origin}. Selected club cards are sent to this server.` : `Local solver: ${destination.origin}. Club data stays on this computer.`;
+      ui.dashboard.href = destination.origin;
+      ui.dashboard.textContent = destination.mode === 'hosted' ? 'Open hosted server ↗' : 'Open local dashboard and database ↗';
+      const selected = scope(false);
+      const result = await http('/health' + (selected ? `?gameYear=${selected.gameYear}&platform=${selected.platform}` : ''));
+      const currentScope = scope(false);
+      if (`${selected?.gameYear}:${selected?.platform}` !== `${currentScope?.gameYear}:${currentScope?.platform}`) return result;
+      state.backendScope = result.status === 'ok' && selected ? `${selected.gameYear}:${selected.platform}` : null;
+      const db = result.database || {};
+      ui.health.textContent = selected ? `Server connected · FC ${selected.gameYear} / ${selected.platform.toUpperCase()} · ${db.count ?? '?'} cards · ${db.pricedCount ?? '?'} market prices${result.solverBusy ? ' · solver busy' : ''}` : 'Server connected. Select your game edition and platform.';
+      if (selected && (db.readiness === 'awaiting_market_prices' || db.readyForConcepts === false)) ui.marketNotice.textContent = `FC ${selected.gameYear} / ${selected.platform.toUpperCase()} FUT.GG prices are not available yet. Database mode cannot suggest priced concepts. Solve with live prices searches current EA listings separately. Prices from other editions are excluded.`;
+      else ui.marketNotice.textContent = selected ? `Prices are specific to FC ${selected.gameYear} / ${selected.platform.toUpperCase()}.` : '';
+      return result;
+    } catch (error) { state.backendScope = null; ui.health.textContent = 'Cannot connect to the configured server'; throw error; }
+  }
+  async function loadSets() {
+    if (!ready()) throw new Error('Sign in to the EA Web App and wait for your club to load.');
+    invalidate();
+    const data = await observe(services.SBC.requestSets(), 'SBC sets');
+    state.sets = (data.sets || []).filter(set => typeof set.isComplete !== 'function' || !set.isComplete());
+    options(ui.set, state.sets);
+    await loadChallenges();
+  }
+  async function loadChallenges() {
+    invalidate();
+    const set = state.sets.find(set => String(set.id) === ui.set.value);
+    if (!set) { options(ui.challenge, []); return; }
+    const data = await observe(services.SBC.requestChallengesForSet(set), 'SBC challenges');
+    state.challenges = (data.challenges || []).filter(challenge => challenge.status !== 'COMPLETED');
+    options(ui.challenge, state.challenges);
+    status(`${state.challenges.length} challenges ready. Review your card rules, then solve.`);
+  }
+  async function solve(nativeContext = null, liveMode = false) {
+    invalidate();
+    state.nativeActive = nativeContext;
+    const version = state.cancel;
+    if (!ready()) throw new Error('The EA Web App is not ready yet.');
+    const selectedScope = scope();
+    if (typeof APP_YEAR !== 'undefined') {
+      const detectedYear = Number(String(APP_YEAR).slice(-2));
+      if ([26,27].includes(detectedYear) && detectedYear !== selectedScope.gameYear) throw new Error(`The EA Web App reports FC ${detectedYear}. Update your game edition selection.`);
+    }
+    await health();
+    assertNativeContext(nativeContext);
+    if (nativeContext) {
+      const data = await observe(services.SBC.requestSets(), 'Current SBC set');
+      assertNativeContext(nativeContext);
+      state.sets = data.sets || [];
+      const selectedSet = state.sets.find(set => String(set.id) === String(nativeContext.setId));
+      if (!selectedSet) throw new Error('The current SBC set is no longer available. Refresh the EA screen.');
+      options(ui.set, state.sets); ui.set.value = selectedSet.id;
+      const challenges = await observe(services.SBC.requestChallengesForSet(selectedSet), 'Current SBC challenge');
+      assertNativeContext(nativeContext);
+      state.challenges = (challenges.challenges || []).filter(challenge => challenge.status !== 'COMPLETED');
+      options(ui.challenge, state.challenges); ui.challenge.value = nativeContext.challengeId;
+    }
+    const currentPolicy = policy(), pale = readPaletools();
+    if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
+    const set = state.sets.find(set => String(set.id) === ui.set.value);
+    const challenge = state.challenges.find(challenge => String(challenge.id) === ui.challenge.value);
+    if (!set || !challenge) throw new Error('Load SBCs and select a challenge first.');
+    const sbcData = await challengeData(challenge, set);
+    assertNativeContext(nativeContext);
+    const inv = await inventory(() => {
+      if (version !== state.cancel) throw new Error('Solve cancelled during inventory refresh.');
+      assertNativeContext(nativeContext);
+    }), chem = chemistry();
+    assertNativeContext(nativeContext);
+    currentPolicy.lockedItemIds = [...new Set([...currentPolicy.lockedItemIds, ...inv.activeSquadIds])];
+    let players = inv.items.map(item => card(item, inv, chem));
+    // Existing reserves are protected: never silently consume a substitute.
+    players = players.filter(player => !sbcData.subs.map(String).includes(String(player.definitionId)));
+    const rejected = {};
+    for (const player of players) {
+      const reason = P.blockedReason(player, currentPolicy, pale);
+      if (reason) rejected[reason] = (rejected[reason] || 0) + 1;
+    }
+    players = players.filter(player => !P.blockedReason(player, currentPolicy, pale));
+    const present = new Set(players.map(player => String(player.id)));
+    for (const required of currentPolicy.requiredItemIds) if (!present.has(String(required))) throw new Error(`Required card ${required} is unavailable or protected.`);
+    // Send explicit Paletools locks too; duplicate preference never overrides locks.
+    currentPolicy.lockedDefinitionIds = [...new Set([...currentPolicy.lockedDefinitionIds, ...pale.definitionIds.filter(value => /^\d+$/.test(value))])];
+    Object.assign(currentPolicy, { lockedNationIds: pale.nationIds, lockedTeamIds: pale.teamIds,
+      lockedLeagueIds: pale.leagueIds, lockedRarityIds: pale.rarityIds });
+    const maxSolveTime = Number(ui.time.value);
+    if (!Number.isFinite(maxSolveTime) || maxSolveTime < 1 || maxSolveTime > 120) throw new Error('Solve time must be between 1 and 120 seconds.');
+    state.input = { clubPlayers: players, sbcData, maxSolveTime, solverPolicy: currentPolicy, ...selectedScope };
+    if (liveMode) state.input.liveMarket = await liveMarketQuotes(selectedScope,currentPolicy,pale,() => {
+      if (version !== state.cancel) throw new Error('Market search cancelled.');
+      assertNativeContext(nativeContext);
+    });
+    ui.export.disabled = false;
+    status(`${players.length} club candidates; ${inv.items.length - players.length} protected cards. ${liveMode ? `${state.input.liveMarket.quotes.length} live EA prices. ` : currentPolicy.allowConcept ? 'Adding priced candidates from the FUT.GG database. ' : ''}Solving…`);
+    // Short polling requests keep Chrome MV3's worker alive even for long solves.
+    // Never retry the creation POST: a lost response must not launch two jobs.
+    if (version !== state.cancel) { status('Cancelled. No new solve job was started.'); return; }
+    assertNativeContext(nativeContext);
+    const job = await http('/api/solve/jobs', 'POST', state.input);
+    if (!job.jobId || !/^[a-zA-Z0-9-]+$/.test(job.jobId)) throw new Error('Local server returned an invalid solve job ID.');
+    let result;
+    const deadline = Date.now() + (state.input.maxSolveTime + 60) * 1000;
+    while (Date.now() < deadline) {
+      if (version !== state.cancel) { status('Cancelled. The result was not applied. The local solver may finish its existing job within the time limit.'); return; }
+      const progress = await http(`/api/solve/jobs/${job.jobId}`);
+      if (progress.status === 'done') { result = progress.result; break; }
+      if (progress.status === 'error') throw new Error(P.errorMessage(progress));
+      if (progress.status !== 'running') throw new Error('Local server returned an unknown job status.');
+      if (progress.progress) status(`Solving: ${progress.progress.ownedCandidates ?? players.length} club cards + ${progress.progress.conceptCandidates ?? 0} market candidates · ${Math.round(progress.progress.elapsedSeconds || 0)} s`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    if (!result) throw new Error('The local solve timed out. Check the server status.');
+    if (version !== state.cancel) { status('Cancelled. The result was not applied.'); return; }
+    assertNativeContext(nativeContext);
+    const conceptCoverage = result.diagnostics?.conceptCoverage ?? result.conceptCoverage ?? result.conceptPool ?? null;
+    if (conceptCoverage) ui.poolInfo.textContent = `Market candidates: ${conceptCoverage.returned ?? conceptCoverage.addedToPool ?? '?'} / ${conceptCoverage.totalEligible ?? '?'} eligible cards. ${conceptCoverage.complete ? 'All eligible catalog candidates were checked.' : 'A limited, varied pool was searched. The cheapest solution across the entire market is not guaranteed.'}`;
+    const rows = P.validateSolution(result, state.input, currentPolicy, pale);
+    state.preview = { rows, set, challenge, input: state.input, policy: currentPolicy, time: Date.now(), result, rejected, conceptCoverage, nativeContext };
+    renderReview(state.preview);
+    status('Solution ready. Review the cards, then apply the squad. This preview only saves the squad; submit it yourself in EA.');
+  }
+  async function apply(batchGuard = null) {
+    const preview = state.preview;
+    const version = state.cancel;
+    if (!preview) throw new Error('Build a solution first.');
+    const assertCurrent = () => {
+      if (batchGuard) batchGuard();
+      if (version !== state.cancel) throw new Error('Apply cancelled.');
+      assertNativeContext(preview.nativeContext);
+      if (Date.now() - preview.time > 5 * 60 * 1000) { invalidate(); throw new Error('This preview is more than 5 minutes old. Refresh your club and solve again.'); }
+      const selected = scope();
+      if (selected.gameYear !== preview.input.gameYear || selected.platform !== preview.input.platform) throw new Error('Game edition or platform changed. Solve again.');
+    };
+    assertCurrent();
+    const pale = readPaletools();
+    if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
+    P.validateSolution(preview.result, preview.input, policy(), pale);
+    const concepts = preview.rows.filter(row => row.player.concept), resolvedConcepts = new Map();
+    for (const row of concepts) {
+      const definitionId = Number(row.player.definitionId);
+      if (!Number.isSafeInteger(definitionId) || definitionId <= 0 || typeof services.Item.searchConceptItems !== 'function') throw new Error('EA concept search is unavailable. The squad was not changed.');
+      const criteria = new UTBucketedItemSearchViewModel().searchCriteria;
+      criteria.defId = [definitionId];
+      const response = await observe(services.Item.searchConceptItems(criteria), 'EA concept card');
+      assertCurrent();
+      if (!Array.isArray(response.items)) throw new Error('Cannot read the EA concept response. The squad was not changed.');
+      const matches = response.items.filter(item => String(item?.definitionId) === String(definitionId));
+      if (matches.length !== 1) throw new Error(`${row.player.name}: EA did not return exactly one matching concept card. The squad was not changed.`);
+      const item = matches[0];
+      // Keep the actual EA search entity. Never turn catalog JSON into an item,
+      // mark an owned card as a concept, or substitute another card version.
+      const assetId = athleteId(item);
+      const rarity = item.rareflag ?? item._rareflag;
+      const mismatches = [];
+      const describe = value => value == null ? 'missing' : typeof value === 'boolean' ? String(value) :
+        typeof value === 'number' || typeof value === 'string' ? String(value).slice(0,60) : 'invalid';
+      const mismatch = (field, expected, actual) => mismatches.push(`${field}: expected ${describe(expected)}, received ${describe(actual)}`);
+      if (item.concept !== true) mismatch('concept', true, item.concept);
+      if (item.id == null) mismatch('EA item ID', 'present', item.id);
+      const isPlayer = typeof item.isPlayer === 'function' ? item.isPlayer() : undefined;
+      if (isPlayer !== true) mismatch('player card', true, isPlayer);
+      if (!Number.isSafeInteger(Number(assetId)) || Number(assetId) <= 0 || String(assetId) !== String(row.player.assetId)) mismatch('athlete ID', row.player.assetId, assetId);
+      if (item.rating != null && Number(item.rating) !== Number(row.player.rating)) mismatch('rating', row.player.rating, item.rating);
+      if (rarity != null && Number(rarity) !== Number(row.player.rarityId)) mismatch('rarity', row.player.rarityId, rarity);
+      if (mismatches.length) {
+        throw new Error(`${row.player.name}: EA concept card identity mismatch (${mismatches.join('; ')}). The squad was not changed.`);
+      }
+      resolvedConcepts.set(String(row.id), item);
+    }
+    const inv = await inventory(assertCurrent,reviewedDefinitions(preview)), chem = chemistry();
+    assertCurrent();
+    const currentItems = new Map(inv.items.map(item => [String(item.id), item]));
+    const fresh = await challengeData(preview.challenge, preview.set);
+    if (JSON.stringify(fresh.constraints) !== JSON.stringify(preview.input.sbcData.constraints) ||
+        JSON.stringify(fresh.formation) !== JSON.stringify(preview.input.sbcData.formation)) throw new Error('SBC requirements changed. Solve again.');
+    const controller = new UTSBCSquadOverviewViewController();
+    controller.initWithSBCSet(preview.set, preview.challenge.id);
+    const { _squad, _challenge } = controller;
+    if (!_squad || !_challenge || String(_challenge.id) !== String(preview.challenge.id) || String(_challenge.setId) !== String(preview.set.id)) throw new Error('EA squad adapter changed. Nothing was applied.');
+    await serverInfo(true);
+    assertCurrent();
+    const currentPolicy = policy(), currentLocks = readPaletools();
+    if (currentLocks.warnings.length) throw new Error(currentLocks.warnings.join(' '));
+    P.validateSolution(preview.result, preview.input, currentPolicy, currentLocks);
+    for (const row of preview.rows) {
+      if (row.player.concept) {
+        const item = resolvedConcepts.get(String(row.id));
+        if (currentItems.has(String(item.id)) || inv.items.includes(item)) throw new Error(`${row.player.name}: EA concept search returned an owned card. The squad was not changed.`);
+        if (currentPolicy.protectSpecial && typeof item.isSpecial === 'function' && item.isSpecial() === true ||
+            currentPolicy.protectEvolutions && (item.upgrades || typeof item.isEvolution === 'function' && item.isEvolution() === true)) {
+          throw new Error(`${row.player.name}: EA card protection blocks this concept. The squad was not changed.`);
+        }
+      } else {
+        const item = currentItems.get(String(row.id));
+        if (!item) throw new Error(`${row.player.name} is no longer in your club. Solve again.`);
+        const current = card(item, inv, chem);
+        if (String(current.definitionId) !== String(row.player.definitionId) || String(current.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: The owned card changed. Solve again.`);
+        const reason = P.blockedReason(current, currentPolicy, currentLocks);
+        if (reason) throw new Error(`${row.player.name}: ${reason}. Solve again.`);
+      }
+    }
+    const oldItems = (_squad._players || []).map(slot => slot?._item);
+    const squad = Array.from({ length: 11 }, () => new UTItemEntity());
+    preview.rows.forEach(row => { squad[row.squadPosition] = row.player.concept ? resolvedConcepts.get(String(row.id)) : currentItems.get(String(row.id)); });
+    squad.push(...oldItems.slice(11));
+    const reserves = oldItems.slice(11).filter(item => typeof item?.isPlayer === 'function' && item.isPlayer());
+    for (const row of preview.rows) {
+      const selected = squad[row.squadPosition];
+      for (const reserve of reserves) {
+        if (typeof selected.compareResourceTo !== 'function' || selected.compareResourceTo(reserve)) throw new Error('A selected card conflicts with a protected reserve or cannot be compared safely. The squad was not changed.');
+      }
+    }
+    if (typeof _squad.removeAllItems !== 'function') throw new Error('EA squad clearing is unavailable. The squad was not changed.');
+    const sameItem = (expected, actual) => {
+      const expectedPlayer = typeof expected?.isPlayer === 'function' && expected.isPlayer();
+      const actualPlayer = typeof actual?.isPlayer === 'function' && actual.isPlayer();
+      return !expectedPlayer && !actualPlayer || expectedPlayer && actualPlayer && String(expected.id) === String(actual.id) &&
+        String(expected.definitionId) === String(actual.definitionId) && Boolean(expected.concept) === Boolean(actual.concept);
+    };
+    try {
+      // EA setPlayers does not empty incoming blank slots, and can omit variants
+      // of an existing reserve. Clear players explicitly while keeping manager.
+      _squad.removeAllItems(true);
+      _squad.setPlayers(squad, true);
+      if (!squad.every((item,index) => sameItem(item,_squad._players?.[index]?._item))) throw new Error('EA could not place the expected cards. The squad was not saved.');
+      assertCurrent();
+      await observe(services.SBC.saveChallenge(_challenge), 'Save SBC squad');
+    } catch (error) {
+      _squad.removeAllItems(true);
+      _squad.setPlayers(oldItems, true);
+      throw error;
+    }
+    if (concepts.length) {
+      // Keep the reviewed shopping list visible without leaving Apply actionable.
+      state.cancel++; state.preview = null; ui.apply.disabled = true; ui.export.disabled = true;
+    } else invalidate();
+    try { if (!batchGuard) {
+      const view = new UTSBCSquadSplitViewController(); view.initWithSBCSet(preview.set, preview.challenge.id);
+      const current = getAppMain().getRootViewController().getPresentedViewController().getCurrentViewController();
+      current.rootController.getRootNavigationController().pushViewController(view);
+    } } catch { /* The saved squad remains accessible via EA's own SBC screen. */ }
+    status(concepts.length ? 'Concept players were placed in the SBC squad. No coins were spent. Replace concepts with owned cards before submitting.' : 'Your squad was saved to the SBC. Check the requirements in EA before submitting it yourself.');
+    return {setId:preview.set.id,challengeId:preview.challenge.id,saved:true,preview,challenge:_challenge,squad:_squad};
+  }
+
+  function assertSavedSquad(preview,challenge) {
+    const slots = challenge.squad?._players;
+    if (!Array.isArray(slots) || slots.length < 11) throw new Error('EA did not return the saved squad.');
+    const bricks = new Set(simpleBricks(challenge.squad)), original = preview.input.sbcData.brickIndices;
+    if (!Array.isArray(original) || original.length !== bricks.size || original.some(index => !bricks.has(index))) throw new Error('Saved SBC brick positions changed. Submission stopped.');
+    const expected = new Map(preview.rows.map(row => [row.squadPosition,row.player]));
+    if (expected.size !== preview.rows.length || expected.size + bricks.size !== 11 || [...expected.keys()].some(index => !Number.isInteger(index) || index < 0 || index > 10 || bricks.has(index))) throw new Error('The saved squad layout does not match the reviewed solution.');
+    const read = (item,method) => { try { return typeof item?.[method] === 'function' ? item[method]() : undefined; } catch { return 'unreadable'; } };
+    const scalar = value => value === null ? null : typeof value === 'boolean' ? value :
+      typeof value === 'number' && Number.isFinite(value) ? value : typeof value === 'string' && /^-?\d{1,16}$/.test(value) ? value :
+      value === undefined ? 'missing' : 'unreadable';
+    const mismatches = [];
+    for (let index=0;index<11;index++) {
+      const slot = slots[index], item = slot?._item, wanted = expected.get(index);
+      const regularBrick = read(slot,'isRegularBrick'), customBrick = read(slot,'isCustomBrick');
+      const isPlayer = read(item,'isPlayer'), isValid = read(item,'isValid');
+      const valid = wanted ? !bricks.has(index) && regularBrick !== true && customBrick !== true && item &&
+        String(item.id) === String(wanted.id) && String(item.definitionId) === String(wanted.definitionId) && item.concept === false && isPlayer === true :
+        bricks.has(index) && regularBrick === true && customBrick !== true && item?.id === 0 && item.definitionId === 0 && item.concept === false && isValid === false;
+      if (!valid) mismatches.push({index,expectedId:wanted ? scalar(wanted.id) : null,actualId:scalar(item?.id),
+        definitionId:scalar(item?.definitionId),concept:scalar(item?.concept),isPlayer:scalar(isPlayer),
+        simpleBrick:bricks.has(index),regularBrick:scalar(regularBrick),customBrick:scalar(customBrick),isValid:scalar(isValid)});
+    }
+    if (mismatches.length) throw new Error(`The saved squad in EA does not match the solution. Submission stopped. Slot details: ${JSON.stringify(mismatches)}`);
+  }
+  function assertSubmitAllowed(challenge, set) {
+    if (typeof challenge.canSubmit !== 'function' || challenge.canSubmit() !== true) throw new Error('EA did not approve the submission requirements. The queue stopped.');
+    if (typeof UTEventTokenUtils === 'undefined' || typeof UTEventTokenUtils.hasEventTokenReward !== 'function' ||
+        typeof services.EventToken?.isEventTokenEarningDisabled !== 'function' ||
+        typeof services.Configuration?.getFeatureSetting !== 'function' ||
+        typeof UTServerSettingsRepository === 'undefined' || !UTServerSettingsRepository.KEY?.SBC_ALLOW_UNTRADEABLE ||
+        typeof challenge.hasUntradeableItems !== 'function') throw new Error('EA submission safety checks are unavailable.');
+    if ((UTEventTokenUtils.hasEventTokenReward(set.awards) || UTEventTokenUtils.hasEventTokenReward(challenge.awards)) && services.EventToken.isEventTokenEarningDisabled()) throw new Error('EA has temporarily disabled event rewards.');
+    if (!services.Configuration.getFeatureSetting(UTServerSettingsRepository.KEY.SBC_ALLOW_UNTRADEABLE) && challenge.hasUntradeableItems()) throw new Error('EA has temporarily disabled untradeable card submissions.');
+  }
+  function hasUncertainBatch(report) {
+    return Boolean(report?.snapshot?.queue?.some(set => set.steps?.some(step => ['save-pending','submit-pending','submitted','claim-pending','uncertain'].includes(step.status))));
+  }
+  function errorDetails(error) {
+    const details = {};
+    if (Number.isSafeInteger(error?.status) && error.status >= 100 && error.status <= 599) details.status = error.status;
+    if (Number.isSafeInteger(error?.code) || typeof error?.code === 'string' && /^[A-Z0-9_-]{1,80}$/.test(error.code)) details.code = error.code;
+    if (Number.isFinite(error?.retryAfterSeconds) && error.retryAfterSeconds > 0) details.retryAfterSeconds = error.retryAfterSeconds;
+    if (typeof error?.operation === 'string') details.operation = error.operation.replace(/[\r\n\x00-\x1f]/g,' ').slice(0,160);
+    const conflicts = itemViolations(error?.itemViolations);
+    if (conflicts) details.itemViolations = conflicts;
+    return details;
+  }
+  function readSBCList(kind,request,guard) {
+    const retry = window.AutoSBCReadRetry;
+    if (!retry) throw new Error('The EA read module did not load. Reload the extension.');
+    return retry.read({kind,request,guard,onWait:({remainingMs,status:responseStatus}) => {
+      const reason = responseStatus === 429 ? 'EA limited the list request (429).' : `EA SBC list request failed (${responseStatus}).`;
+      status(`${reason} One retry in ${Math.ceil(remainingMs/1000)} seconds. Select Stop to cancel.`);
+    }});
+  }
+  async function waitForRewardRead(guard) {
+    // EA has already granted the reward. Pace the subsequent authoritative
+    // read; this delay never retries the submit or a failed reward check.
+    for (let elapsed=0;elapsed<2000;elapsed+=500) {
+      guard(); await new Promise(resolve => setTimeout(resolve,500)); guard();
+    }
+  }
+  async function runBatch({queueOverride = null,dailyParent = null,dailyEntry = null} = {}) {
+    const B = window.AutoSBCBatchPolicy, R = window.AutoSBCBatchRunner;
+    if (!B || !R) throw new Error('The queue module did not load. Reload the extension and EA page.');
+    if (dailyParent) assertDailyRun(dailyParent);
+    else if (!ui.batchConsent.checked || !state.batchQueue.length) throw new Error('Add SBC sets to the queue and confirm automatic submission first.');
+    if (state.batchReportUnreadable || hasUncertainBatch(state.batchReport)) throw new Error('A previous run has an unreadable or unverified submission record. Check completion in EA before starting another queue.');
+    if (!ready() || typeof services.SBC.reset !== 'function' || typeof services.SBC.submitChallenge !== 'function' || typeof services.Chemistry?.isFeatureEnabled !== 'function') throw new Error('EA automatic submission is not ready.');
+    // Batch permission is scoped to owned cards and these mandatory protections.
+    ui.settings.protectPlayed.checked = true; ui.settings.protectEvolutions.checked = true; ui.settings.allowConcept.checked = false;
+    const selectedScope = scope(), selectedQueue = (queueOverride || state.batchQueue).map(entry => ({...entry}));
+    const batchPolicy = B.batchPolicy(policy());
+    const controller = B.createBatch(selectedQueue.map(entry => entry.id), batchPolicy);
+    const run = {controller,stopped:false,contexts:new Map(),checks:new Map(),receipts:[],runId:crypto.randomUUID()};
+    state.batchRun = run;
+    const config = [ui.set,ui.challenge,ui.season,ui.platform,...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling];
+    config.forEach(control => { control.disabled = true; });
+    ui.batchStop.disabled = false;
+    const guard = () => {
+      if (state.batchRun !== run || run.stopped || controller.snapshot().status !== 'running') throw new Error('The queue stopped. No new action was started.');
+      if (dailyParent) assertDailyRun(dailyParent);
+      if ((!dailyParent && !ui.batchConsent.checked) || !ui.settings.protectPlayed.checked || !ui.settings.protectEvolutions.checked || ui.settings.allowConcept.checked) throw new Error('Queue card protections changed.');
+      if (dailyParent && (!ui.settings.protectSpecial.checked || Number(ui.settings.maxRating.value) !== dailyRating(dailyEntry.kind) || Number(ui.settings.maxPlayerPrice.value) !== dailyParent.cardLimit)) throw new Error('Daily card limits changed.');
+      const current = scope();
+      if (current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('The queue game edition or platform changed.');
+    };
+    const record = phase => {
+      const report = {runId:run.runId,scope:selectedScope,selectedSets:selectedQueue,updatedAt:new Date().toISOString(),phase,snapshot:controller.snapshot(),receipts:run.receipts,...(run.lastError ? {lastError:run.lastError} : {})};
+      // Persist before every external write; storage failures stop dispatch.
+      if (dailyParent) recordDailyChild(dailyParent,report);
+      localStorage.setItem(BATCH_STORAGE,JSON.stringify(report)); state.batchReport = report;
+      const p = report.snapshot.progress;
+      const labels = {snapshot:'Checking set',solve:'Solving squad',save:'Saving squad','save-confirmed':'Squad saved',submit:'Submitting squad','submit-confirmed':'Submission confirmed',claim:'Checking rewards and completion counters','claim-confirmed':'Rewards verified','set-completed':'Set completed','set-skipped':'Skipped completed or exhausted set',finished:'Queue finished',failed:'Queue stopped'};
+      const active = selectedQueue.find(entry => String(entry.id) === report.snapshot.currentSetId);
+      const submitted = report.receipts.filter(receipt => receipt.completed === true && receipt.rewardsGranted === true).length;
+      ui.batchStatus.textContent = `${p.completed}/${p.total} sets completed · ${submitted} submission receipts · ${p.confirmedChallenges} counter verifications${active ? `\n${active.name}` : ''}\n${labels[phase] || phase}`;
+      ui.batchExport.disabled = false;
+      ui.batchDetails.show.disabled = false;
+    };
+    const freshSet = async setId => {
+      guard(); services.SBC.reset();
+      const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(), 'Queue SBC sets'),guard); guard();
+      if (!Array.isArray(data.sets)) throw new Error('Cannot read the EA set list.');
+      const set = data.sets.find(item => String(item.id) === String(setId));
+      if (!set) throw new Error(`SBC set ${setId} is no longer available.`);
+      if (dailyParent) nativeDailySnapshot(set);
+      const data2 = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set), 'Queue SBC challenges'),guard); guard();
+      if (!Array.isArray(data2.challenges)) throw new Error('Cannot read the EA challenge list.');
+      const context = {set,challenges:data2.challenges,sets:data.sets}; run.contexts.set(String(setId),context); return context;
+    };
+    const choose = (step, context) => {
+      const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
+      if (!challenge || challenge.status === 'COMPLETED') throw new Error('The queued challenge changed or is already complete.');
+      state.sets = context.sets; state.challenges = context.challenges.filter(item => item.status !== 'COMPLETED');
+      options(ui.set,state.sets); ui.set.value = step.setId;
+      options(ui.challenge,state.challenges); ui.challenge.value = step.challengeId;
+      return challenge;
+    };
+    const checkPlayersNow = (solution,inv,chem) => {
+      const players = new Map(inv.items.map(item => [String(item.id),card(item,inv,chem)]));
+      const currentPolicy = policy(), pale = readPaletools();
+      if (pale.warnings.length) throw new Error(pale.warnings.join(' '));
+      P.validateSolution(solution.preview.result,solution.preview.input,currentPolicy,pale);
+      const fresh = solution.preview.rows.map(row => {
+        const player = players.get(String(row.id));
+        if (!player || String(player.definitionId) !== String(row.player.definitionId) || String(player.assetId) !== String(row.player.assetId)) throw new Error(`${row.player.name}: The inventory card changed.`);
+        const reason = P.blockedReason(player,currentPolicy,pale); if (reason) throw new Error(`${player.name}: ${reason}`);
+        return player;
+      });
+      B.assertBatchPlayers(fresh); return fresh;
+    };
+    const verifyPlayers = async (step, solution, phase) => {
+      guard(); let submissionCheck;
+      if (phase === 'submit') {
+        const context = await freshSet(step.setId), challenge = choose(step,context);
+        if (dailyParent) window.AutoSBCDailyPlan.assertCycle(dailyEntry,nativeDailySnapshot(context.set));
+        const data = await challengeData(challenge,context.set); guard();
+        if (JSON.stringify(data.constraints) !== JSON.stringify(solution.preview.input.sbcData.constraints) || JSON.stringify(data.formation) !== JSON.stringify(solution.preview.input.sbcData.formation)) throw new Error('SBC requirements changed before submission.');
+        assertSavedSquad(solution.preview,challenge);
+        assertSubmitAllowed(challenge,context.set);
+        if (!Number.isSafeInteger(challenge.timesCompleted) || !Number.isSafeInteger(context.set.timesCompleted)) throw new Error('Cannot read the EA completion counter.');
+        submissionCheck = {...context,challenge,beforeChallenge:challenge.timesCompleted,beforeSet:context.set.timesCompleted};
+      }
+      // Read inventory/active squad after all challenge-loading awaits. Keep its
+      // live entities so getters and locks can be rechecked at dispatch too.
+      const inv = await inventory(guard,reviewedDefinitions(solution.preview)), chem = chemistry(); guard();
+      const fresh = checkPlayersNow(solution,inv,chem);
+      if (submissionCheck) run.checks.set(String(step.challengeId),{...submissionCheck,inv,chem});
+      guard(); return fresh;
+    };
+    try {
+      invalidate(); record('Started');
+      await R.run({controller,onProgress:event => record(event.phase),adapter:{
+        snapshotSet:async setId => {
+          if (!dailyParent && controller.snapshot().progress.completed > 0) {
+            record('Next set begins in 5 seconds; Stop cancels it.');
+            for (let elapsed=0;elapsed<5000;elapsed+=500) {
+              guard(); await new Promise(resolve => setTimeout(resolve,500)); guard();
+            }
+          }
+          const {set,challenges} = await freshSet(setId);
+          if (dailyParent) window.AutoSBCDailyPlan.assertCycle(dailyEntry,nativeDailySnapshot(set));
+          if (typeof set.isComplete !== 'function' || typeof set.isRepeatable !== 'boolean' || typeof set.isLimitedRepeatable !== 'boolean') throw new Error('Cannot read the EA repeat allowance.');
+          const remaining = set.isLimitedRepeatable ? set.getRepeatsRemaining() : null;
+          return {setId:String(set.id),completed:set.isComplete(),repeatable:set.isRepeatable,remaining,
+            challenges:challenges.map(challenge => ({challengeId:String(challenge.id),completed:challenge.status === 'COMPLETED'}))};
+        },
+        solve:async step => {
+          // The snapshot, or the previous submission's verified refresh, is
+          // current here. Avoid another reset/GET before any intervening write.
+          const context = run.contexts.get(String(step.setId)) || await freshSet(step.setId); choose(step,context); guard();
+          await solve(); guard(); const preview = state.preview;
+          if (!preview || String(preview.set.id) !== String(step.setId) || String(preview.challenge.id) !== String(step.challengeId)) throw new Error('No fresh solution was created for the queued challenge.');
+          B.assertBatchPlayers(preview.rows.map(row => row.player));
+          return {players:preview.rows.map(row => row.player),preview};
+        },
+        freshPlayers:verifyPlayers,
+        apply:async (step,solution) => {
+          guard(); if (state.preview !== solution.preview) throw new Error('The queue preview changed.');
+          const receipt = await apply(guard); return receipt;
+        },
+        submit:async (step,solution) => {
+          await serverInfo(true);
+          guard(); const check = run.checks.get(String(step.challengeId));
+          if (!check || String(check.set.id) !== String(step.setId)) throw new Error('Pre-submission verification is missing.');
+          checkPlayersNow(solution,check.inv,check.chem);
+          assertSavedSquad(solution.preview,check.challenge);
+          assertSubmitAllowed(check.challenge,check.set);
+          const response = await observe(services.SBC.submitChallenge(check.challenge,check.set,false,services.Chemistry.isFeatureEnabled()), 'Automatic SBC submission');
+          // Validate the response, not resettable local challenge.status.
+          if (String(response.challengeId) !== String(step.challengeId) || String(response.setId) !== String(step.setId) || typeof response.setCompleted !== 'boolean' || !Array.isArray(response.grantedChallengeAwards)) throw new Error('Cannot validate the EA submission response. This squad will not be submitted again.');
+          const receipt = {setId:String(step.setId),challengeId:String(step.challengeId),completed:true,setCompleted:response.setCompleted,rewardsGranted:true,
+            at:new Date().toISOString(),beforeChallenge:check.beforeChallenge,beforeSet:check.beforeSet,
+            cardIds:solution.players.map(player => String(player.id)),zeroGames:solution.players.every(player => player.gamesPlayed === 0),
+            coinSpent:0,grantedChallengeAwards:response.grantedChallengeAwards};
+          run.receipts.push(receipt); record('EA submission response received'); return receipt;
+        },
+        verifyRewards:async (step,receipt) => {
+          // Rewards are granted by submitChallenge. This read verifies counters;
+          // there is no separate claim, purchase, pack-open, or pick-selection call.
+          await waitForRewardRead(guard);
+          const context = await freshSet(step.setId);
+          const challenge = context.challenges.find(item => String(item.id) === String(step.challengeId));
+          if (!challenge || !Number.isSafeInteger(challenge.timesCompleted) || challenge.timesCompleted <= receipt.beforeChallenge ||
+              receipt.setCompleted && (!Number.isSafeInteger(context.set.timesCompleted) || context.set.timesCompleted <= receipt.beforeSet)) throw new Error('EA completion counters have not confirmed the submission yet. The queue stopped.');
+          if (typeof repositories.Item?.setDirty === 'function' && typeof ItemPile !== 'undefined') repositories.Item.setDirty(ItemPile.PURCHASED);
+          return {setId:receipt.setId,challengeId:receipt.challengeId,rewardsGranted:true,setCompleted:receipt.setCompleted};
+        }
+      }});
+      record(controller.snapshot().status === 'completed' ? 'Selected queue completed' : 'Stopped');
+      status('Queue finished. Submitted challenges are in the run report. Reward packs remain unopened.');
+      return {snapshot:controller.snapshot(),receipts:run.receipts};
+    } catch (error) { run.lastError = errorDetails(error); record(`Stopped: ${error.message || error}`); throw error; }
+    finally {
+      state.batchRun = null; config.forEach(control => { control.disabled = Boolean(dailyParent); });
+      if (!dailyParent) {
+        const finished = new Set(controller.snapshot().queue.filter(entry => ['completed','skipped'].includes(entry.status)).map(entry => entry.setId));
+        state.batchQueue = state.batchQueue.filter(entry => !finished.has(String(entry.id)));
+        ui.batchConsent.checked = false;
+      }
+      invalidate(); renderBatch(); renderDaily();
+    }
+  }
+
+  async function reconcileLastSubmission() {
+    const helper = window.AutoSBCBatchReconcile;
+    if (!helper || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Submission verification or the EA session is not ready.');
+    if (state.batchRun || state.dailyRun) throw new Error('Stop the current queue first.');
+    const originalBatchText = localStorage.getItem(BATCH_STORAGE), originalDailyText = localStorage.getItem(DAILY_STORAGE);
+    let original, daily;
+    try { original = JSON.parse(originalBatchText || 'null'); daily = JSON.parse(originalDailyText || 'null'); }
+    catch { throw new Error('Cannot read the previous run report. No records were changed.'); }
+    const planned = helper.plan(original), selectedScope = scope();
+    if (original.scope?.gameYear !== selectedScope.gameYear || original.scope?.platform !== selectedScope.platform) throw new Error('The submission record does not match the selected game edition or platform.');
+    let dailyCycle = -1;
+    if (originalDailyText) {
+      if (!daily?.runId || !Array.isArray(daily.cycles) || !Array.isArray(daily.plan?.entries) || !Number.isSafeInteger(daily.plan?.totalCycles)) throw new Error('Cannot validate the daily report. No records were changed.');
+      const matches = daily.cycles.map((cycle,index) => cycle.child?.runId === original.runId ? index : -1).filter(index => index >= 0);
+      if (matches.length > 1) throw new Error('The same submission belongs to multiple daily cycles. No records were changed.');
+      if (matches.length) {
+        dailyCycle = matches[0]; const cycle = daily.cycles[dailyCycle];
+        if (JSON.stringify(cycle.child) !== JSON.stringify(original) || String(cycle.entry?.setId) !== planned.setId ||
+            daily.scope?.gameYear !== selectedScope.gameYear || daily.scope?.platform !== selectedScope.platform) throw new Error('Daily and SBC submission reports do not match. No records were changed.');
+      }
+    }
+    invalidate(); const version = state.cancel;
+    const guard = () => {
+      const current = scope();
+      if (state.cancel !== version || state.batchRun || state.dailyRun || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Last submission verification cancelled.');
+      if (localStorage.getItem(BATCH_STORAGE) !== originalBatchText || localStorage.getItem(DAILY_STORAGE) !== originalDailyText) throw new Error('The run report changed during verification. No records were changed.');
+    };
+    status('Checking the last submission without resubmitting the squad.');
+    guard(); services.SBC.reset();
+    const sets = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Submission verification: SBC sets'),guard); guard();
+    if (!Array.isArray(sets.sets)) throw new Error('Cannot validate the EA set list.');
+    const matches = sets.sets.filter(set => String(set.id) === planned.setId);
+    if (matches.length !== 1) throw new Error('The submitted SBC set did not match exactly.');
+    const set = matches[0];
+    const data = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set),'Submission verification: SBC challenges'),guard); guard();
+    if (!Array.isArray(data.challenges)) throw new Error('Cannot validate the EA challenge list.');
+    const challenges = data.challenges.filter(challenge => String(challenge.id) === planned.challengeId && String(challenge.setId) === planned.setId);
+    if (challenges.length !== 1) throw new Error('The submitted SBC challenge did not match exactly.');
+    const reconciled = helper.reconcile(original,{setId:planned.setId,challengeId:planned.challengeId,
+      challengeTimesCompleted:challenges[0].timesCompleted,setTimesCompleted:set.timesCompleted,observedAt:new Date().toISOString()});
+    let reconciledDaily = null;
+    if (dailyCycle >= 0) {
+      reconciledDaily = JSON.parse(JSON.stringify(daily));
+      const cycle = reconciledDaily.cycles[dailyCycle]; cycle.child = reconciled;
+      const setEntry = reconciled.snapshot.queue.find(entry => entry.setId === planned.setId);
+      cycle.status = setEntry?.status === 'completed' ? 'completed' : 'blocked';
+      reconciledDaily.status = 'stopped'; reconciledDaily.updatedAt = new Date().toISOString();
+      reconciledDaily.phase = 'Last submission verified with a read-only check. The run was not resumed.';
+      reconciledDaily.progress = {completedCycles:reconciledDaily.cycles.filter(entry => entry.status === 'completed').length,totalCycles:reconciledDaily.plan.totalCycles,
+        confirmedParts:reconciledDaily.cycles.reduce((sum,entry) => sum + (entry.child?.snapshot?.progress?.confirmedChallenges || 0),0)};
+    }
+    guard();
+    // Keep the original ledger/receipts as evidence. For linked journals, write
+    // the parent first; a second-write failure leaves a detectable mismatch
+    // and blocks further execution rather than silently resuming either run.
+    if (reconciledDaily) {
+      localStorage.setItem(DAILY_STORAGE,JSON.stringify(reconciledDaily)); state.dailyReport = reconciledDaily;
+    }
+    localStorage.setItem(BATCH_STORAGE,JSON.stringify(reconciled)); state.batchReport = reconciled;
+    const completedSets = new Set(reconciled.snapshot.queue.filter(entry => entry.status === 'completed').map(entry => entry.setId));
+    state.batchQueue = state.batchQueue.filter(entry => !completedSets.has(String(entry.id)));
+    ui.batchConsent.checked = false; ui.dailyConsent.checked = false; state.dailyPlan = null;
+    ui.batchStatus.textContent = `Last submission verified · ${reconciled.snapshot.progress.confirmedChallenges} challenges recorded. The queue is stopped and was not resumed.`;
+    if (reconciledDaily) ui.dailyStatus.textContent = `${reconciledDaily.progress.completedCycles}/${reconciledDaily.progress.totalCycles} daily cycles · ${reconciledDaily.progress.confirmedParts} challenges verified. Automatic resume is disabled.`;
+    status('Last submission verified against EA completion counters. Start a fresh queue to continue.');
+    renderBatch(); renderDaily();
+  }
+
+  async function verifyCardsForReplan() {
+    const helper = window.AutoSBCBatchReplan;
+    if (!helper || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Card verification or the EA session is not ready.');
+    if (state.batchRun || state.dailyRun) throw new Error('Stop the current queue first.');
+    const originalBatchText = localStorage.getItem(BATCH_STORAGE), originalDailyText = localStorage.getItem(DAILY_STORAGE);
+    let original, daily;
+    try { original = JSON.parse(originalBatchText || 'null'); daily = JSON.parse(originalDailyText || 'null'); }
+    catch { throw new Error('Cannot read the previous run report. No records were changed.'); }
+    const planned = helper.plan(original), selectedScope = scope();
+    if (planned.scope.gameYear !== selectedScope.gameYear || planned.scope.platform !== selectedScope.platform) throw new Error('The submission record does not match the selected game edition or platform.');
+    let dailyCycle = -1;
+    if (originalDailyText) {
+      if (!daily?.runId || !Array.isArray(daily.cycles) || !Array.isArray(daily.plan?.entries) || !Number.isSafeInteger(daily.plan?.totalCycles)) throw new Error('Cannot validate the daily report. No records were changed.');
+      const matches = daily.cycles.map((cycle,index) => cycle.child?.runId === original.runId ? index : -1).filter(index => index >= 0);
+      if (matches.length > 1) throw new Error('The same submission belongs to multiple daily cycles. No records were changed.');
+      if (matches.length) {
+        dailyCycle = matches[0]; const cycle = daily.cycles[dailyCycle];
+        if (JSON.stringify(cycle.child) !== JSON.stringify(original) || String(cycle.entry?.setId) !== planned.setId ||
+            daily.scope?.gameYear !== selectedScope.gameYear || daily.scope?.platform !== selectedScope.platform) throw new Error('Daily and SBC submission reports do not match. No records were changed.');
+      }
+    }
+    invalidate(); const version = state.cancel;
+    const guard = () => {
+      const current = scope();
+      if (state.cancel !== version || state.batchRun || state.dailyRun || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Card verification cancelled.');
+      if (localStorage.getItem(BATCH_STORAGE) !== originalBatchText || localStorage.getItem(DAILY_STORAGE) !== originalDailyText) throw new Error('The run report changed during verification. No records were changed.');
+    };
+    const readState = async () => {
+      guard(); services.SBC.reset();
+      const sets = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Card verification: SBC sets'),guard); guard();
+      if (!Array.isArray(sets.sets)) throw new Error('Cannot validate the EA set list.');
+      const matching = sets.sets.filter(set => String(set.id) === planned.setId);
+      if (matching.length !== 1 || typeof matching[0].isComplete !== 'function') throw new Error('Cannot match the submitted SBC set.');
+      const set = matching[0];
+      const data = await readSBCList('requestChallengesForSet',() => observe(services.SBC.requestChallengesForSet(set),'Card verification: SBC challenges'),guard); guard();
+      if (!Array.isArray(data.challenges)) throw new Error('Cannot validate the EA challenge list.');
+      const challenges = data.challenges.filter(challenge => String(challenge.id) === planned.challengeId && String(challenge.setId) === planned.setId);
+      if (challenges.length !== 1 || typeof challenges[0].isCompleted !== 'function') throw new Error('Cannot match the submitted SBC challenge.');
+      const challenge = challenges[0], setCompleted = set.isComplete(), challengeCompleted = challenge.isCompleted();
+      // Native status is resettable, so this path accepts only the narrow
+      // nonrepeatable, never-completed case on both sides of the ownership read.
+      if (set.isRepeatable !== false || setCompleted !== false || challengeCompleted !== false ||
+          !['IN_PROGRESS','NOT_STARTED'].includes(challenge.status) || set.timesCompleted !== 0 || challenge.timesCompleted !== 0) throw new Error('Replanning requires a nonrepeatable, incomplete challenge with zero completion counters.');
+      return {setId:planned.setId,challengeId:planned.challengeId,isRepeatable:false,setCompleted,challengeCompleted,
+        challengeStatus:challenge.status,setTimesCompleted:set.timesCompleted,challengeTimesCompleted:challenge.timesCompleted,observedAt:new Date().toISOString()};
+    };
+    status('Checking challenge status and fresh card ownership. No squad will be saved or submitted.');
+    const initial = await readState(); guard();
+    const owned = await freshOwnership(guard); guard();
+    const final = await readState(); guard();
+    const reconciled = helper.reconcile(original,{runId:planned.runId,scope:selectedScope,initial,inventory:owned.ownership,final});
+    let reconciledDaily = null;
+    if (dailyCycle >= 0) {
+      reconciledDaily = JSON.parse(JSON.stringify(daily));
+      reconciledDaily.cycles[dailyCycle].child = reconciled;
+      reconciledDaily.cycles[dailyCycle].status = 'blocked';
+      reconciledDaily.status = 'stopped'; reconciledDaily.updatedAt = new Date().toISOString();
+      reconciledDaily.phase = 'Fresh reads confirmed no completion and all saved cards still owned. Build a new plan to continue.';
+      reconciledDaily.progress = {completedCycles:reconciledDaily.cycles.filter(entry => entry.status === 'completed').length,totalCycles:reconciledDaily.plan.totalCycles,
+        confirmedParts:reconciledDaily.cycles.reduce((sum,entry) => sum + (entry.child?.snapshot?.progress?.confirmedChallenges || 0),0)};
+    }
+    guard();
+    // Preserve the original attempt in both journals. A failed second write
+    // leaves a detectable parent/child mismatch and never resumes either run.
+    if (reconciledDaily) { localStorage.setItem(DAILY_STORAGE,JSON.stringify(reconciledDaily)); state.dailyReport = reconciledDaily; }
+    localStorage.setItem(BATCH_STORAGE,JSON.stringify(reconciled)); state.batchReport = reconciled;
+    ui.batchConsent.checked = false; ui.dailyConsent.checked = false; state.dailyPlan = null;
+    status('All 11 saved cards are still owned and EA reports no completion. The run stays stopped. Review a fresh queue and confirm it to continue.');
+    if (reconciledDaily) ui.dailyStatus.textContent = reconciledDaily.phase;
+    renderBatch(); renderDaily();
+  }
+
+  function nativeDailySnapshot(set) {
+    if (!set || typeof set.isComplete !== 'function' || typeof set.hasExpired !== 'function' || typeof set.getTimeRemaining !== 'function' ||
+        typeof set.getRepeatsRemaining !== 'function' || !Number.isSafeInteger(set.endTime) || set.endTime < 0) throw new Error(`${set?.name || 'Daily'}: Cannot read the daily expiry time or repeat allowance.`);
+    const expired = set.hasExpired(false), timeRemaining = set.getTimeRemaining(), completed = set.isComplete();
+    if (typeof expired !== 'boolean' || typeof completed !== 'boolean' || !Number.isFinite(timeRemaining)) throw new Error('Cannot read the daily expiry status.');
+    return {id:set.id,name:set.name,isRepeatable:set.isRepeatable,isLimitedRepeatable:set.isLimitedRepeatable,
+      repeats:set.repeats,timesCompleted:set.timesCompleted,remaining:set.getRepeatsRemaining(),completed,
+      expired:expired || set.endTime > 0 && timeRemaining <= 0};
+  }
+  function dailyRating(kind) { return kind === 'bronze' ? 64 : kind === 'silver' ? 74 : 82; }
+  function unresolvedDaily() {
+    const report = state.dailyReport;
+    return state.dailyReportUnreadable || Boolean(report && (!Array.isArray(report.cycles) || !report.plan ||
+      report.status === 'running' || report.cycles.some(cycle => cycle.status === 'pending' || hasUncertainBatch(cycle.child))));
+  }
+  function assertDailyHistory() {
+    if (state.batchReportUnreadable || state.batchReport && (!state.batchReport.snapshot || !Array.isArray(state.batchReport.snapshot.queue) ||
+        !['running','completed','stopped','blocked'].includes(state.batchReport.snapshot.status) ||
+        state.batchReport.snapshot.status === 'running' || hasUncertainBatch(state.batchReport))) throw new Error('The previous SBC run has an unresolved outcome. Check the EA record before starting dailies.');
+    if (unresolvedDaily()) throw new Error('The previous daily run has an unresolved outcome. It will not resume or repeat automatically.');
+  }
+  async function prepareDailies() {
+    const D = window.AutoSBCDailyPlan;
+    if (!D || !ready() || typeof services.SBC.reset !== 'function') throw new Error('Daily planning or the EA session is not ready.');
+    assertDailyHistory(); state.dailyPlan = null; ui.dailyConsent.checked = false; invalidate();
+    const selectedScope = scope(), version = state.cancel;
+    const guard = () => { const current = scope(); if (state.cancel !== version || current.gameYear !== selectedScope.gameYear || current.platform !== selectedScope.platform) throw new Error('Daily planning was cancelled or the game edition changed.'); };
+    services.SBC.reset();
+    const data = await readSBCList('requestSets',() => observe(services.SBC.requestSets(),'Daily SBC sets'),guard); guard();
+    if (!Array.isArray(data.sets)) throw new Error('EA did not return daily SBC sets.');
+    const selected = data.sets.filter(set => D.dailyKind(set?.name));
+    const plan = D.createPlan(selected.map(nativeDailySnapshot));
+    state.dailyPlan = {plan,scope:selectedScope,day:new Date().toDateString(),createdAt:new Date().toISOString()};
+    ui.dailyStatus.textContent = `${plan.totalCycles} daily cycles planned. Review the remaining allowances below before starting.`;
+    renderDaily();
+  }
+  function assertDailyRun(run) {
+    if (state.dailyRun !== run || run.stopped || !ui.dailyConsent.checked) throw new Error('The daily plan stopped. No new action was started.');
+    const current = scope();
+    if (current.gameYear !== run.scope.gameYear || current.platform !== run.scope.platform || new Date().toDateString() !== run.day) throw new Error('The daily plan date, game edition or platform changed. Build a new plan.');
+  }
+  function recordDaily(run,phase) {
+    const progress = {completedCycles:run.cycles.filter(cycle => cycle.status === 'completed').length,totalCycles:run.plan.totalCycles,
+      confirmedParts:run.cycles.reduce((sum,cycle) => sum + (cycle.child?.snapshot?.progress?.confirmedChallenges || 0),0)};
+    const report = {runId:run.runId,scope:run.scope,day:run.day,plan:run.plan,status:run.status,phase,updatedAt:new Date().toISOString(),
+      currentCycle:run.currentCycle,cycles:run.cycles,progress,...(run.lastError ? {lastError:run.lastError} : {})};
+    localStorage.setItem(DAILY_STORAGE,JSON.stringify(report)); state.dailyReport = report;
+    ui.dailyStatus.textContent = `${progress.completedCycles}/${progress.totalCycles} daily cycles completed · ${progress.confirmedParts} challenges verified\n${phase}`;
+    ui.dailyExport.disabled = false;
+    ui.dailyDetails.show.disabled = false;
+  }
+  function recordDailyChild(run,report) {
+    const cycle = run.cycles[run.currentCycle];
+    if (!cycle) throw new Error('The daily cycle record is missing. No action was started.');
+    cycle.child = report;
+    if (report.snapshot.status === 'completed' && report.snapshot.progress.completed === 1) cycle.status = 'completed';
+    else settleDailyFailure(cycle);
+    recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle} cycle · ${report.phase}`);
+  }
+  function settleDailyFailure(cycle) {
+    if (!cycle || cycle.status === 'completed') return;
+    // A stopped/blocked child with no unresolved write can be freshly planned
+    // later. Keep uncertain writes and interrupted running journals pending.
+    if (!cycle.child || ['stopped','blocked','completed'].includes(cycle.child.snapshot?.status) &&
+        Array.isArray(cycle.child.snapshot?.queue) && !hasUncertainBatch(cycle.child)) cycle.status = 'blocked';
+  }
+  async function runDailies() {
+    assertDailyHistory();
+    const prepared = state.dailyPlan;
+    if (!prepared?.plan.totalCycles || !ui.dailyConsent.checked) throw new Error('Build a daily plan and confirm automatic submission first.');
+    if (new Date().toDateString() !== prepared.day) throw new Error('The daily plan date changed. Build a new plan.');
+    const config = [ui.set,ui.challenge,ui.season,ui.platform,...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling];
+    const savedControls = config.map(control => ({control,value:control.value,checked:control.checked,disabled:control.disabled}));
+    const savedPolicy = localStorage.getItem(STORAGE), savedQueue = state.batchQueue.map(entry => ({...entry}));
+    const savedSets = state.sets, savedChallenges = state.challenges, savedConsent = ui.batchConsent.checked;
+    const run = {...prepared,runId:crypto.randomUUID(),status:'running',stopped:false,currentCycle:null,
+      cardLimit:Math.min(Number(ui.settings.maxPlayerPrice.value) || 1000,1000),
+      cycles:prepared.plan.entries.map(entry => ({entry,status:'planned',child:null}))};
+    state.dailyRun = run; config.forEach(control => { control.disabled = true; }); renderDaily();
+    try {
+      assertDailyRun(run); recordDaily(run,'Daily plan started');
+      for (let index=0;index<run.cycles.length;index++) {
+        assertDailyRun(run);
+        run.currentCycle = index; const cycle = run.cycles[index]; cycle.status = 'pending';
+        recordDaily(run,`${cycle.entry.name} · ${cycle.entry.cycle} cycle preparing`);
+        assertDailyRun(run);
+        ui.settings.protectPlayed.checked = true; ui.settings.protectEvolutions.checked = true; ui.settings.protectSpecial.checked = true; ui.settings.allowConcept.checked = false;
+        ui.settings.maxRating.value = dailyRating(cycle.entry.kind); ui.settings.maxPlayerPrice.value = run.cardLimit;
+        const result = await runBatch({queueOverride:[{id:cycle.entry.setId,name:cycle.entry.name}],dailyParent:run,dailyEntry:cycle.entry});
+        if (result.snapshot.status === 'completed' && result.snapshot.progress.completed === 1) cycle.status = 'completed';
+        recordDaily(run,cycle.status === 'completed' ? `${cycle.entry.name} · cycle verified` : 'Daily cycle incomplete');
+        if (run.stopped) break;
+        assertDailyRun(run);
+        if (cycle.status !== 'completed') throw new Error('Daily cycle completion could not be verified. The next cycle was not started.');
+        // Avoid another list burst immediately after the verified reward read.
+        // This pacing is our policy, not an assumed EA rate-limit threshold.
+        if (index + 1 < run.cycles.length) {
+          recordDaily(run,'Cycle verified. Next daily begins in 5 seconds; Stop cancels it.');
+          for (let elapsed=0;elapsed<5000;elapsed+=500) {
+            assertDailyRun(run);
+            await new Promise(resolve => setTimeout(resolve,500));
+            assertDailyRun(run);
+          }
+        }
+      }
+      run.status = run.stopped ? 'stopped' : 'completed';
+      recordDaily(run,run.stopped ? 'Daily plan stopped' : 'Planned daily cycles completed');
+    } catch (error) {
+      run.status = run.stopped ? 'stopped' : 'blocked'; run.lastError = errorDetails(error);
+      settleDailyFailure(run.cycles[run.currentCycle]);
+      try { recordDaily(run,`Stopped: ${error.message || error}`); } catch { /* Preserve the original error if persistence also failed. */ }
+      throw error;
+    } finally {
+      state.dailyRun = null; state.dailyPlan = null;
+      state.batchQueue = savedQueue; state.sets = savedSets; state.challenges = savedChallenges;
+      options(ui.set,savedSets); options(ui.challenge,savedChallenges);
+      savedControls.forEach(({control,value,checked,disabled}) => { control.value = value; control.checked = checked; control.disabled = disabled; });
+      ui.batchConsent.checked = savedConsent; ui.dailyConsent.checked = false;
+      if (savedPolicy === null) localStorage.removeItem(STORAGE); else localStorage.setItem(STORAGE,savedPolicy);
+      invalidate(); renderBatch(); renderDaily();
+    }
+  }
+  function renderDaily() {
+    if (!ui.dailyList) return;
+    ui.dailyList.replaceChildren();
+    const plan = state.dailyPlan?.plan;
+    for (const entry of plan?.sets || []) el('li',`${entry.name}: ${entry.repetitions} cycles`,ui.dailyList);
+    for (const entry of plan?.skipped || []) el('li',`${entry.name}: omitted from plan (${entry.reason})`,ui.dailyList);
+    if (!plan) el('li','Build a plan to check current daily allowances.',ui.dailyList);
+    ui.dailyPlan.disabled = state.busy;
+    ui.dailyStart.disabled = state.busy || !plan?.totalCycles || !ui.dailyConsent.checked;
+    ui.dailyStop.disabled = !state.dailyRun;
+    ui.dailyExport.disabled = !state.dailyReport;
+    ui.dailyDetails.show.disabled = !state.dailyReport;
+  }
+  function stopDaily() {
+    const run = state.dailyRun;
+    if (run) { run.stopped = true; run.status = 'stopped'; }
+    if (state.batchRun) { state.batchRun.stopped = true; state.batchRun.controller.stop(); }
+    invalidate();
+    if (run) { try { recordDaily(run,'The daily plan stopped. No new action will start'); } catch (error) { fail(error); } }
+    status('The daily plan stopped. An action already sent to EA may complete; the next cycle will not start.');
+  }
+
+  function el(tag, text, parent) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (parent) parent.append(node); return node; }
+  function options(select, entries) { select.replaceChildren(); entries.forEach(entry => { const option = el('option', entry.name, select); option.value = entry.id; }); }
+  function renderBatch() {
+    if (!ui.batchList) return;
+    ui.batchList.replaceChildren();
+    for (const entry of state.batchQueue) el('li', entry.name, ui.batchList);
+    if (!state.batchQueue.length) el('li', 'No sets added yet.', ui.batchList);
+    ui.batchAdd.disabled = state.busy;
+    ui.batchClear.disabled = state.busy || !state.batchQueue.length;
+    ui.batchStart.disabled = state.busy || !state.batchQueue.length || !ui.batchConsent.checked;
+    ui.batchStop.disabled = !state.batchRun;
+    ui.batchExport.disabled = !state.batchReport;
+    const eligible = helper => { try { return Boolean(helper?.plan(state.batchReport)); } catch { return false; } };
+    ui.batchReconcile.disabled = state.busy || !eligible(window.AutoSBCBatchReconcile);
+    ui.batchReplan.disabled = state.busy || !eligible(window.AutoSBCBatchReplan);
+    ui.batchDetails.show.disabled = !state.batchReport;
+    const report = state.batchReport, p = report?.snapshot?.progress;
+    if (!state.batchRun && p && Array.isArray(report.snapshot.queue)) {
+      const current = report.snapshot.queue.find(entry => entry && String(entry.setId) === String(report.snapshot.currentSetId));
+      const selected = Array.isArray(report.selectedSets) ? report.selectedSets.find(entry => entry && String(entry.id) === String(current?.setId)) : null;
+      const step = Array.isArray(current?.steps) ? current.steps.at(-1) : null;
+      const submitted = Array.isArray(report.receipts) ? report.receipts.filter(receipt => receipt.completed === true && receipt.rewardsGranted === true).length : 0;
+      ui.batchStatus.textContent = `${p.completed}/${p.total} sets completed · ${submitted} submission receipts · ${p.confirmedChallenges} counter verifications${current ? `\n${selected?.name || `Set ${current.setId}`}${step ? ` · Challenge ${step.challengeId}` : ''}` : ''}\n${report.phase || report.snapshot.status}`;
+    }
+  }
+  function stopBatch() {
+    if (state.dailyRun) { stopDaily(); return; }
+    if (state.batchRun) { state.batchRun.stopped = true; state.batchRun.controller.stop(); }
+    invalidate();
+    status('Stopped. A submission already sent to EA may complete; the next squad will not start.');
+  }
+  function settingsChanged() { if (state.dailyRun) stopDaily(); else if (state.batchRun) stopBatch(); else { state.dailyPlan = null; if (ui.dailyConsent) ui.dailyConsent.checked = false; invalidate(); renderDaily(); } }
+  function downloadJSON(value, filename) {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(value,null,2)], {type:'application/json'}));
+    const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+    // Chrome may keep its Save dialog open before reading the blob. Keep the
+    // snapshot available while the user chooses a filename; unload also frees it.
+    setTimeout(() => URL.revokeObjectURL(url),300000);
+  }
+  function reportDetails(parent,title,buttonLabel,fieldLabel,getReport) {
+    const details = el('details',undefined,parent); el('summary',title,details);
+    el('p','Show the current report. Select the button again to refresh it.',details).className = 'muted';
+    const show = el('button',buttonLabel,details); show.disabled = true;
+    const field = el('textarea',undefined,el('label',fieldLabel,details));
+    field.readOnly = true; field.rows = 12; field.value = ''; field.spellcheck = false;
+    show.addEventListener('click',() => {
+      const report = getReport();
+      if (!report) return;
+      field.value = JSON.stringify(report,null,2); details.open = true;
+    });
+    return {show,field};
+  }
+  function renderReview(preview) {
+    ui.review.replaceChildren();
+    el('h3', preview.input.sbcData.challengeName, ui.review);
+    el('p', `FC ${preview.input.gameYear} · ${preview.input.platform.toUpperCase()} · Club and market squad`, ui.review).className = 'muted';
+    if (preview.input.liveMarket) el('p', `Live EA market · ${preview.input.liveMarket.quotes.length} prices observed across ${preview.input.liveMarket.pagesRead} searches. Only those listings were compared; the cheapest card across the entire market is not guaranteed. Prices expire after 120 seconds.`, ui.review);
+    const table = el('table', undefined, ui.review), head = el('tr', undefined, table);
+    ['Slot','Player','RTG','Games','Type','Price'].forEach(label => el('th', label, head));
+    for (const row of preview.rows) {
+      const tr = el('tr', undefined, table);
+      const type = row.player.concept ? 'Concept' : row.player.tradeabilityKnown === false ? 'Club · tradeability unknown' : row.player.isStorage ? 'Storage' : row.player.isDuplicate ? 'Dupe' : row.player.isUntradeable ? 'Club · untradeable' : 'Club · tradeable';
+      const price = Number(row.marketPrice ?? row.futggPrice ?? row.player.marketPrice);
+      const played = row.player.concept ? '—' : Number.isSafeInteger(row.player.gamesPlayed) && row.player.gamesPlayed >= 0 ? row.player.gamesPlayed : 'Unknown';
+      [row.squadPosition + 1, row.player.name, row.player.rating, played, type, price > 0 ? Math.round(price).toLocaleString() : 'Estimated'].forEach(value => el('td', String(value), tr));
+    }
+    const shopping = preview.result.shoppingList || [];
+    const purchase = shopping.reduce((sum,item) => sum + Number(item.marketPrice) * Number(item.quantity), 0);
+    const owned = preview.rows.filter(row => !row.player.concept);
+    const ownedCost = owned.reduce((sum,row) => sum + (Number(row.marketPrice ?? row.futggPrice) || 0),0);
+    el('p', `${owned.length} club cards + ${shopping.length} cards to buy · Purchase total: ${purchase.toLocaleString()} coin`, ui.review);
+    el('p', `Estimated market value of club cards: ${ownedCost.toLocaleString()} coins. This is their value, not a purchase charge. The preview expires after 5 minutes.`, ui.review);
+    if (shopping.length) {
+      el('h3', 'Shopping list', ui.review);
+      for (const item of shopping) {
+        const box = el('div', undefined, ui.review);
+        el('p', `${item.quantity} × ${item.name} (${item.rating}) — ${Number(item.marketPrice).toLocaleString()} coin`, box);
+        const age = Math.max(0, Math.round((Date.now() - Date.parse(item.priceSnapshotAt))/60000));
+        el('p', `${item.source} · FC ${item.gameYear} / ${item.platform.toUpperCase()} · Source price ${age} minutes ago · ${new Date(item.priceSnapshotAt).toLocaleString()}`, box).className = 'muted';
+        try {
+          const url = new URL(item.url);
+          if (url.protocol === 'https:' && ['www.fut.gg','fut.gg'].includes(url.hostname)) {
+            const link = el('a', preview.input.liveMarket ? 'View card details ↗' : 'View card and price source ↗', box); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+          }
+        } catch { /* A missing source link never becomes an arbitrary navigation. */ }
+      }
+      el('p', 'Place concept players saves EA concept cards to the SBC without spending coins. Replace them with owned cards before submitting. The shopping list provides prices only.', ui.review);
+    } else el('p', 'All cards in this solution are already in your club.', ui.review);
+    if (preview.conceptCoverage) el('p', `Market pool: ${preview.conceptCoverage.returned ?? preview.conceptCoverage.addedToPool ?? '?'} / ${preview.conceptCoverage.totalEligible ?? '?'} eligible candidates. ${preview.conceptCoverage.complete ? 'All eligible catalog candidates were checked.' : 'A limited pool was searched. The cheapest solution across the entire market is not guaranteed.'}`, ui.review);
+    if (preview.result.summary) {
+      const summary = preview.result.summary;
+      const requirements = preview.input.sbcData.constraints || [];
+      const rating = requirements.some(rule => rule.requirementKey === 'TEAM_RATING') ? summary.estimatedRating ?? 'Unavailable' : 'Not required';
+      const chemistry = requirements.some(rule => ['CHEMISTRY_POINTS','ALL_PLAYERS_CHEMISTRY_POINTS'].includes(rule.requirementKey)) ? summary.chemistry ?? 'Unavailable' : 'Not required';
+      el('p', `Squad rating: ${rating} · Chemistry: ${chemistry} · Duplicates used: ${summary.duplicatesUsed ?? 0}`, ui.review);
+      if (Number.isFinite(summary.marketCost)) el('p', `Estimated total market value: ${Math.round(summary.marketCost).toLocaleString()} coin`, ui.review);
+    }
+    const diagnostics = preview.result.diagnostics;
+    if (Array.isArray(diagnostics?.warnings)) for (const warning of diagnostics.warnings) {
+      if (typeof warning === 'string') el('p',warning,ui.review);
+    }
+    if (diagnostics && (Array.isArray(diagnostics) ? diagnostics.length : true)) {
+      const solverDetails = el('details',undefined,ui.review); el('summary','Solver details',solverDetails);
+      el('pre',JSON.stringify({diagnostics,summary:preview.result.summary},null,2),solverDetails);
+    }
+    const details = el('details', undefined, ui.review); el('summary', 'Protected cards and Paletools', details);
+    el('pre', JSON.stringify(preview.rejected, null, 2), details);
+    el('p', 'Cards in every saved squad are protected, including inactive squads, bench and reserves, as reported by EA. Match counts use the same EA data as Player Bio; EA-reported zero counts are not independently verified. Played-card protection excludes cards with positive or unreadable match counts. Fresh club, storage and saved squad reads are required before applying. Cards with unknown tradeability follow the tradeable-card rule.', details);
+    el('p', 'Saved Paletools locks for cards, nations, clubs, leagues and rarities are respected, including saved locks from other accounts. Paletools settings are left unchanged.', details);
+    ui.apply.textContent = shopping.length ? 'Place concept players' : 'Apply squad';
+    ui.apply.disabled = false;
+  }
+
+  const host = document.createElement('div'); host.id = 'autosbc-local-panel'; document.documentElement.append(host);
+  const root = host.attachShadow({ mode: 'open' });
+  const style = el('style', undefined, root);
+  style.textContent = `:host{all:initial;position:fixed;z-index:2147483000;right:18px;bottom:18px;font:13px/1.5 system-ui,sans-serif;color:#ecf6f3}*{box-sizing:border-box}button,input,select,textarea{font:inherit}button{background:#24443d;color:#ecf6f3;border:1px solid #56736b;border-radius:8px;padding:8px 12px;cursor:pointer}button:hover{background:#345c50}button:disabled{opacity:.45;cursor:default}.launch{background:#bdf576;color:#162210;font-weight:700}.panel{width:min(470px,calc(100vw - 36px));max-height:82vh;overflow:auto;background:#10231e;border:1px solid #3c6054;box-shadow:0 12px 50px #0008;border-radius:16px;padding:18px;margin-bottom:8px}.hidden{display:none}h2{font-size:21px;margin:0 0 2px}h3{font-size:16px}p{margin:8px 0}a{color:#bdf576}label{display:block;margin:9px 0}select,textarea,input[type=number]{background:#1c342d;color:#fff;border:1px solid #4e6f62;border-radius:6px;padding:6px;width:100%}input[type=checkbox]{margin-right:8px;accent-color:#bdf576}input[type=number]{width:100px;float:right}.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}details{border-top:1px solid #375348;margin-top:12px;padding-top:10px}summary{cursor:pointer;color:#d6e6de}.muted{font-size:12px;color:#a3c3b6}.status{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;font-size:12px}td,th{text-align:left;padding:5px 3px;border-bottom:1px solid #375348}pre{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}.apply{background:#bdf576;color:#122010;font-weight:700}`;
+  const panel = el('section', undefined, root); panel.className = 'panel hidden';
+  const ui = { settings: {}, weights: {} };
+  const launch = el('button', 'Auto-SBC Studio', root); launch.className = 'launch';
+  launch.addEventListener('click', () => { panel.classList.toggle('hidden'); if (!panel.classList.contains('hidden')) health().catch(fail); });
+  el('h2', 'Auto-SBC Studio', panel); el('p', 'Build SBC squads with club cards and priced concepts', panel).className = 'muted';
+  if (typeof window.__autoSBCVersion === 'string' && /^\d+(\.\d+){0,3}$/.test(window.__autoSBCVersion)) el('p',`Version ${window.__autoSBCVersion}`,panel).className = 'muted';
+  ui.season = el('select', undefined, el('label', 'Game edition', panel));
+  options(ui.season, [{id:'',name:'Select game edition'},{id:26,name:'EA FC 26'},{id:27,name:'EA FC 27'}]);
+  ui.platform = el('select', undefined, el('label', 'Market platform', panel));
+  options(ui.platform, [{id:'',name:'Select platform'},{id:'ps5',name:'Console market (PS / Xbox)'},{id:'pc',name:'PC market'}]);
+  try {
+    const selected = JSON.parse(localStorage.getItem(SCOPE_STORAGE) || '{}');
+    if ([26,27].includes(Number(selected.gameYear)) && ['ps5','pc'].includes(selected.platform)) {
+      ui.season.value = selected.gameYear; ui.platform.value = selected.platform;
+    }
+  } catch { /* Require explicit selection for missing or malformed saved scope. */ }
+  ui.destination = el('p', 'Server destination will be checked before solving.', panel); ui.destination.className = 'muted';
+  ui.health = el('p', 'Server not checked yet.', panel); ui.health.className = 'muted';
+  ui.marketNotice = el('p', '', panel); ui.marketNotice.className = 'muted';
+  ui.dashboard = el('a', 'Open local dashboard and database ↗', panel); ui.dashboard.href = BASE; ui.dashboard.target = '_blank'; ui.dashboard.rel = 'noopener';
+  const top = el('div', undefined, panel); top.className = 'row';
+  ui.refresh = el('button', 'Load SBCs', top);
+  const check = el('button', 'Check server', top); check.addEventListener('click', () => health().catch(fail));
+  if (window.__autoSBCExtension) {
+    const settings = el('button','Server settings',top);
+    settings.addEventListener('click',() => {
+      if (state.busy) { status('Stop the current run before changing servers.',true); return; }
+      window.postMessage({source:'autosbc-server-options-request',id:crypto.randomUUID()},location.origin);
+    });
+  }
+  ui.set = el('select', undefined, el('label', 'SBC set', panel));
+  ui.challenge = el('select', undefined, el('label', 'Challenge', panel));
+  ui.marketQuality = el('select', undefined, el('label', 'Live market card quality', panel));
+  options(ui.marketQuality,[{id:'bronze',name:'Bronze'},{id:'silver',name:'Silver'},{id:'gold',name:'Gold'}]); ui.marketQuality.value = 'silver';
+  ui.marketCeiling = el('input', undefined, el('label','Live search price ceiling (coins)',panel));
+  ui.marketCeiling.type='number'; ui.marketCeiling.min=1; ui.marketCeiling.max=15000000; ui.marketCeiling.value=2000;
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORAGE) || '{}'); } catch { /* Use safe defaults. */ }
+  const settings = { ...P.defaults, ...saved, weights: { ...P.defaults.weights, ...saved.weights } };
+  const policySection = el('details', undefined, panel); policySection.open = true; el('summary', 'Card rules', policySection);
+  for (const [name,label] of [['prioritizeDuplicates','Prioritize duplicates and untradeables'],['onlyStorage','Use SBC storage only'],['allowTradeable','Allow tradeable cards'],['protectSpecial','Protect special cards'],['protectEvolutions','Protect evolved cards'],['protectPlayed','Protect played cards'],['allowConcept','Allow priced concept players']]) {
+    const row = el('label', undefined, policySection), input = el('input', undefined, row); input.type = 'checkbox'; input.checked = Boolean(settings[name]); row.append(document.createTextNode(label)); ui.settings[name] = input;
+  }
+  for (const [name,label,max] of [['maxRating','Maximum player rating',99],['maxPlayerPrice','Player value limit (0 = no limit)',15000000],['maxPurchasePrice','Purchase budget (0 = no limit)',165000000],['maxTotalPrice','Squad value limit (0 = no limit)',165000000]]) {
+    const labelNode = el('label', label, policySection), input = el('input', undefined, labelNode); input.type = 'number'; input.min = name === 'maxRating' ? 1 : 0; input.max = max; input.value = settings[name]; ui.settings[name] = input;
+  }
+  const weights = el('details', undefined, panel); el('summary', 'Cost weights and locks', weights);
+  el('p', '1 = full market value; 0.1 = 10% of that value. Locks and protections always take priority.', weights).className = 'muted';
+  for (const [name,label] of [['duplicateUntradeable','Duplicate untradeable'],['untradeable','Untradeable'],['tradeable','Tradeable'],['concept','Concept']]) {
+    const labelNode = el('label', label, weights), input = el('input', undefined, labelNode); input.type = 'number'; input.min = 0; input.max = 100; input.step = .1; input.value = settings.weights[name]; ui.weights[name] = input;
+  }
+  ui.locked = el('textarea', undefined, el('label', 'Protected item IDs (comma-separated)', weights)); ui.locked.rows = 2; ui.locked.value = (settings.lockedItemIds || []).join(', ');
+  ui.required = el('textarea', undefined, el('label', 'Required item IDs', weights)); ui.required.rows = 2; ui.required.value = (settings.requiredItemIds || []).join(', ');
+  const timeLabel = el('label', 'Maximum solve time (seconds)', panel); ui.time = el('input', undefined, timeLabel); ui.time.type = 'number'; ui.time.min = 1; ui.time.max = 120; ui.time.value = 30;
+  const controls = el('div', undefined, panel); controls.className = 'row';
+  ui.solve = el('button', 'Solve and preview', controls); ui.solve.className = 'launch';
+  ui.liveSolve = el('button', 'Solve with live prices', controls);
+  el('p','Solve and preview uses the FUT.GG database. Solve with live prices searches current EA listings using the lowest of your search ceiling, card limit and total budget limits.',panel).className='muted';
+  const cancel = el('button', 'Cancel', controls); cancel.addEventListener('click', () => { if (state.dailyRun) stopDaily(); else if (state.batchRun) stopBatch(); else { invalidate(); status('Cancelled. The pending result will not be applied.'); } });
+  ui.export = el('button', 'Export solve request', controls); ui.export.disabled = true;
+  ui.export.addEventListener('click', () => {
+    if (!state.input) return;
+    downloadJSON(state.input,`autosbc-request-${state.input.sbcData.challengeId}.json`);
+  });
+  ui.status = el('p', 'Load SBCs to begin, or build a daily plan.', panel); ui.status.className = 'status';
+  ui.poolInfo = el('p', '', panel); ui.poolInfo.className = 'muted';
+  ui.review = el('div', undefined, panel);
+  ui.apply = el('button', 'Apply squad', panel); ui.apply.className = 'apply'; ui.apply.disabled = true;
+  const batchSection = el('section', undefined, panel);
+  el('h3', 'Automatic SBC queue', batchSection);
+  el('p', 'Solve, apply and submit the remaining challenges in each selected set once. Played and evolved cards, plus cards in every saved squad, are protected. No purchases, pack opening or player-pick selection. Stop prevents the next squad; a submission already sent to EA may complete.', batchSection).className = 'muted';
+  ui.batchList = el('ol', undefined, batchSection);
+  const batchControls = el('div', undefined, batchSection); batchControls.className = 'row';
+  ui.batchAdd = el('button', 'Add selected set', batchControls);
+  ui.batchClear = el('button', 'Clear queue', batchControls);
+  const consentLabel = el('label', undefined, batchSection);
+  ui.batchConsent = el('input', undefined, consentLabel); ui.batchConsent.type = 'checkbox'; ui.batchConsent.checked = false;
+  consentLabel.append(document.createTextNode('Automatically submit the queued squads. Submitted cards will be removed from my club.'));
+  const batchRunControls = el('div', undefined, batchSection); batchRunControls.className = 'row';
+  ui.batchStart = el('button', 'Start queue', batchRunControls); ui.batchStart.className = 'launch';
+  ui.batchStop = el('button', 'Stop queue', batchRunControls);
+  ui.batchExport = el('button', 'Download run report', batchRunControls);
+  ui.batchReconcile = el('button','Verify last submission',batchRunControls);
+  ui.batchReplan = el('button','Verify cards and replan',batchRunControls);
+  el('p','Recovery buttons are available only for a matching stopped run. Verification checks EA records without resubmitting. A fresh plan always requires your confirmation.',batchSection).className = 'muted';
+  ui.batchStatus = el('p', 'Queue idle.', batchSection); ui.batchStatus.className = 'status';
+  ui.batchDetails = reportDetails(batchSection,'Run details','Show report JSON','SBC run report (JSON)',() => state.batchReport);
+  try {
+    const raw = localStorage.getItem(BATCH_STORAGE), previous = JSON.parse(raw || 'null');
+    if (previous?.runId) { state.batchReport = previous; ui.batchStatus.textContent = 'A previous run report is available. Runs do not resume after a reload. Review the report and completion status in EA.'; }
+    if (raw && (!previous?.runId || !previous.snapshot || !Array.isArray(previous.snapshot.queue))) state.batchReportUnreadable = true;
+  } catch { state.batchReportUnreadable = true; ui.batchStatus.textContent = 'Cannot read the previous run report. Automatic resume is disabled.'; }
+  ui.batchAdd.addEventListener('click', () => {
+    if (state.busy) return;
+    const selected = state.sets.find(set => String(set.id) === ui.set.value);
+    if (!selected) { fail(new Error('Load SBCs and select a set first.')); return; }
+    if (!state.batchQueue.some(entry => String(entry.id) === String(selected.id))) state.batchQueue.push({id:String(selected.id),name:selected.name});
+    ui.batchConsent.checked = false; renderBatch();
+  });
+  ui.batchClear.addEventListener('click', () => { if (!state.busy) { state.batchQueue = []; ui.batchConsent.checked = false; renderBatch(); } });
+  ui.batchConsent.addEventListener('change', () => { if (state.batchRun && !ui.batchConsent.checked) stopBatch(); renderBatch(); });
+  ui.batchStart.addEventListener('click', () => action(runBatch));
+  ui.batchStop.addEventListener('click', stopBatch);
+  ui.batchExport.addEventListener('click', () => { if (state.batchReport) downloadJSON(state.batchReport, 'autosbc-batch-report.json'); });
+  ui.batchReconcile.addEventListener('click',() => action(reconcileLastSubmission));
+  ui.batchReplan.addEventListener('click',() => action(verifyCardsForReplan));
+  renderBatch();
+  const dailySection = el('section',undefined,panel);
+  el('h3','Complete dailies',dailySection);
+  el('p','Check the current allowances for bronze, silver, common gold and rare gold dailies. Review and start the finite plan. Special, played and evolved cards are protected. Packs stay unopened.',dailySection).className = 'muted';
+  ui.dailyPlan = el('button','Build daily plan',dailySection);
+  ui.dailyList = el('ol',undefined,dailySection);
+  const dailyConsent = el('label',undefined,dailySection);
+  ui.dailyConsent = el('input',undefined,dailyConsent); ui.dailyConsent.type = 'checkbox'; ui.dailyConsent.checked = false;
+  dailyConsent.append(document.createTextNode('Automatically submit the daily cycles shown. Submitted cards will be removed from my club.'));
+  const dailyControls = el('div',undefined,dailySection); dailyControls.className = 'row';
+  ui.dailyStart = el('button','Start daily plan',dailyControls);
+  ui.dailyStop = el('button','Stop daily plan',dailyControls);
+  ui.dailyExport = el('button','Download daily report',dailyControls);
+  ui.dailyStatus = el('p','Build a daily plan to get started.',dailySection); ui.dailyStatus.className = 'status';
+  ui.dailyDetails = reportDetails(dailySection,'Daily run details','Show daily report JSON','Daily run report (JSON)',() => state.dailyReport);
+  try {
+    const raw = localStorage.getItem(DAILY_STORAGE), previous = JSON.parse(raw || 'null');
+    if (previous?.runId && Array.isArray(previous.plan?.entries) && Number.isSafeInteger(previous.plan?.totalCycles) &&
+        Array.isArray(previous.cycles) && ['running','completed','stopped','blocked'].includes(previous.status)) {
+      state.dailyReport = previous;
+      ui.dailyStatus.textContent = 'A previous daily report is available. Runs do not resume after a reload. The plan and EA status are checked again.';
+    } else if (raw) state.dailyReportUnreadable = true;
+  } catch { state.dailyReportUnreadable = true; ui.dailyStatus.textContent = 'Cannot read the daily report. Automatic resume is disabled.'; }
+  ui.dailyPlan.addEventListener('click',() => action(prepareDailies));
+  ui.dailyStart.addEventListener('click',() => action(runDailies));
+  ui.dailyConsent.addEventListener('change',() => { if (state.dailyRun && !ui.dailyConsent.checked) stopDaily(); renderDaily(); });
+  ui.dailyStop.addEventListener('click',stopDaily);
+  ui.dailyExport.addEventListener('click',() => { if (state.dailyReport) downloadJSON(state.dailyReport,'autosbc-daily-report.json'); });
+  renderDaily();
+  el('p', 'Single previews save squads. Automatic queues submit only the sets you select. Based on TitiroMonkey Auto-SBC · MIT.', panel).className = 'muted';
+  ui.refresh.addEventListener('click', () => action(loadSets));
+  ui.set.addEventListener('change', () => action(loadChallenges));
+  ui.challenge.addEventListener('change', settingsChanged);
+  for (const select of [ui.season,ui.platform]) select.addEventListener('change', () => { settingsChanged(); health().catch(fail); });
+  ui.solve.addEventListener('click', () => action(solve));
+  ui.liveSolve.addEventListener('click', () => action(() => solve(activeChallengeContext(),true)));
+  ui.apply.addEventListener('click', () => action(apply));
+  for (const input of [...Object.values(ui.settings),...Object.values(ui.weights),ui.locked,ui.required,ui.time,ui.marketQuality,ui.marketCeiling]) input.addEventListener('change', settingsChanged);
+  if (window.AutoSBCNative) {
+    window.AutoSBCNative.install({
+      document,
+      getPrototype: () => typeof UTSBCSquadDetailPanelView !== 'undefined' ? UTSBCSquadDetailPanelView.prototype : null,
+      resolveContext: activeChallengeContext,
+      getGate: () => {
+        if (state.busy) return { ready: false, reason: 'Wait for the current solve to finish.' };
+        const gameYear = Number(ui.season.value), platform = ui.platform.value;
+        if (![26,27].includes(gameYear) || !['ps5','pc'].includes(platform)) return { ready: false, reason: 'Select your game edition and platform in Auto-SBC.' };
+        if (state.backendScope !== `${gameYear}:${platform}`) return { ready: false, reason: 'Check the server connection in Auto-SBC.' };
+        return { ready: true };
+      },
+      onMount: () => { health().catch(fail); },
+      onSolveCurrent: context => { panel.classList.remove('hidden'); return action(() => solve(context)); },
+      onContextChanged: () => { if (state.nativeActive || state.preview?.nativeContext) invalidate(); },
+      onError: fail
+    });
+  }
+})();

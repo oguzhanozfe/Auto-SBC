@@ -1,249 +1,351 @@
-from fastapi.middleware.cors import CORSMiddleware
-import time
+"""Auto-SBC service. Club data stays in memory; the browser controls EA actions."""
+from __future__ import annotations
+
 import json
-from fastapi import Request, FastAPI, BackgroundTasks
-from . import setup
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import functools
-import signal
-import sys
-import uvicorn
+import io
+import hmac
 import logging
-from . import logger  # Import the logger module
-import requests
+import os
+import re
+import time
+import uuid
+import zipfile
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Any, Literal
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
-# Global variables
-app = FastAPI()
-thread_pool = ThreadPoolExecutor(max_workers=10)
-shutdown_event = asyncio.Event()
+from . import logger, setup, planner
+from .catalog import Catalog
+from .live_market import LiveMarket
+from .runtime_config import RuntimeConfig
+from .hosted_seed import seed_ratings
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def run_in_threadpool(func):
-    """Decorator to run a function in a thread pool"""
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        if shutdown_event.is_set():
-            logging.warning("Server is shutting down, rejecting new requests")
-            raise RuntimeError("Server is shutting down")
-            
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            thread_pool, 
-            functools.partial(func, *args, **kwargs)
-        )
-    return wrapper
-
-# Shutdown handler that properly cleans up resources
-async def shutdown():
-    logging.info("Initiating graceful shutdown")
-    
-    # Set shutdown event to prevent new requests
-    shutdown_event.set()
-    
-    # Wait for active tasks to complete (with a timeout)
-    logging.info("Waiting for active tasks to complete")
-    try:
-        # Give active tasks up to 5 seconds to complete
-        await asyncio.wait_for(asyncio.sleep(2), timeout=5)
-    except asyncio.TimeoutError:
-        logging.warning("Some tasks didn't complete in time")
-        
-    
-    # Don't wait for all tasks - faster shutdown for reloads
-    thread_pool.shutdown(wait=False)
-    
-    # Force terminate the process
-    import os
-    logging.critical(f"Killing {os.getpid()} - process will terminate immediately")
-    os.kill(os.getpid(), signal.SIGTERM)
-    
-    
-    
-
-# Register the shutdown handler
-@app.on_event("shutdown")
-async def app_shutdown():
-    await shutdown()
-
-# Synchronous function that will be run in a thread
-def get_logs():
-    # Return the logs from the shared module
-    return {"logs": logger.solver_logs}
-
-@app.get('/solver-logs')
-async def get_solver_logs():
-    # Run the blocking operation in a separate thread
-    return await run_in_threadpool(get_logs)()
-
-# Synchronous function that will be run in a thread
-def process_solve_request(request_data):
-    # Use the globals module
-    logger.clear_logs()  # Clear previous logs
-    logger.add_log("SBC Solver started in thread")
-    
-    sbcData = request_data['sbcData']
-    clubPlayers = request_data['clubPlayers']
-    maxSolveTime = request_data['maxSolveTime']
-    
-    # Log received data
-    logger.add_log(f"Processing {len(clubPlayers)} players, max time: {maxSolveTime}s")
-    
-    try:
-        result = setup.runAutoSBC(sbcData, clubPlayers, maxSolveTime)
-        
-        # Log completion
-        logger.add_log("Solver thread completed successfully")
-        
-        return result
-    except Exception as e:
-        # Log errors
-        logger.add_log(f"Error in solver thread: {str(e)}")
-        raise e
-
-@app.post('/solve')
-async def get_body(request: Request):
-    # Parse the request data and clear logs on new solve
-    request_data = await request.json()
-    logger.clear_logs()  # Clear previous logs
-    
-    # Run the CPU-intensive task in a thread pool
-    result = await run_in_threadpool(process_solve_request)(request_data)
-    return result
-
-# Add endpoint to clear logs in a separate thread
-def clear_logs_handler():
-    logger.clear_logs()
-    return {"status": "success"}
-
-@app.post('/clear-logs')
-async def clear_solver_logs():
-    return await run_in_threadpool(clear_logs_handler)()
-
-# Add endpoint to serve the CSV file
-@app.get('/allPlayers.csv')
-async def get_all_players_csv():
-    """Serve the allPlayers.csv file for the Tampermonkey script"""
-    import os
-    from fastapi.responses import FileResponse
-
-    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'allPlayers.csv')
-
-    if os.path.exists(csv_path):
-        logging.info(f"Serving CSV file from: {csv_path}")
-        return FileResponse(
-            csv_path,
-            media_type='text/csv',
-            headers={
-                'Content-Disposition': 'inline; filename=allPlayers.csv',
-                'Access-Control-Allow-Origin': '*'
-            }
-        )
-    else:
-        logging.warning(f"CSV file not found at: {csv_path}")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="CSV file not found")
+ROOT = Path(__file__).resolve().parent.parent
+VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+EA_ORIGINS = {"https://www.ea.com", "https://www.easports.com"}
+LOCAL_ORIGINS = {"http://127.0.0.1:8000", "http://localhost:8000"}
+MAX_BODY_BYTES = 24 * 1024 * 1024
 
 
-@app.get('/conceptPlayers.csv')
-async def get_concept_players_csv():
-    """Serve the conceptPlayers.csv file for the Tampermonkey script"""
-    import os
-    from fastapi.responses import FileResponse
+class MarketScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gameYear: Literal[26, 27] | None = None
+    platform: Literal["ps5", "pc"] | None = None
 
-    csv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'conceptPlayers.csv')
 
-    if os.path.exists(csv_path):
-        logging.info(f"Serving concept CSV file from: {csv_path}")
-        return FileResponse(
-            csv_path,
-            media_type='text/csv',
-            headers={
-                'Content-Disposition': 'inline; filename=conceptPlayers.csv',
-                'Access-Control-Allow-Origin': '*'
-            }
-        )
-    else:
-        logging.warning(f"Concept CSV file not found at: {csv_path}")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Concept CSV file not found")
+class SolveRequest(MarketScope):
+    sbcData: dict[str, Any]
+    clubPlayers: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+    maxSolveTime: float = Field(default=15, ge=1, le=120, allow_inf_nan=False)
+    solverPolicy: dict[str, Any] = Field(default_factory=dict)
+    liveMarket: LiveMarket | None = None
 
-def process_relay_request(body):
-    logging.info("Received relay request")
-    logging.debug("Relay request data: %s", body)
-    url     = body.get("url")
-    method  = body.get("method", "GET").upper()
-    headers = body.get("headers", {})
-    data    = body.get("data", None)
-    resp    = requests.request(method, url, headers=headers, data=data)
-    logging.info(f"Relay request completed with {url} {resp.text}")
-    return {
-        "status":       resp.status_code,
-        "responseText": resp.text
-    }
+    @model_validator(mode="after")
+    def require_pool(self):
+        if self.liveMarket is not None:
+            if self.solverPolicy.get("allowConcept") is not True:
+                raise ValueError("liveMarket requires solverPolicy.allowConcept=true")
+            if self.gameYear is not None and self.gameYear != self.liveMarket.gameYear:
+                raise ValueError("liveMarket.gameYear differs from the selected season")
+            if self.platform is not None and self.platform != self.liveMarket.platform:
+                raise ValueError("liveMarket.platform differs from the selected market")
+            self.gameYear, self.platform = self.liveMarket.gameYear, self.liveMarket.platform
+        if not self.clubPlayers and self.solverPolicy.get("allowConcept") is not True:
+            raise ValueError("Load club players or enable market concepts.")
+        return self
 
-@app.post("/relay")
-async def relay(request: Request):
-    body = await request.json()
-    # forward the HTTP call to threadpool so it doesn't block the event loop
-    # return await run_in_threadpool(process_relay_request)(body)
-    return {"data":[]}  # Placeholder for relay functionality
 
-def start():
-    """Start the server using the uvicorn runner with proper signal handling"""
-    config = uvicorn.Config(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
-        reload=False,
-        workers=1
-    )
-    
-    server = uvicorn.Server(config)
-    
-    # Override the server's signal handlers with our own
-    server.install_signal_handlers = lambda: None
-    
-    # Define our own signal handlers
-    def handle_exit(signum, frame):
-        logging.info(f"Received exit signal {signum}")
-        # Tell the server to exit
-        server.should_exit = True
-    
-    # Register our signal handlers
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-    
-    # Start the server
-    logging.info("Starting server...")
-    server.run()
-    logging.info("Server stopped")
+class SyncRequest(MarketScope):
+    maxPages: int = Field(default=10, ge=1, le=1000)
+
+
+class ConceptRequest(MarketScope):
+    sbcData: dict[str, Any]
+    solverPolicy: dict[str, Any] = Field(default_factory=dict)
+    limit: int = Field(default=1500, ge=1, le=20000)
+
+
+def create_app(data_dir=None):
+    config = RuntimeConfig.read()
+    app = FastAPI(title="Auto-SBC Studio", version=VERSION)
+    app.state.runtime_config = config
+    catalog = Catalog(data_dir=data_dir, game_year=int(os.environ.get("AUTOSBC_GAME_YEAR", "26")),
+                      platform=os.environ.get("AUTOSBC_PLATFORM", "ps5"))
+    if config.hosted:
+        seed_ratings(catalog)
+    catalogs = {(catalog.game_year, catalog.platform): catalog}
+    catalog_lock = Lock()
+    def get_catalog(game_year=None, platform=None):
+        key = (game_year or catalog.game_year, platform or catalog.platform)
+        with catalog_lock:
+            if key not in catalogs:
+                catalogs[key] = Catalog(data_dir=data_dir, game_year=key[0], platform=key[1])
+                if config.hosted:
+                    seed_ratings(catalogs[key])
+            return catalogs[key]
+    solve_lock = Lock()
+    sync_lock = Lock()
+    jobs_lock = Lock()
+    jobs = {}
+    app.state.catalog = catalog
+    app.state.get_catalog = get_catalog
+    app.state.solve_lock = solve_lock
+    app.state.sync_lock = sync_lock
+    allowed_origins = EA_ORIGINS | ({config.public_origin} | config.extension_origins if config.hosted else LOCAL_ORIGINS)
+    port = os.environ.get("AUTOSBC_PORT", "8000")
+    if not config.hosted:
+        allowed_origins |= {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    app.add_middleware(CORSMiddleware, allow_origins=sorted(allowed_origins),
+                       allow_origin_regex=None if config.hosted else r"^chrome-extension://[a-p]{32}$",
+                       allow_credentials=False, allow_methods=["GET", "POST"],
+                       allow_headers=["Content-Type", "Authorization"] if config.hosted else ["Content-Type"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[config.hostname] if config.hosted else ["127.0.0.1", "localhost", "testserver"])
+
+    @app.middleware("http")
+    async def guard_request(request: Request, call_next):
+        origin = request.headers.get("origin")
+        if origin and origin not in allowed_origins and (config.hosted or not re.fullmatch(r"chrome-extension://[a-p]{32}", origin)):
+            return JSONResponse(status_code=403, content={"detail": "This origin cannot access the solver."})
+        request.state.owner_authenticated = False
+        if config.hosted:
+            public = request.method in {"GET", "HEAD"} and request.url.path in {
+                "/", "/privacy", "/health", "/static/app.js", "/static/style.css"}
+            preflight = request.method == "OPTIONS" and origin in allowed_origins and request.headers.get("access-control-request-method") in {"GET", "POST"}
+            supplied = request.headers.get("authorization", "")
+            if supplied:
+                request.state.owner_authenticated = hmac.compare_digest(supplied.encode(), ("Bearer " + config.token).encode())
+            if not preflight and (supplied and not request.state.owner_authenticated or not public and not request.state.owner_authenticated):
+                return JSONResponse(status_code=401, content={"detail": "A valid owner access token is required."}, headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
+        if request.method == "POST":
+            try:
+                length = int(request.headers.get("content-length", "0"))
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Invalid content length."})
+            body_limit = 8 * 1024 * 1024 if config.hosted else MAX_BODY_BYTES
+            if length > body_limit:
+                return JSONResponse(status_code=413, content={"detail": "Request is too large."})
+            size = 0
+            body_parts = []
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > body_limit:
+                    return JSONResponse(status_code=413, content={"detail": "Request is too large."})
+                body_parts.append(chunk)
+            request._body = b"".join(body_parts)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        if request.url.path in {"/", "/privacy"}:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+            )
+        return response
+
+    @app.get("/")
+    def dashboard():
+        filename = "hosted.html" if config.hosted else "index.html"
+        return FileResponse(ROOT / "backend/static" / filename)
+
+    @app.get("/privacy")
+    def privacy():
+        return FileResponse(ROOT / "backend/static/privacy.html")
+
+    @app.get("/download/chrome-extension")
+    def download_extension():
+        directory = ROOT / "dist/chrome-extension"
+        names = ("manifest.json", "companion.js", "bridge.js", "worker.js", "LICENSE",
+                 "transport.js", "options.html", "options.js", "options.css")
+        if any(not (directory / name).is_file() for name in names):
+            raise HTTPException(404, "The Chrome extension has not been built. Run node frontend/build.mjs first.")
+        try:
+            built_version = json.loads((directory / "manifest.json").read_text())["version"]
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(409, "The extension manifest is unreadable. Rebuild the browser extension.")
+        if built_version != VERSION:
+            raise HTTPException(409, "The extension build does not match Studio. Run node frontend/build.mjs to update it.")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name in names:
+                archive.write(directory / name, f"Auto-SBC-Chrome/{name}")
+        return Response(buffer.getvalue(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="Auto-SBC-Chrome-{VERSION}.zip"'})
+
+    @app.get("/static/{filename}")
+    def static_file(filename: str):
+        if filename not in {"app.js", "style.css"}:
+            raise HTTPException(404, "File not found")
+        return FileResponse(ROOT / "backend/static" / filename)
+
+    @app.get("/health")
+    def health(request: Request, gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        if config.hosted and not request.state.owner_authenticated:
+            return {"status": "ok", "version": VERSION, "mode": "hosted"}
+        return {"status": "ok", "version": VERSION, "solverBusy": solve_lock.locked(),
+                **({"mode": "hosted", "capabilities": config.capabilities} if config.hosted else {}),
+                "database": get_catalog(gameYear, platform).status()}
+
+    @app.get("/api/database/status")
+    def database_status(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        return {**get_catalog(gameYear, platform).status(), "syncing": sync_lock.locked()}
+
+    @app.get("/api/players")
+    def players(q: str = Query(default="", max_length=120), limit: int = Query(default=50, ge=1, le=1000),
+                offset: int = Query(default=0, ge=0), gameYear: int | None = Query(default=None, ge=26, le=27),
+                platform: Literal["ps5", "pc"] | None = None):
+        selected = get_catalog(gameYear, platform)
+        return {"players": selected.search(q, limit=limit, offset=offset),
+                "database": selected.status(), "total": selected.count(q), "limit": limit, "offset": offset}
+
+    @app.post("/api/concepts")
+    async def concept_candidates(body: ConceptRequest):
+        if config.hosted:
+            raise HTTPException(422, "This hosted free profile supports owned cards only. Use local Studio for concepts.")
+        try:
+            selected = get_catalog(body.gameYear, body.platform)
+            return await run_in_threadpool(selected.concept_candidates, body.sbcData, body.solverPolicy, body.limit)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/database/sync")
+    async def sync_database(body: SyncRequest):
+        if config.hosted:
+            raise HTTPException(403, "Catalog sync is disabled for this ephemeral hosted free profile.")
+        if not sync_lock.acquire(blocking=False):
+            raise HTTPException(409, "A database update is already running.")
+        def work():
+            try:
+                return get_catalog(body.gameYear, body.platform).sync(max_pages=body.maxPages)
+            except Exception as exc:
+                logging.exception("Public catalog sync failed")
+                raise HTTPException(502, f"Database update failed; existing data was kept. {exc}") from exc
+            finally:
+                sync_lock.release()
+        return await run_in_threadpool(work)
+
+    def solve_work(body, progress=None):
+        logger.clear_logs()
+        try:
+            return planner.plan(body, get_catalog(body.gameYear, body.platform), progress, refresh_prices=True)
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.add_log(f"Invalid solve input: {exc}")
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            logging.exception("Solver failed")
+            logger.add_log("Solver failed. No squad was applied.")
+            raise HTTPException(500, "The solver failed. No squad was applied; check local diagnostics.") from exc
+        finally:
+            solve_lock.release()
+
+    def acquire_solver():
+        if not solve_lock.acquire(blocking=False):
+            raise HTTPException(409, "A solution is already being calculated. Wait for it to finish.")
+
+    def hosted_solve_limits(body):
+        if not config.hosted:
+            return
+        if body.maxSolveTime > 30 or len(body.clubPlayers) > 5000:
+            raise HTTPException(422, "Hosted free profile limit: 30 seconds and 5,000 input cards. Use local Studio for a larger request; no candidates were discarded.")
+        if body.liveMarket is not None or body.solverPolicy.get("allowConcept") is True or any(player.get("concept") for player in body.clubPlayers):
+            raise HTTPException(422, "This hosted free profile supports owned cards only. Use local Studio for concepts.")
+        requirements = body.sbcData.get("constraints", [])
+        chemistry = isinstance(requirements, list) and any(isinstance(req, dict) and req.get("requirementKey") in {"CHEMISTRY_POINTS", "ALL_PLAYERS_CHEMISTRY_POINTS"} for req in requirements)
+        if chemistry and len(body.clubPlayers) > config.max_chemistry_players:
+            raise HTTPException(422, f"Hosted chemistry input limit: {config.max_chemistry_players} cards. Use local Studio for this larger pool; no candidates were discarded.")
+
+    @app.post("/solve")
+    async def solve(body: SolveRequest):
+        hosted_solve_limits(body)
+        acquire_solver()
+        return await run_in_threadpool(solve_work, body)
+
+    def prune_jobs():
+        # Caller holds jobs_lock. Store at most five recent results for ten minutes.
+        cutoff = time.monotonic() - 600
+        for job_id in list(jobs):
+            if jobs[job_id]["status"] != "running" and jobs[job_id]["created"] < cutoff:
+                del jobs[job_id]
+        finished = [key for key in jobs if jobs[key]["status"] != "running"]
+        for key in finished[:-4]:
+            del jobs[key]
+
+    @app.post("/api/solve/jobs", status_code=202)
+    def start_solve_job(body: SolveRequest):
+        hosted_solve_limits(body)
+        acquire_solver()
+        job_id = uuid.uuid4().hex
+        with jobs_lock:
+            prune_jobs()
+            jobs[job_id] = {"status": "running", "created": time.monotonic()}
+        def work():
+            try:
+                def progress(value):
+                    with jobs_lock:
+                        jobs[job_id]["progress"] = value
+                result = solve_work(body, progress)
+                update = {"status": "done", "result": result}
+            except HTTPException as exc:
+                update = {"status": "error", "detail": exc.detail, "statusCode": exc.status_code}
+            except Exception:
+                logging.exception("Asynchronous solver failed")
+                update = {"status": "error", "detail": "The background solver failed."}
+            with jobs_lock:
+                jobs[job_id].update(update)
+        try:
+            Thread(target=work, name=f"autosbc-{job_id[:8]}", daemon=True).start()
+        except Exception:
+            solve_lock.release()
+            with jobs_lock:
+                del jobs[job_id]
+            raise HTTPException(503, "Could not start the solver.")
+        return {"jobId": job_id, "status": "running"}
+
+    @app.get("/api/solve/jobs/{job_id}")
+    def get_solve_job(job_id: str):
+        with jobs_lock:
+            prune_jobs()
+            if job_id not in jobs:
+                raise HTTPException(410 if config.hosted else 404, "This solve job is missing or expired, possibly after a service restart. Results stay in memory for ten minutes. Start a fresh review; never replay an account action.")
+            return {key: value for key, value in jobs[job_id].items() if key != "created"}
+
+    @app.get("/solver-logs")
+    def solver_logs():
+        return {"logs": logger.snapshot()}
+
+    @app.post("/clear-logs")
+    def clear_logs():
+        if solve_lock.locked():
+            raise HTTPException(409, "Cannot clear diagnostics while solving.")
+        logger.clear_logs()
+        return {"status": "success"}
+
+    @app.get("/conceptPlayers.csv")
+    def concept_csv(gameYear: int | None = Query(default=None, ge=26, le=27), platform: Literal["ps5", "pc"] | None = None):
+        return Response(get_catalog(gameYear, platform).csv_text(), media_type="text/csv",
+                        headers={"Content-Disposition": "inline; filename=conceptPlayers.csv"})
+
+    @app.get("/allPlayers.csv")
+    def club_csv():
+        # Never disguise a public player catalog as the user's owned inventory.
+        raise HTTPException(404, "Club inventory is kept in memory. Export it explicitly from the Web App panel.")
+
+    @app.get("/download/userscript")
+    def userscript():
+        return FileResponse(ROOT / "tampermonkey-ai-sbc.user.js", media_type="application/javascript",
+                            filename="autosbc-studio.user.js")
+
+    return app
+
+
+app = create_app()
 
 if __name__ == "__main__":
-    try:
-        start()
-    except KeyboardInterrupt:
-        logging.info("Keyboard interrupt received")
-    except Exception as e:
-        logging.error(f"Error starting server: {str(e)}")
-    finally:
-        # Ensure thread pool is always shut down
-        if thread_pool:
-            thread_pool.shutdown(wait=False)
-        logging.info("Application terminated")
-    sys.exit(0)
+    import uvicorn
+    uvicorn.run("backend.main:app", host="127.0.0.1", port=int(os.environ.get("AUTOSBC_PORT", 8000)))

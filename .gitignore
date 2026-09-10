@@ -16,3 +16,9 @@ logs/**
 *.bak
 ~$*
 *.swp
+.venv/
+data/
+.env
+coverage.xml
+htmlcov/
+work/

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy · Auto-SBC Studio</title><link rel="stylesheet" href="/static/style.css"></head>
+<body class="privacy-page"><main>
+<header><a href="/">← Back to Studio</a><span>Auto-SBC Studio</span></header>
+<article>
+<h1>Privacy</h1><p>Auto-SBC Studio · Private beta</p>
+<p>The Chrome extension reads the signed-in EA Web App’s SBC requirements, owned player cards, saved-squad references and protection settings to build squads and carry out the finite queue you start. The local computer is the default solver destination. You can explicitly choose a private HTTPS server in the extension’s settings.</p>
+<h2>Where data goes</h2>
+<ul>
+<li>In local mode, club-card data and SBC requirements go to <code>http://127.0.0.1:8000</code> and are processed on your computer.</li>
+<li>In hosted mode, that payload goes to the exact HTTPS origin you enter and approve. It can include physical card IDs, public card definitions, ratings, positions, ownership and protection fields, and challenge requirements. The server operator and hosting provider process this data. Use a server you control and review its provider’s privacy terms before opting in.</li>
+<li>EA passwords, cookies and session tokens are not sent to the solver. EA requests and account actions stay in the signed-in Web App. This application has no analytics tracker.</li>
+<li>The solver can fetch public definitions and price snapshots from FUT.GG. Price refreshes send no club payload. Public catalog data is cached in SQLite, separately from owned inventory.</li>
+<li>Local live market mode reads listings through your existing EA session and sends observed prices and public definitions to the local solver. The initial hosted evaluation profile supports owned cards only; concepts and full catalog synchronization are disabled there.</li>
+</ul>
+<h2>Credentials and browser records</h2>
+<p>A hosted server’s owner access token stays in the extension’s local storage, restricted to trusted extension contexts. It is attached only to requests to the configured solver, never sent to the EA page or included in solve exports. It grants access to that single-owner server’s jobs and diagnostics; do not share it. Application access logs are disabled in the hosted entry point. Hosting providers may retain their own operational logs.</p>
+<p>Run journals and card preferences remain in the EA page’s browser storage. Journals can contain physical card IDs, challenge IDs, timestamps and reward evidence. They help prevent an uncertain submission from being replayed. Downloaded requests, solutions and reports can also contain club data; review them before sharing. Uninstalling the extension does not automatically erase EA-origin browser storage or downloaded files.</p>
+<h2>Server storage and retention</h2>
+<p>Club inputs, results and bounded solver diagnostics are held in process memory. Completed jobs are available for up to ten minutes, with older results pruned on subsequent job requests; restarting the process clears them. A free host may sleep or restart and lose a job. A missing job stops the client and requires a fresh review, without replaying an EA action.</p>
+<p>Local public catalogs remain in the package’s <code>data</code> directory. The hosted evaluation image contains only public definition/rating seeds and uses ephemeral storage for public prices. Its build excludes local databases, club exports, journals and secrets. There is no shared multi-user account system.</p>
+<h2>Your actions</h2>
+<p>Individual Apply saves the reviewed squad. An explicitly started finite queue or daily plan submits eligible owned cards to EA, which removes those cards from the club. Stop prevents subsequent requests; it cannot withdraw a request already sent. The current product does not purchase cards, open packs or choose rewards.</p>
+<p>Stop any run before changing solver settings. Saving a different destination requires reloading the EA tab and checking the displayed server before continuing. Resolve uncertain runs before deleting their journals; other EA extensions may use the same site’s storage.</p>
+</article><footer>Independent community software · MIT</footer>
+</main></body></html>

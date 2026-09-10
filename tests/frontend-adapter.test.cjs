@@ -1,0 +1,1551 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const fs = require('node:fs');
+const path = require('node:path');
+
+class Element {
+  constructor(tag, text = '') { this.tag = tag; this.children = []; this._text = text; this.listeners = {}; this.style = {}; this._value = ''; this.disabled = false;
+    const classes = new Set(); this.classList = { toggle: value => classes.has(value) ? classes.delete(value) : classes.add(value), contains: value => classes.has(value), remove: value => classes.delete(value) }; }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+  set value(value) { this._value = String(value); }
+  get value() { return this._value; }
+  set className(value) { this._class = value; }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; this._text = ''; }
+  attachShadow() { this.shadowRoot = new Element('shadow'); return this.shadowRoot; }
+  addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
+  async click() { if (!this.disabled) await Promise.all((this.listeners.click || []).map(callback => callback({}))); }
+}
+class Storage {
+  constructor() { this.data = new Map(); }
+  get length() { return this.data.size; }
+  key(index) { return [...this.data.keys()][index]; }
+  getItem(name) { return this.data.get(name) ?? null; }
+  setItem(name,value) { this.data.set(name,String(value)); }
+  removeItem(name) { this.data.delete(name); }
+}
+const observable = data => ({ observe(owner,callback) { queueMicrotask(() => callback(this,{success:true,status:200,data})); }, unobserve() {} });
+function marketCard(id=9999, gameYear=26, platform='ps5') {
+  const timestamp=new Date(Date.now()-60000).toISOString();
+  return {id:`concept:${id}`,definitionId:id,assetId:id+10000,name:'Market base card',rating:82,teamId:18,leagueId:13,nationId:18,rarityId:0,
+    possiblePositions:[14],preferredPosition:14,marketPrice:1500,concept:true,priceStale:false,
+    gameYear,platform,priceGameYear:gameYear,pricePlatform:platform,priceSource:'FUT.GG',catalogSource:'https://www.fut.gg/players/',
+    priceSnapshotAt:timestamp,priceFetchedAt:timestamp,url:`https://www.fut.gg/players/${id}/`};
+}
+function marketResult(input, concepts=[marketCard()], ownedCount=10) {
+  const solution=[...input.clubPlayers.slice(0,ownedCount),...concepts].map((player,i)=>({...player,squadPosition:i,marketPriceSource:player.priceSource}));
+  return {status_code:4,solution,conceptCandidates:concepts,conceptCoverage:{returned:1500,totalEligible:19000,complete:false},
+    database:{priceMaxAgeHours:6},summary:{purchaseCost:concepts.reduce((sum,p)=>sum+p.marketPrice,0)},
+    shoppingList:solution.filter(p=>p.concept).map(p=>({definitionId:p.definitionId,assetId:p.assetId,name:p.name,rating:p.rating,quantity:1,
+      squadPosition:p.squadPosition,marketPrice:p.marketPrice,source:p.priceSource,priceSnapshotAt:p.priceSnapshotAt,priceFetchedAt:p.priceFetchedAt,
+      gameYear:p.gameYear,platform:p.platform,url:p.url}))};
+}
+function filterClub(players,criteria) {
+  return criteria.defId?.length ? players.filter(player=>criteria.defId.includes(Number(player.definitionId))) : players;
+}
+function harness(overrides = {}) {
+  const body = new Element('html');
+  const localStorage = new Storage(), sessionStorage = new Storage();
+  for (const [key,value] of Object.entries(overrides.storage || {})) localStorage.setItem(key,value);
+  const writes = [], requests = [], conceptRequests = [];
+  const timerDelays=[], pageMessages=[], workerMessages=[];
+  const extension = overrides.extension ? {config:overrides.extension.config || {mode:'hosted',origin:'https://solver.example',token:'x'.repeat(48),consent:true,revision:'configured-v1'},
+    infoError:overrides.extension.infoError, noInfoResponse:overrides.extension.noInfoResponse, responseOrigin:overrides.extension.responseOrigin,
+    openedOptions:0, infoRequests:0, beforeInfo:null, beforeNetwork:null} : null;
+  const activeSquadPlayers=[], cacheReads=[];
+  const savedSquads=new Map([[7,activeSquadPlayers]]);
+  const nativeSquad=(id,slots)=>({getId:()=>id,getPlayers:()=>Array.from({length:23},(_,index)=>({
+    getItem:()=>slots[index]?._item ?? {id:0,isPlayer:()=>false}}))});
+  let jobResult;
+  const players = Array.from({length:12},(_,i) => ({id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`},
+    rating:80,teamId:18,leagueId:13,nationId:18,rareflag:0,untradeable:true,loans:-1,preferredPosition:14,possiblePositions:[14],groups:[0],concept:false,
+    isPlayer:()=>true,isSpecial:()=>false,isTimeLimited:()=>false,getTier:()=>3,
+    getTotalGamesPlayed:()=>0,getLifetimeStats:()=>[0,0,0,0,0],getStats:()=>[0,0,0,0,0],
+    compareResourceTo(other){return this.assetId===other.assetId;}}));
+  const squad = {_formation:{generalPositions:Array(11).fill(14)},simpleBrickIndices:[],_players:Array.from({length:11},()=>({_item:{}})),
+    removeAllItems(keepManager){assert.equal(keepManager,true);writes.push('removeAllItems');this._players=this._players.map(()=>({_item:{id:0,isPlayer:()=>false}}));},
+    setPlayers(items) { writes.push('setPlayers'); this._players=items.map(item=>({_item:item})); }};
+  const challenge = {id:10,setId:20,name:'Test challenge',status:'IN_PROGRESS',squad,eligibilityOperation:'AND',
+    eligibilityRequirements:[{scope:0,count:11,kvPairs:{_collection:{1:[11]}}}]};
+  const set = {id:20,name:'Test SBC',isComplete:()=>false};
+  let activeChallenge=challenge,nativeOptions;
+  const ctx = {console,setTimeout:(callback,delay,...args)=>{timerDelays.push(delay);return setTimeout(callback,delay===500||extension?.noInfoResponse&&delay===10000?0:delay,...args);},clearTimeout,setInterval,clearInterval,queueMicrotask,URL,Blob,AbortController,crypto:require('node:crypto').webcrypto,
+    localStorage,sessionStorage,location:{origin:'https://www.ea.com'},atob:value=>Buffer.from(value,'base64').toString(),
+    document:{documentElement:body,createElement:tag=>new Element(tag),createTextNode:text=>new Element('#text',text)},
+    repositories:{TeamConfig:{},Item:{getClub:()=>({reset:()=>cacheReads.push('club-reset')}),setDirty:pile=>cacheReads.push(`dirty-${pile}`)}},
+    ItemPile:{STORAGE:'storage',PURCHASED:'purchased'},
+    services:{SBC:{requestSets:()=>observable({sets:[set]}),requestChallengesForSet:()=>observable({challenges:[challenge]}),loadChallenge:()=>observable(challenge),saveChallenge:()=>{writes.push('saveChallenge');return observable({});}},
+      Club:{clubDao:{resetStatsCache(){}},getStats:()=>observable({}),search:criteria=>observable({items:filterClub(players,criteria),retrievedAll:true})},Item:{searchStorageItems:()=>observable({items:[],endOfList:true}),requestUnassignedItems:()=>observable({items:[]})},
+      Squad:{resetSquadsCache:()=>cacheReads.push('squads-reset'),
+        requestSquadList:()=>observable({activeSquadId:7,listFull:false,squads:[...savedSquads].map(([id,slots])=>nativeSquad(id,slots))}),
+        getActiveSquadId:()=>7,requestSquadById:id=>observable({squad:nativeSquad(id,savedSquads.get(id))})},
+      Localization:{localize:()=> 'Gold Common'},Chemistry:{}},
+    UTBucketedItemSearchViewModel:class {constructor(){this.searchCriteria={};}},
+    UTSBCSquadOverviewViewController:class {initWithSBCSet(){this._squad=squad;this._challenge=challenge;}},
+    UTSBCSquadSplitViewController:class {initWithSBCSet(){}},UTItemEntity:class {},
+    UTSquadChemCalculatorUtils:class {getChemProfileForPlayer(){return {maxChem:false,rules:[{calculationType:1,contribution:1,parameterId:1},{calculationType:1,contribution:1,parameterId:2},{calculationType:1,contribution:1,parameterId:3}]};}normalizeClubId(id){return id;}},
+    SBCEligibilityKey:{1:'NUMBER_OF_PLAYERS'},SBCEligibilityScope:{0:'EXACT'},
+    fetch: async (url, options) => {
+      let result={status:'ok',database:{count:20000,pricedCount:overrides.noPrices?0:10000,readyForConcepts:!overrides.noPrices,readiness:overrides.noPrices?'awaiting_market_prices':'ready'}};
+      if (url.endsWith('/api/concepts')) {
+        conceptRequests.push(JSON.parse(options.body));
+        result = overrides.concepts || {players:[],coverage:{returned:0,totalEligible:0,complete:true}};
+      }
+      if (url.endsWith('/api/solve/jobs')) {
+        const input=JSON.parse(options.body); requests.push(input);
+        jobResult = overrides.solve ? await overrides.solve(input) : {status_code:4,status:'Optimal',solution:input.clubPlayers.slice(0,11).map((player,i)=>({...player,squadPosition:i})),summary:{estimatedRating:80,chemistry:33,duplicatesUsed:0,weightedCost:7700,marketCost:11000}};
+        result = {jobId:'test-job',status:'running'};
+      }
+      if (url.endsWith('/api/solve/jobs/test-job')) result = {status:'done',result:jobResult};
+      return {ok:true,status:200,text:async()=>JSON.stringify(result)};
+    }};
+  if(overrides.native){
+    ctx.AutoSBCNative={install:options=>{nativeOptions=options;}};
+    ctx.getAppMain=()=>({getRootViewController:()=>({getPresentedViewController:()=>({getCurrentViewController:()=>({getCurrentController:()=>({childViewControllers:[{_challenge:activeChallenge}]})})})})});
+  }
+  ctx.window = ctx;
+  const context = vm.createContext(ctx), pageWindow = vm.runInContext('window',context);
+  if(extension) {
+    const T=require('../frontend/extension-transport.js'),listeners=new Set();
+    ctx.__autoSBCExtension=true;
+    ctx.addEventListener=(name,callback)=>{if(name==='message')listeners.add(callback);};
+    ctx.removeEventListener=(name,callback)=>{if(name==='message')listeners.delete(callback);};
+    ctx.postMessage=(data,origin)=>{
+      pageMessages.push(data);
+      queueMicrotask(()=>{for(const listener of [...listeners])listener({source:pageWindow,origin,data});});
+    };
+    const bridgeContext=vm.createContext({window:pageWindow,location:ctx.location,chrome:{runtime:{sendMessage:async message=>{
+      workerMessages.push(message);
+      if(message.type==='autosbc-server-info') {
+        extension.infoRequests++;
+        if(extension.noInfoResponse)return new Promise(()=>{});
+        if(extension.beforeInfo)await extension.beforeInfo(message);
+        if(extension.infoError)return {error:extension.infoError};
+        try{return T.info(extension.config);}catch(error){return {error:error.message};}
+      }
+      if(message.type==='autosbc-server-options'){extension.openedOptions++;return {ok:true};}
+      if(message.type!=='autosbc-local-http')throw new Error('Unexpected extension message.');
+      if(extension.beforeNetwork)await extension.beforeNetwork(message);
+      let request;
+      try{request=T.request(extension.config,message);}catch(error){return {error:error.message};}
+      const response=await ctx.fetch(request.url,request.options);
+      return {ok:response.ok,status:response.status,body:JSON.parse(await response.text()),serverOrigin:extension.responseOrigin||request.origin};
+    }}}});
+    vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/extension-bridge.js'),'utf8'),bridgeContext);
+  }
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/policy.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-policy.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-runner.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-reconcile.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/batch-replan.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/daily-plan.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/read-retry.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../frontend/companion.js'),'utf8'),context);
+  const elements = [];
+  const visit = element => { elements.push(element);element.children.forEach(visit);if(element.shadowRoot)visit(element.shadowRoot);}; visit(body);
+  const button = text => elements.find(element=>element.tag==='button'&&element.textContent===text);
+  const selects = elements.filter(element=>element.tag==='select');
+  const refresh = async () => { selects[0].value=overrides.gameYear||26;selects[1].value=overrides.platform||'ps5';await button('Load SBCs').click(); selects[2].value='20'; await Promise.all(selects[2].listeners.change.map(callback=>callback())); selects[3].value='10'; };
+  return {ctx,elements,button,refresh,writes,requests,conceptRequests,players,squad,challenge,set,activeSquadPlayers,savedSquads,nativeSquad,cacheReads,localStorage,selects,nativeOptions,timerDelays,extension,pageMessages,workerMessages,
+    navigate:id=>{activeChallenge=id===null?null:{...challenge,id};}};
+}
+test('EA integration: solve only reads; reviewed Apply is the only save', async () => {
+  const h=harness(); await h.refresh();
+  h.localStorage.setItem('paletools:2026:account:lockedItems','[1011]');
+  await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);
+  assert.equal(h.requests[0].clubPlayers.length,11);
+  assert.deepEqual(h.writes,[]);
+  await h.button('Apply squad').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.equal(h.button('Apply squad').disabled,true);
+});
+function nativeRequirementHarness(h=harness()) {
+  // Verified public EA enums: AND/OR are strings; scope 0/1/2 means min/max/exact.
+  Object.assign(h.ctx.SBCEligibilityKey,{10:'NATION_ID',11:'LEAGUE_ID',19:'TEAM_RATING',25:'PLAYER_RARITY_GROUP'});
+  h.ctx.SBCEligibilityScope={0:'GREATER',1:'LOWER',2:'EXACT'};
+  // Two French LaLiga cards and two English Premier League cards satisfy
+  // separate minimum counts, but none satisfy their same-player intersection.
+  h.players.forEach((player,index)=>{player.nationId=index<2?18:index<4?14:99;player.leagueId=index<2?53:index<4?13:99;});
+  return h;
+}
+function nativeRequirement(pairs,scope=0,count=2) {
+  return {scope,count,kvPairs:{_collection:pairs},get isCombinedRequirement(){return Object.keys(this.kvPairs._collection).length>1;}};
+}
+test('separate native AND requirements preserve their scopes and player counts',async t=>{
+  for(const [scope,name] of [[0,'GREATER'],[1,'LOWER'],[2,'EXACT']])await t.test(name,async()=>{
+    const h=nativeRequirementHarness();
+    h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]},scope),nativeRequirement({11:[13]},scope)];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,1);assert.deepEqual(h.requests[0].sbcData.constraints,[
+      {scope:name,count:2,requirementKey:'NATION_ID',eligibilityValues:[18]},
+      {scope:name,count:2,requirementKey:'LEAGUE_ID',eligibilityValues:[13]}
+    ]);
+    assert.equal(h.button('Apply squad').disabled,false);assert.deepEqual(h.writes,[]);
+  });
+});
+test('combined same-player predicates stop before solving for minimum, maximum and exact counts',async t=>{
+  for(const scope of [0,1,2])await t.test(String(scope),async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[nativeRequirement({10:[18],11:[13]},scope)];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.deepEqual(h.cacheReads,[]);
+    assert.equal(h.button('Apply squad').disabled,true);assert.equal(h.button('Export solve request').disabled,true);
+    assert.ok(h.elements.some(e=>e.textContent.includes('combines multiple conditions on the same players')));
+  });
+});
+test('native OR and every missing or unknown operation stop without assuming AND',async t=>{
+  for(const operation of ['OR',undefined,null,0,1,true,'XOR','and','AND ','OR ',{},[]])await t.test(String(operation),async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityOperation=operation;
+    h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]}),nativeRequirement({11:[13]})];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+    const message=operation==='OR'?'alternative (OR) requirements':'requirement operation is missing or unsupported';
+    assert.ok(h.elements.some(e=>e.textContent.includes(message)));
+  });
+});
+test('single-key native alternative values and unset squad-level counts remain intact',async()=>{
+  const h=nativeRequirementHarness();
+  h.challenge.eligibilityRequirements=[nativeRequirement({19:[84]},0,-1),nativeRequirement({25:[83,84]},0,1),nativeRequirement({11:[13,53]},2,4)];
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.deepEqual(h.requests[0].sbcData.constraints,[
+    {scope:'GREATER',count:-1,requirementKey:'TEAM_RATING',eligibilityValues:[84]},
+    {scope:'GREATER',count:1,requirementKey:'PLAYER_RARITY_GROUP',eligibilityValues:[83,84]},
+    {scope:'EXACT',count:4,requirementKey:'LEAGUE_ID',eligibilityValues:[13,53]}
+  ]);assert.deepEqual(h.writes,[]);
+});
+test('malformed grouping metadata cannot bypass the same-player requirement gate',async t=>{
+  const cases=[
+    ['false combined flag on multiple predicates',{scope:0,count:2,isCombinedRequirement:false,kvPairs:{_collection:{10:[18],11:[13]}}}],
+    ['true combined flag on one predicate',{scope:0,count:2,isCombinedRequirement:true,kvPairs:{_collection:{10:[18]}}}],
+    ['unknown combined flag',{scope:0,count:2,isCombinedRequirement:'false',kvPairs:{_collection:{10:[18]}}}],
+    ['empty predicate map',{scope:0,count:2,kvPairs:{_collection:{}}}],
+    ['array predicate map',{scope:0,count:2,kvPairs:{_collection:[[18]]}}],
+    ['string predicate map',{scope:0,count:2,kvPairs:{_collection:'10'}}],
+    ['missing predicate map',{scope:0,count:2}],['null requirement',null],['array requirement',[]]
+  ];
+  for(const [name,requirement] of cases)await t.test(name,async()=>{
+    const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[requirement];
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('an unsupported operation returned by Load SBC invalidates an earlier actionable preview',async()=>{
+  const h=nativeRequirementHarness();h.challenge.eligibilityRequirements=[nativeRequirement({10:[18]})];
+  await h.refresh();await h.button('Solve and preview').click();assert.equal(h.button('Apply squad').disabled,false);
+  h.ctx.services.SBC.loadChallenge=()=>{h.challenge.eligibilityOperation='OR';return observable(h.challenge);};
+  await h.button('Solve and preview').click();await h.button('Apply squad').click();
+  assert.equal(h.requests.length,1);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  assert.equal(h.button('Export solve request').disabled,true);
+});
+test('automatic queues also reject grouped and OR challenges before save or submit',async t=>{
+  for(const kind of ['combined','OR'])await t.test(kind,async()=>{
+    const h=nativeRequirementHarness(batchHarness());
+    h.challenge.eligibilityRequirements=kind==='combined'?[nativeRequirement({10:[18],11:[13]})]:[nativeRequirement({10:[18]}),nativeRequirement({11:[13]})];
+    if(kind==='OR')h.challenge.eligibilityOperation='OR';
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.deepEqual(h.report().receipts,[]);
+    assert.equal(h.report().snapshot.status,'blocked');assert.equal(h.report().snapshot.progress.confirmedChallenges,0);
+  });
+});
+test('Paletools lock added after review stops Apply before any mutation', async () => {
+  const h=harness(); await h.refresh();await h.button('Solve and preview').click();
+  h.localStorage.setItem('paletools:2026:account:lockedItems','[1000]');
+  await h.button('Apply squad').click();
+  assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Paletools lock')));
+});
+test('unowned solver result cannot be applied', async () => {
+  const h=harness({solve:input=>({status_code:4,solution:input.clubPlayers.slice(0,11).map((player,i)=>({...player,id:i?player.id:999,squadPosition:i}))})});
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.button('Apply squad').disabled,true);
+  assert.deepEqual(h.writes,[]);
+});
+test('cancelled solve cannot restore an actionable preview', async () => {
+  let release,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  const h=harness({solve:input=>{entered();return new Promise(resolve=>{release=()=>resolve({status_code:4,solution:input.clubPlayers.slice(0,11).map((player,i)=>({...player,squadPosition:i}))});});}});
+  await h.refresh();const pending=h.button('Solve and preview').click();await started;
+  await h.button('Cancel').click();release();await pending;
+  assert.equal(h.button('Apply squad').disabled,true);
+  assert.deepEqual(h.writes,[]);
+});
+test('mixed solve validates server-selected concepts and shows a scoped shopping list', async () => {
+  const h=harness({solve:input=>marketResult(input)});
+  await h.refresh();
+  await h.button('Solve and preview').click();
+  assert.equal(h.conceptRequests.length,0);
+  assert.equal(h.requests[0].gameYear,26);
+  assert.equal(h.requests[0].platform,'ps5');
+  assert.equal(h.requests[0].solverPolicy.allowConcept,true);
+  assert.equal(h.requests[0].clubPlayers.filter(p=>p.concept).length,0);
+  assert.equal(h.button('Place concept players').disabled,false);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Shopping list')));
+  assert.ok(h.elements.some(element=>element.textContent.includes('Purchase total: 1,500 coin')));
+  assert.deepEqual(h.writes,[]);
+});
+test('missing owned rarity groups remain unknown in exported solve input', async () => {
+  const h=harness();delete h.players[0].groups;h.players[1].groups=[];
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers[0].rarityGroupsKnown,false);
+  assert.equal(Object.hasOwn(h.requests[0].clubPlayers[0],'groups'),false);
+  assert.equal(h.requests[0].clubPlayers[1].rarityGroupsKnown,false);
+  assert.equal(h.requests[0].clubPlayers[2].rarityGroupsKnown,true);
+});
+test('empty club can request a fully priced market squad without inventing ownership', async () => {
+  const concepts=Array.from({length:11},(_,i)=>marketCard(9999+i));
+  const h=harness({solve:input=>marketResult(input,concepts,0)});h.players.length=0;
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers.length,0);
+  assert.equal(h.button('Place concept players').disabled,false);
+  assert.ok(h.elements.some(element=>element.textContent.includes('0 club cards + 11 cards to buy')));
+  assert.deepEqual(h.writes,[]);
+});
+test('FC27 without market prices keeps owned-only solves and reports missing quotes', async () => {
+  const h=harness({gameYear:27,noPrices:true});await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].gameYear,27);
+  assert.ok(h.elements.some(element=>element.textContent.includes('FC 27 / PS5 FUT.GG prices are not available yet')));
+  assert.equal(h.button('Apply squad').disabled,false);
+});
+test('season choice is required before sending club data', async () => {
+  const h=harness();await h.refresh();h.selects[0].value='';await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+});
+test('market purchase limit is separate from owned opportunity cost', async () => {
+  const h=harness({solve:input=>marketResult(input)});await h.refresh();
+  const budget=h.elements.find(element=>element.tag==='label'&&element.textContent.startsWith('Purchase budget')).children.find(element=>element.tag==='input');
+  budget.value=1000;await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].solverPolicy.maxPurchasePrice,1000);
+  assert.equal(h.button('Apply squad').disabled,true);
+  assert.ok(h.elements.some(element=>element.textContent.includes('purchase budget')));
+});
+test('native entry resolves actual upstream controller challenge into shared solver pipeline',async()=>{
+  const h=harness({native:true});await h.refresh();
+  const context=h.nativeOptions.resolveContext();assert.deepEqual({...context},{setId:20,challengeId:10});
+  await h.nativeOptions.onSolveCurrent(context);
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].sbcData.challengeId,10);
+  assert.equal(h.requests[0].solverPolicy.protectSpecial,true);assert.deepEqual(h.writes,[]);
+  assert.equal(h.button('Apply squad').disabled,false);
+});
+test('native entry with missing challenge never starts a solve job',async()=>{
+  const h=harness({native:true});await h.refresh();h.navigate(null);
+  assert.equal(h.nativeOptions.resolveContext(),null);
+  await h.nativeOptions.onSolveCurrent({setId:20,challengeId:10});assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+});
+test('navigation discards a native solve response before review or Apply',async()=>{
+  let release,entered;const started=new Promise(resolve=>{entered=resolve;});
+  const h=harness({native:true,solve:input=>{entered();return new Promise(resolve=>{release=()=>resolve({status_code:4,solution:input.clubPlayers.slice(0,11).map((p,i)=>({...p,squadPosition:i}))});});}});
+  await h.refresh();const pending=h.nativeOptions.onSolveCurrent(h.nativeOptions.resolveContext());await started;
+  h.navigate(11);h.nativeOptions.onContextChanged('20:10','20:11');release();await pending;
+  assert.equal(h.button('Apply squad').disabled,true);assert.deepEqual(h.writes,[]);
+});
+test('native Apply rechecks navigation even before the next readiness tick',async()=>{
+  const h=harness({native:true});await h.refresh();
+  await h.nativeOptions.onSolveCurrent(h.nativeOptions.resolveContext());
+  h.navigate(11);
+  await h.button('Apply squad').click();
+  assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(element=>element.textContent.includes('The SBC screen changed')));
+});
+test('navigation during native Apply inventory refresh prevents squad mutation',async()=>{
+  const h=harness({native:true});await h.refresh();
+  await h.nativeOptions.onSolveCurrent(h.nativeOptions.resolveContext());
+  let release,entered;const started=new Promise(resolve=>{entered=resolve;});
+  h.ctx.services.Club.search=()=>({observe(owner,callback){entered();release=()=>callback(this,{success:true,status:200,data:{items:h.players,retrievedAll:true}});},unobserve(){}});
+  const pending=h.button('Apply squad').click();await started;
+  h.navigate(11);release();await pending;
+  assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(element=>element.textContent.includes('The SBC screen changed')));
+});
+test('EA boolean tradable and legacy untradeable map conservatively, including unknown and conflicts',async()=>{
+  const h=harness();
+  for(const item of h.players) delete item.untradeable;
+  h.players[0].tradable=false;h.players[1].tradable=true;
+  h.players[2].untradeable=true;h.players[3].untradeable=false;
+  h.players[5].tradable='false';h.players[6].untradeable='true';
+  h.players[7].tradable=true;h.players[7].untradeable=true;
+  h.players[8].tradable=false;h.players[8].untradeable=false;
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.deepEqual(h.requests[0].clubPlayers.slice(0,9).map(p=>p.isUntradeable),[true,false,true,false,false,false,false,false,false]);
+  assert.deepEqual(h.requests[0].clubPlayers.slice(0,9).map(p=>p.tradeabilityKnown),[true,true,true,true,false,false,false,false,false]);
+  assert.ok(h.elements.some(element=>element.textContent.includes('tradeability unknown')));
+});
+test('untradeable-only policy excludes current tradeable and unknown metadata',async()=>{
+  const h=harness();h.players[0].tradable=true;delete h.players[0].untradeable;
+  delete h.players[1].untradeable;
+  const input=h.elements.find(e=>e.tag==='label'&&e.textContent.includes('Allow tradeable cards')).children.find(e=>e.tag==='input');
+  input.checked=false;await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers.some(p=>p.id===1||p.id===2),false);
+});
+test('active squad players are excluded from solve and sent as hard inventory locks',async()=>{
+  const h=harness();h.activeSquadPlayers.push({_item:h.players[0]},{_item:{id:0}});
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers.some(p=>p.id===1),false);
+  assert.ok(h.requests[0].solverPolicy.lockedItemIds.includes('1'));
+  assert.deepEqual(h.writes,[]);
+});
+test('active squad membership is read again before reviewed Apply',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();
+  h.activeSquadPlayers.push({_item:h.players[0]});
+  await h.button('Apply squad').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('Locked player')));
+});
+test('all saved squads protect inactive bench and reserve cards without treating squad references as owned',async()=>{
+  const h=harness(), reserve=[];
+  reserve[11]={_item:h.players[0]};reserve[22]={_item:{id:9001,concept:false}};
+  h.savedSquads.set(8,reserve);
+  const read=h.ctx.services.Squad.requestSquadById;
+  h.ctx.services.Squad.requestSquadById=id=>{
+    if(id===8)h.players.push({...h.players[1],id:9001}); // Native hydration can repopulate the repository.
+    return read(id);
+  };
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers.some(player=>[1,9001].includes(player.id)),false);
+  assert.ok(h.requests[0].solverPolicy.lockedItemIds.includes('1'));
+  assert.ok(h.requests[0].solverPolicy.lockedItemIds.includes('9001'));
+  assert.deepEqual(h.cacheReads,['club-reset','dirty-storage','squads-reset']);assert.deepEqual(h.writes,[]);
+});
+test('an inactive saved squad lock added after preview blocks Apply before saving',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();
+  const bench=[];bench[15]={_item:h.players[0]};h.savedSquads.set(8,bench);
+  await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Locked player')));
+});
+test('saved squad ID zero is accepted for active and inactive squads while physical item IDs stay positive',async t=>{
+  for(const activeId of [0,7])await t.test(`active squad ${activeId}`,async()=>{
+    const h=harness(),slots=[];slots[22]={_item:h.players[0]};h.savedSquads.set(0,slots);
+    h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:activeId,listFull:false,squads:[...h.savedSquads].map(([id,players])=>h.nativeSquad(id,players))});
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests[0].clubPlayers.some(player=>player.id===1),false);
+    assert.ok(h.requests[0].solverPolicy.lockedItemIds.includes('1'));assert.deepEqual(h.writes,[]);
+  });
+  const h=harness();h.players[0].id=0;await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+});
+test('a zero squad alias returning a different native squad ID is rejected',async()=>{
+  const h=harness();h.savedSquads.set(0,[]);const read=h.ctx.services.Squad.requestSquadById;
+  h.ctx.services.Squad.requestSquadById=id=>id===0?observable({squad:h.nativeSquad(7,[])}):read(id);
+  await h.refresh();await h.button('Solve and preview').click();assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Cannot read saved squad players or match the squad identity')));
+});
+test('saved squad identity diagnostics are bounded and do not serialize unknown objects or strings',async()=>{
+  const h=harness();const squads=[{getId:()=>0},{},{getId:()=>{throw new Error('do-not-record');}},
+    {getId:()=>({token:'do-not-record'})},{getId:()=> 'do-not-record'},...Array.from({length:40},(_,i)=>({getId:()=>i+10}))];
+  h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:'7',squads,token:'do-not-record'});
+  await h.refresh();await h.button('Solve and preview').click();
+  const message=h.elements.find(e=>e.tag==='p'&&e.textContent.includes('Squad identity details:')).textContent;
+  const details=JSON.parse(message.split('Squad identity details: ')[1]);
+  assert.deepEqual(details.activeSquadId,{type:'string',value:'7'});assert.equal(details.count,45);assert.equal(details.squads.length,30);
+  assert.deepEqual(details.squads[0],{getIdPresent:true,type:'number',value:'0'});
+  assert.equal(details.squads[1].getIdPresent,false);assert.equal(details.squads[2].getterFailed,true);
+  assert.equal(details.squads[3].value,'[non-scalar]');assert.equal(details.squads[4].value,'[non-numeric string]');
+  assert.doesNotMatch(message,/do-not-record|token/);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+});
+test('fresh inventory and saved squad adapters fail closed on incomplete identities or roster models',async t=>{
+  const cases=[
+    ['missing club reset',h=>{h.ctx.repositories.Item.getClub=()=>({});}],
+    ['missing storage refresh',h=>{delete h.ctx.repositories.Item.setDirty;}],
+    ['missing squad reset',h=>{delete h.ctx.services.Squad.resetSquadsCache;}],
+    ['missing squad list',h=>{h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:7});}],
+    ['duplicate squad IDs',h=>{h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:7,squads:[h.nativeSquad(7,[]),h.nativeSquad(7,[])]});}],
+    ['missing active squad',h=>{h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:8,squads:[h.nativeSquad(7,[])]});}],
+    ['wrong returned squad',h=>{h.ctx.services.Squad.requestSquadById=()=>observable({squad:h.nativeSquad(8,[])});}],
+    ['partial roster',h=>{h.ctx.services.Squad.requestSquadById=()=>observable({squad:{getId:()=>7,getPlayers:()=>h.nativeSquad(7,[]).getPlayers().slice(0,11)}});}],
+    ['missing slot accessor',h=>{h.ctx.services.Squad.requestSquadById=()=>observable({squad:{getId:()=>7,getPlayers:()=>Array(23).fill({_item:{id:0}})}});}],
+    ['invalid item ID',h=>{h.activeSquadPlayers[22]={_item:{id:-3}};}],
+    ['unknown owned concept flag',h=>{delete h.players[0].concept;}],
+    ['unknown page completion flag',h=>{h.ctx.services.Club.search=()=>observable({items:h.players,retrievedAll:'true'});}]
+  ];
+  for(const [name,change] of cases)await t.test(name,async()=>{
+    const h=harness();change(h);await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+    if(name==='missing storage refresh'||name==='missing squad reset')assert.deepEqual(h.cacheReads,[]);
+  });
+});
+test('cancelling a pending fresh club read prevents storage and saved squad reads',async()=>{
+  const h=harness();let release,signal;const entered=new Promise(resolve=>{signal=resolve;});
+  h.ctx.services.Club.search=()=>({observe(owner,callback){release=()=>callback(this,{success:true,data:{items:h.players,retrievedAll:true}});signal();},unobserve(){}});
+  await h.refresh();const pending=h.button('Solve and preview').click();await entered;
+  await h.button('Cancel').click();release();await pending;
+  assert.deepEqual(h.cacheReads,['club-reset']);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+});
+test('EA Bio zero-game getters allow owned cards and display their match count in review',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].solverPolicy.protectPlayed,true);
+  assert.ok(h.requests[0].clubPlayers.every(p=>p.gamesPlayed===0));
+  const checkbox=h.elements.find(e=>e.tag==='label'&&e.textContent.includes('Protect played cards')).children.find(e=>e.tag==='input');
+  assert.equal(checkbox.checked,true);
+  const all=[];const visit=e=>{all.push(e);e.children.forEach(visit);if(e.shadowRoot)visit(e.shadowRoot);};visit(h.ctx.document.documentElement);
+  const table=all.find(e=>e.tag==='table');
+  assert.equal(table.children[0].children[3].textContent,'Games');
+  assert.equal(table.children[1].children[3].textContent,'0');
+  assert.ok(all.some(e=>e.textContent.includes('EA-reported zero counts are not independently verified')));
+});
+test('played and malformed EA Bio stats are excluded from the solve inventory',async()=>{
+  const changes=[
+    p=>{p.getTotalGamesPlayed=()=>505;p.getLifetimeStats=()=>[505,0,0,0,0];},
+    p=>{p.getStats=()=>[1,0,0,0,0];},
+    p=>{delete p.getTotalGamesPlayed;},p=>{delete p.getLifetimeStats;},p=>{delete p.getStats;},
+    p=>{p.getTotalGamesPlayed=()=>NaN;},p=>{p.getTotalGamesPlayed=()=>Infinity;},
+    p=>{p.getTotalGamesPlayed=()=>0.5;},p=>{p.getTotalGamesPlayed=()=>-1;},
+    p=>{p.getTotalGamesPlayed=()=>'0';},p=>{p.getLifetimeStats=()=>[1,0,0,0,0];},
+    p=>{p.getLifetimeStats=()=>[0];},p=>{p.getStats=()=>null;},p=>{p.getStats=()=>[0,,,,];},
+    p=>{p.getStats=()=>[0,0,0,0,NaN];},p=>{p.getStats=()=>{throw new Error('Unavailable');};}
+  ];
+  for (const change of changes) {
+    const h=harness();change(h.players[0]);await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests[0].clubPlayers.length,11);
+    assert.equal(h.requests[0].clubPlayers.some(p=>p.id===1),false);
+    assert.deepEqual(h.writes,[]);
+  }
+});
+test('played or unknown stats discovered during Apply re-read stop all squad mutation',async()=>{
+  for(const change of [
+    p=>{p.getTotalGamesPlayed=()=>1;p.getLifetimeStats=()=>[1,0,0,0,0];},
+    p=>{p.getStats=()=>[2,0,0,0,0];},
+    p=>{delete p.getTotalGamesPlayed;},
+    p=>{p.getStats=()=>[NaN,0,0,0,0];}
+  ]) {
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();
+    change(h.players[0]);await h.button('Apply squad').click();
+    assert.deepEqual(h.writes,[]);
+    assert.ok(h.elements.some(e=>/Protected played card|Games played unknown/.test(e.textContent)));
+  }
+});
+test('unreadable active squad blocks solving instead of treating the roster as empty',async()=>{
+  const h=harness();h.ctx.services.Squad.requestSquadById=()=>observable({squad:{}});
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Cannot read saved squad players')));
+});
+test('storage rarity fallback is consistent and unknown rarity remains protected without boolean proof',async()=>{
+  const h=harness(), localized=[];
+  const storage=Array.from({length:5},(_,i)=>({...h.players[i],id:100+i,definitionId:5000+i,assetId:6000+i,_metaData:{id:6000+i},isSpecial:undefined}));
+  storage.forEach(p=>{delete p.rareflag;});
+  storage[0]._rareflag=3;storage[1]._rareflag='0';
+  storage[3].isSpecial=()=>false;
+  storage[4].rareflag=1;storage[4]._rareflag=3;
+  h.ctx.services.Item.searchStorageItems=()=>observable({items:storage,endOfList:true});
+  h.ctx.services.Localization.localize=key=>{localized.push(key);return key;};
+  await h.refresh();await h.button('Solve and preview').click();
+  const candidates=h.requests[0].clubPlayers;
+  assert.equal(candidates.some(p=>p.id===100||p.id===102),false);
+  assert.equal(candidates.find(p=>p.id===101).rarityId,0);
+  assert.equal(candidates.find(p=>p.id===101).cardType,'item.raretype0');
+  assert.equal(candidates.find(p=>p.id===103).isSpecial,false);
+  assert.equal(candidates.find(p=>p.id===104).rarityId,1);
+  assert.ok(localized.includes('item.raretype3'));
+  assert.equal(localized.includes('item.raretypeundefined'),false);
+});
+test('each inventory read refreshes club cache before traversing cumulative search results',async()=>{
+  const h=harness();let refreshed=false,resets=0,stats=0;const offsets=[];
+  h.ctx.services.Club.clubDao.resetStatsCache=()=>{refreshed=true;resets++;};
+  h.ctx.services.Club.getStats=()=>{stats++;return observable({});};
+  h.ctx.services.Club.search=criteria=>{
+    offsets.push(criteria.offset);
+    const items=filterClub(h.players,criteria);
+    if(!refreshed)return observable({items,retrievedAll:false});
+    if(criteria.offset===0)return observable({items:items.slice(0,7),retrievedAll:false});
+    refreshed=false;return observable({items,retrievedAll:true});
+  };
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers.length,12);
+  await h.button('Apply squad').click();
+  assert.equal(resets,2);assert.equal(stats,2);assert.deepEqual(offsets,[0,91,0,91]);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+});
+test('repeated pages after cache refresh still block with source and count diagnostics',async()=>{
+  const h=harness();h.ctx.services.Club.search=()=>observable({items:h.players,retrievedAll:false});
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Club players: offset=91, rows=12, unique=12, retrievedAll=false, endOfList=missing')));
+});
+test('owned Apply reads exact reviewed definitions and refreshes full storage before all saved squads',async()=>{
+  const h=harness(),reads=[];
+  const search=h.ctx.services.Club.search,storage=h.ctx.services.Item.searchStorageItems;
+  h.ctx.UTBucketedItemSearchViewModel=class {constructor(){this.searchCriteria={};Object.defineProperty(this.searchCriteria,'cacheable',{get:()=>true});}};
+  h.ctx.services.Club.search=criteria=>{reads.push({kind:'club',...JSON.parse(JSON.stringify(criteria))});return search(criteria);};
+  h.ctx.services.Item.searchStorageItems=criteria=>{reads.push({kind:'storage',...JSON.parse(JSON.stringify(criteria))});return storage(criteria);};
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Apply squad').click();
+  assert.equal(reads[0].defId,undefined,'solve still reads the full club');
+  assert.deepEqual(reads[2].defId,Array.from({length:11},(_,i)=>1000+i));assert.equal(reads[2].isExactSearch,true);
+  assert.deepEqual(reads.filter(read=>read.kind==='storage').map(read=>read.defId),[undefined,undefined]);
+  assert.deepEqual(h.cacheReads,['club-reset','dirty-storage','squads-reset','club-reset','dirty-storage','squads-reset']);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+});
+test('targeted ownership rejects missing physical cards, alternate revisions and unrelated native results before Apply',async t=>{
+  const variants=[
+    ['removed card',items=>items.slice(1)],
+    ['another physical copy of the same athlete',items=>[{...items[0],id:90001},...items.slice(1)]],
+    ['same athlete but another full revision',items=>[{...items[0],definitionId:items[0].definitionId+0x1000000},...items.slice(1)]],
+    ['unrelated definition',items=>[...items,{...items[0],id:90002,definitionId:999999}]],
+    ['changed athlete on the same physical item',items=>[{...items[0],assetId:999999},...items.slice(1)]]
+  ];
+  for(const [name,change] of variants)await t.test(name,async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();
+    h.ctx.services.Club.search=criteria=>{assert.equal(criteria.isExactSearch,true);return observable({items:change(filterClub(h.players,criteria)),retrievedAll:true});};
+    await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,1);
+    assert.ok(h.elements.some(e=>/no longer in your club|different card definition|owned card changed/.test(e.textContent)));
+  });
+});
+test('targeted ownership traverses cumulative full pages until the selected physical cards arrive',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();
+  const offsets=[],duplicates=Array.from({length:91},(_,i)=>({...h.players[0],id:90000+i}));
+  h.ctx.services.Club.search=criteria=>{
+    offsets.push(criteria.offset);assert.equal(criteria.isExactSearch,true);assert.equal(criteria.count,91);
+    return observable({items:criteria.offset===0?duplicates:[...duplicates,...h.players.slice(0,11)],retrievedAll:criteria.offset===91});
+  };
+  await h.button('Apply squad').click();assert.deepEqual(offsets,[0,91]);
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.deepEqual(Array.from(h.squad._players.slice(0,11),slot=>slot._item.id),Array.from({length:11},(_,i)=>i+1));
+});
+test('empty or stalled targeted pages with a false native completion flag cannot authorize Apply',async t=>{
+  for(const variant of ['empty','stalled'])await t.test(variant,async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();const offsets=[];
+    h.ctx.services.Club.search=criteria=>{offsets.push(criteria.offset);return observable({items:variant==='empty'?[]:filterClub(h.players,criteria),retrievedAll:false,endOfList:false});};
+    await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
+    assert.deepEqual(offsets,variant==='empty'?[0]:[0,91]);
+    assert.ok(h.elements.some(e=>e.textContent.includes('EA pagination stopped advancing.')));
+  });
+});
+test('saved-squad hydration cannot restore a removed card to a targeted ownership snapshot',async()=>{
+  const h=harness();await h.refresh();await h.button('Solve and preview').click();const removed=h.players.shift();
+  const list=h.ctx.services.Squad.requestSquadList;
+  h.ctx.services.Squad.requestSquadList=()=>{h.players.unshift(removed);return list();};
+  await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('is no longer in your club')));
+});
+test('targeted ownership retains fresh storage cards and detects an inactive reserve lock added after preview',async t=>{
+  for(const locked of [false,true])await t.test(String(locked),async()=>{
+    const h=harness();await h.refresh();await h.button('Solve and preview').click();const moved=h.players.shift();
+    h.ctx.services.Item.searchStorageItems=criteria=>{assert.equal(criteria.defId,undefined);return observable({items:[moved],endOfList:true});};
+    if(locked){const slots=[];slots[22]={_item:moved};h.savedSquads.set(9,slots);}
+    await h.button('Apply squad').click();
+    assert.equal(h.writes.includes('saveChallenge'),!locked);
+    if(locked)assert.deepEqual(h.writes,[]);
+  });
+});
+const eaConcept=player=>({id:0,concept:true,definitionId:player.definitionId,assetId:player.assetId,rating:player.rating,rareflag:player.rarityId,isPlayer:()=>true,compareResourceTo(other){return this.assetId===other.assetId;}});
+test('reviewed mixed Apply uses exact EA concept entities and retains the shopping list without spending',async()=>{
+  const concept=marketCard(), raw=eaConcept(concept), searches=[];
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  const clubScopes=[],search=h.ctx.services.Club.search;
+  h.ctx.services.Club.search=criteria=>{clubScopes.push(criteria.defId);return search(criteria);};
+  h.ctx.services.Item.searchConceptItems=criteria=>{searches.push([...criteria.defId]);return observable({items:[raw]});};
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.deepEqual(h.writes,[]);await h.button('Place concept players').click();
+  assert.deepEqual(searches,[[concept.definitionId]]);
+  assert.deepEqual(clubScopes,[undefined,undefined],'mixed concept placement retains full owned inventory checks');
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.equal(h.squad._players[10]._item,raw);assert.equal(h.squad._players[0]._item,h.players[0]);
+  assert.equal(h.squad._players[10]._item.concept,true);
+  assert.equal(h.button('Place concept players').disabled,true);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Shopping list')));
+  assert.ok(h.elements.some(e=>e.textContent.includes('No coins were spent')));
+});
+test('EA revision metadata uses native databaseId for athlete identity in owned and concept cards',async()=>{
+  const concept={...marketCard(50599553),assetId:267905,rating:69,name:'Bertuğ Yıldırım'};
+  const raw={...eaConcept(concept),_metaData:{id:50599553},get databaseId(){return this.definitionId & 0xFFFFFF;},getAssetId:()=>0};
+  delete raw.assetId;
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  const owned=h.players[0];
+  owned.definitionId=50599554;owned._metaData.id=50599554;delete owned.assetId;
+  Object.defineProperty(owned,'databaseId',{get(){return this.definitionId & 0xFFFFFF;}});
+  h.squad._players[0]={_item:owned};
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[raw]});
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests[0].clubPlayers[0].assetId,267906);
+  assert.equal(h.requests[0].sbcData.currentSolution[0],267906);
+  await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge']);
+  assert.equal(h.squad._players[10]._item,raw);
+  assert.equal(h.squad._players[10]._item.definitionId,50599553);
+});
+test('native databaseId mismatch remains blocked and reports only failed metadata fields',async()=>{
+  const concept={...marketCard(50599553),assetId:267905,rating:69};
+  const raw={...eaConcept(concept),databaseId:267906,_metaData:{id:50599553}};
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[raw]});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);
+  const status=h.elements.find(e=>e.tag==='p'&&e.textContent.includes('EA concept card identity mismatch'));
+  assert.ok(status);
+  assert.match(status.textContent,/athlete ID: expected 267905, received 267906/);
+  assert.doesNotMatch(status.textContent,/rating:|rarity:|concept:/);
+});
+test('missing, duplicate, owned and mismatched EA concept results never mutate a squad',async t=>{
+  const concept=marketCard();
+  for(const [name,items] of [
+    ['missing',[]],['duplicate',[eaConcept(concept),eaConcept(concept)]],
+    ['wrong definition',[{...eaConcept(concept),definitionId:1}]],
+    ['different revision of same athlete',[{...eaConcept(concept),definitionId:concept.definitionId+0x1000000}]],
+    ['wrong athlete',[{...eaConcept(concept),assetId:1}]],
+    ['missing athlete',[{...eaConcept(concept),assetId:undefined}]],
+    ['wrong rating',[{...eaConcept(concept),rating:99}]],
+    ['wrong rarity',[{...eaConcept(concept),rareflag:3}]],
+    ['explicit owned',[{...eaConcept(concept),concept:false}]],
+    ['missing concept flag',[{...eaConcept(concept),concept:undefined}]],
+    ['missing player method',[{...eaConcept(concept),isPlayer:undefined}]],
+    ['missing EA item id',[{...eaConcept(concept),id:undefined}]],
+    ['owned inventory id',[{...eaConcept(concept),id:1}]],
+    ['nonplayer',[{...eaConcept(concept),isPlayer:()=>false}]],
+    ['EA special protection',[{...eaConcept(concept),isSpecial:()=>true}]],
+    ['EA evolution protection',[{...eaConcept(concept),isEvolution:()=>true}]]
+  ]) await t.test(name,async()=>{
+    const h=harness({solve:input=>marketResult(input,[concept])});
+    h.ctx.services.Item.searchConceptItems=()=>observable({items});
+    await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+    assert.deepEqual(h.writes,[]);
+  });
+});
+test('all concepts must resolve before any owned or concept placement',async()=>{
+  const concepts=[marketCard(),marketCard(10000)];
+  const h=harness({solve:input=>marketResult(input,concepts,9)});
+  h.ctx.services.Item.searchConceptItems=criteria=>observable({items:criteria.defId[0]===9999?[eaConcept(concepts[0])]:[]});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);
+});
+test('locks inserted while EA concepts load are rechecked before mutation',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.localStorage.setItem('paletools:2026:account:lockedItems','[9999]');queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('Paletools lock')));
+});
+test('navigation during EA concept resolution stops Apply before squad changes',async()=>{
+  const concept=marketCard(),h=harness({native:true,solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.navigate(11);queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.nativeOptions.onSolveCurrent(h.nativeOptions.resolveContext());await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('The SBC screen changed')));
+});
+test('concept quote freshness is rechecked after EA lookup even within preview lifetime',async()=>{
+  const concept=marketCard(),started=Date.now();concept.priceSnapshotAt=new Date(started-(6*60-1)*60000).toISOString();
+  const h=harness({solve:input=>marketResult(input,[concept])});
+  h.ctx.services.Item.searchConceptItems=()=>({observe(owner,callback){h.ctx.Date=class extends Date{static now(){return started+2*60000;}};queueMicrotask(()=>callback(this,{success:true,data:{items:[eaConcept(concept)]}}));},unobserve(){}});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);assert.ok(h.elements.some(e=>e.textContent.includes('fresh, positive market quote')));
+});
+test('expired concept preview and a wrong initialized challenge both stop before mutation',async t=>{
+  await t.test('preview expired',async()=>{
+    const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});let searches=0;
+    h.ctx.services.Item.searchConceptItems=()=>{searches++;return observable({items:[eaConcept(concept)]});};
+    await h.refresh();await h.button('Solve and preview').click();const future=Date.now()+6*60000;
+    h.ctx.Date=class extends Date{static now(){return future;}};
+    await h.button('Place concept players').click();assert.equal(searches,0);assert.deepEqual(h.writes,[]);
+  });
+  await t.test('wrong controller challenge',async()=>{
+    const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+    h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+    await h.refresh();await h.button('Solve and preview').click();
+    h.ctx.UTSBCSquadOverviewViewController=class{initWithSBCSet(){this._squad=h.squad;this._challenge={id:999,setId:20};}};
+    await h.button('Place concept players').click();assert.deepEqual(h.writes,[]);
+  });
+});
+test('a concept cannot displace a preserved reserve version of the same athlete',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  const reserve={...h.players[11],definitionId:99999,assetId:concept.assetId};h.squad._players.push({_item:reserve});
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,[]);assert.equal(h.squad._players[11]._item,reserve);
+});
+test('EA placement omissions block save and clear newly populated slots during rollback',async()=>{
+  const concept=marketCard(),h=harness({solve:input=>marketResult(input,[concept])});
+  const oldItems=h.squad._players.map(slot=>slot._item),originalSet=h.squad.setPlayers;let calls=0;
+  h.squad.setPlayers=function(items){calls++;originalSet.call(this,items);if(calls===1)this._players[10]={_item:{id:0,isPlayer:()=>false}};};
+  h.ctx.services.Item.searchConceptItems=()=>observable({items:[eaConcept(concept)]});
+  await h.refresh();await h.button('Solve and preview').click();await h.button('Place concept players').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','removeAllItems','setPlayers']);
+  oldItems.forEach((item,i)=>assert.equal(h.squad._players[i]._item,item));
+});
+function marketSearchHarness(search){
+  const concept={...marketCard(),rating:65};
+  const h=harness({solve:input=>{
+    const observation=input.liveMarket,quote=observation.quotes.find(q=>q.definitionId===concept.definitionId);
+    const proof={...concept,marketPrice:quote.buyNowPrice,priceSource:'EA Transfer Market',priceSnapshotAt:observation.observedAt,priceFetchedAt:observation.observedAt,liveQuoteExpiresAt:new Date(Date.parse(observation.observedAt)+120000).toISOString()};
+    return marketResult(input,[proof]);
+  }});
+  const calls=[],clears=[];
+  Object.assign(h.ctx,{UTSearchCriteriaDTO:class{constructor(){this.type='player';this.count=20;this.offset=0;}},
+    ItemType:{PLAYER:'player'},ItemSearchFeature:{MARKET:'market'},SearchLevel:{BRONZE:'bronze',SILVER:'silver',GOLD:'gold'},ItemRatingTier:{BRONZE:1,SILVER:2,GOLD:3},
+    UTBucketedItemSearchViewModel:class{constructor(){this.searchCriteria={};this.defaultSearchCriteria={};}updateSearchCriteria(value){Object.assign(this.searchCriteria,value);}}});
+  const listing=(extra={})=>({...eaConcept(concept),concept:false,id:7000,getTier:()=>2,
+    getAuctionData:()=>({buyNowPrice:200,isActiveTrade:()=>true,getSecondsRemaining:()=>90,tradeId:'never-send-this'}),...extra});
+  h.ctx.services.Item.clearTransferMarketCache=()=>clears.push(calls.length);
+  h.ctx.services.Item.searchTransferMarket=(query,page)=>{query.offset=(page-1)*20;query.count=21;calls.push({...query,page});return observable({items:search?search(query,page,listing):query.maxBuy<200?[]:[listing()]});};
+  return {...h,calls,clears,listing,concept};
+}
+test('live market mode searches official EA API, resets changed queries and sends only observed quote fields',async()=>{
+  const h=marketSearchHarness();await h.refresh();await h.button('Solve with live prices').click();
+  assert.deepEqual(h.calls.map(c=>[c.maxBuy,c.page]),[[150,1],[200,1]]);assert.deepEqual(h.clears,[0,1]);
+  h.calls.forEach(c=>{assert.equal(c.type,'player');assert.equal(c.level,'silver');assert.equal(c.disableOverrides,true);assert.deepEqual([...c.rarities],[0,1]);});
+  const live=h.requests[0].liveMarket;assert.equal(live.pagesRead,2);assert.equal(live.searchMaxBuy,200);
+  assert.deepEqual(live.quotes,[{definitionId:h.concept.definitionId,buyNowPrice:200}]);
+  assert.equal(JSON.stringify(h.requests[0]).includes('never-send-this'),false);
+  assert.equal(h.button('Place concept players').disabled,false);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Live EA market')));
+});
+test('live market ignores expired, inactive, zero-BIN, wrong-tier and protected listings',async()=>{
+  const h=marketSearchHarness((query,page,listing)=>query.maxBuy<200?[]:[
+    listing({getAuctionData:()=>({buyNowPrice:1,isActiveTrade:()=>false,getSecondsRemaining:()=>90})}),
+    listing({getAuctionData:()=>({buyNowPrice:1,isActiveTrade:()=>true,getSecondsRemaining:()=>0})}),
+    listing({getAuctionData:()=>({buyNowPrice:0,isActiveTrade:()=>true,getSecondsRemaining:()=>90})}),
+    listing({getTier:()=>3}),listing({rareflag:3}),listing()
+  ]);
+  await h.refresh();await h.button('Solve with live prices').click();assert.deepEqual(h.requests[0].liveMarket.quotes,[{definitionId:h.concept.definitionId,buyNowPrice:200}]);
+});
+test('market pagination uses EA-mutated count and page argument with a nine-request bound',async t=>{
+  await t.test('lookahead page',async()=>{
+    const h=marketSearchHarness((query,page,listing)=>query.maxBuy===150?(page===1?Array.from({length:21},()=>listing({rareflag:3})):[]):[listing()]);
+    await h.refresh();await h.button('Solve with live prices').click();assert.deepEqual(h.calls.map(c=>[c.maxBuy,c.page]),[[150,1],[150,2],[200,1]]);assert.deepEqual(h.clears,[0,2]);
+  });
+  await t.test('bounded full pages',async()=>{
+    const h=marketSearchHarness((query,page,listing)=>Array.from({length:21},()=>listing({rareflag:3})));
+    await h.refresh();await h.button('Solve with live prices').click();assert.equal(h.calls.length,9);assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  });
+});
+
+function batchHarness(overrides={}) {
+  const h=harness(overrides);
+  Object.assign(h.set,{isRepeatable:false,isLimitedRepeatable:false,timesCompleted:0,awards:[]});
+  Object.assign(h.challenge,{timesCompleted:0,awards:[],canSubmit:()=>true,hasUntradeableItems:()=>true});
+  h.ctx.UTEventTokenUtils={hasEventTokenReward:()=>false};
+  h.ctx.UTServerSettingsRepository={KEY:{SBC_ALLOW_UNTRADEABLE:'allow-untradeable'}};
+  h.ctx.services.EventToken={isEventTokenEarningDisabled:()=>false};
+  h.ctx.services.Configuration={getFeatureSetting:()=>true};
+  h.ctx.services.Chemistry.isFeatureEnabled=()=>true;
+  h.ctx.services.SBC.reset=()=>{};
+  h.ctx.services.SBC.submitChallenge=(challenge,set,skip,chem)=>{
+    assert.equal(skip,false);assert.equal(chem,true);h.writes.push('submitChallenge');
+    challenge.timesCompleted++;set.timesCompleted++;challenge.status='COMPLETED';
+    return observable({setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]});
+  };
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
+  h.prepare=async()=>{await h.refresh();await h.button('Add selected set').click();consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));};
+  h.report=()=>JSON.parse(h.localStorage.getItem('autosbc.local.batch.v1'));
+  return h;
+}
+test('extension handshake pins the displayed hosted destination before sending private solve data',async()=>{
+  const h=harness({extension:{}});await h.refresh();
+  assert.equal(h.requests.length,0);
+  await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.equal(h.button('Apply squad').disabled,false);
+  const info=h.pageMessages.findIndex(message=>message.source==='autosbc-server-info-response');
+  const solve=h.pageMessages.findIndex(message=>message.source==='autosbc-local-request'&&message.method==='POST');
+  assert.ok(info>=0&&solve>info);
+  assert.ok(h.elements.some(element=>element.tag==='p'&&element.textContent==='Hosted solver: https://solver.example. Selected club cards are sent to this server.'));
+  const link=h.elements.find(element=>element.tag==='a'&&element.textContent==='Open hosted server ↗');assert.equal(link.href,'https://solver.example');
+  assert.equal(JSON.stringify(h.pageMessages).includes('x'.repeat(48)),false);
+  await h.button('Server settings').click();await new Promise(setImmediate);
+  assert.equal(h.extension.openedOptions,1);assert.deepEqual(h.writes,[]);
+});
+test('extension default local destination remains usable without a token or remote label',async()=>{
+  const h=harness({extension:{config:{mode:'local',origin:'http://127.0.0.1:8000',revision:'local-default-v1'}}});await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,1);assert.equal(h.button('Apply squad').disabled,false);
+  assert.ok(h.elements.some(element=>element.tag==='p'&&element.textContent==='Local solver: http://127.0.0.1:8000. Club data stays on this computer.'));
+});
+test('extension missing consent, unreadable settings and absent handshake fail before private transport',async t=>{
+  for(const [name,extension] of [['missing consent',{config:{mode:'hosted',origin:'https://solver.example',token:'x'.repeat(48),consent:false,revision:'v1'}}],
+    ['read error',{infoError:'Server settings are unavailable'}],['no response',{noInfoResponse:true}]])await t.test(name,async()=>{
+    const h=harness({extension});await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+    assert.equal(h.workerMessages.some(message=>message.type==='autosbc-local-http'),false);
+    assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('extension response from a different origin is rejected before private solve or review',async t=>{
+  await t.test('wrong health origin',async()=>{
+    const h=harness({extension:{responseOrigin:'https://other.example'}});await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+    assert.ok(h.elements.some(element=>element.textContent.includes('server destination changed')));
+  });
+  await t.test('wrong poll origin',async()=>{
+    const h=harness({extension:{}});h.extension.beforeNetwork=async message=>{if(message.path.startsWith('/api/solve/jobs/'))h.extension.responseOrigin='https://other.example';};
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests.length,1);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  });
+});
+test('a destination change between health and job creation transmits no club request to the new server',async()=>{
+  const h=harness({extension:{}});h.extension.beforeNetwork=async message=>{
+    if(message.path==='/api/solve/jobs')h.extension.config={...h.extension.config,origin:'https://other.example',revision:'v2'};
+  };
+  await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Apply squad').disabled,true);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Server settings changed')));
+});
+test('changing server settings after a preview blocks Apply before any squad mutation or save',async()=>{
+  const h=harness({extension:{}});await h.refresh();await h.button('Solve and preview').click();assert.equal(h.button('Apply squad').disabled,false);
+  h.extension.config={...h.extension.config,origin:'https://other.example',revision:'v2'};
+  await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,1);
+  assert.ok(h.elements.some(element=>element.textContent.includes('Server settings changed')));
+});
+test('a same-origin token/config revision change after save blocks the queued submission',async()=>{
+  const h=batchHarness({extension:{}}),save=h.ctx.services.SBC.saveChallenge;
+  h.ctx.services.SBC.saveChallenge=(...args)=>{const result=save(...args);h.extension.config={...h.extension.config,revision:'rotated-token'};return result;};
+  await h.prepare();await h.button('Start queue').click();
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.includes('submitChallenge'),false);
+  assert.equal(h.report().receipts.length,0);assert.match(h.report().phase,/Server settings changed/);
+});
+test('Cancel during the fresh extension settings check prevents Apply after that check resolves',async()=>{
+  const h=harness({extension:{}});await h.refresh();await h.button('Solve and preview').click();
+  let entered,release;const checking=new Promise(resolve=>{entered=resolve;});
+  h.extension.beforeInfo=()=>new Promise(resolve=>{release=resolve;entered();});
+  const pending=h.button('Apply squad').click();await checking;await h.button('Cancel').click();release();await pending;
+  assert.deepEqual(h.writes,[]);
+});
+test('explicit batch solves, saves, submits, verifies reward counters and completes one selected set',async()=>{
+  const h=batchHarness();await h.prepare();await h.button('Start queue').click();
+  assert.deepEqual(h.writes,['removeAllItems','setPlayers','saveChallenge','submitChallenge']);
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].solverPolicy.allowConcept,false);
+  assert.equal(h.requests[0].solverPolicy.protectPlayed,true);assert.equal(h.requests[0].solverPolicy.protectEvolutions,true);
+  assert.equal(h.report().snapshot.status,'completed');assert.equal(h.report().snapshot.progress.confirmedChallenges,1);
+  assert.equal(h.report().receipts[0].coinSpent,0);assert.equal(h.report().receipts[0].rewardsGranted,true);
+});
+test('batch checks native eligibility and service untradeable gate before submit',async t=>{
+  for(const name of ['eligibility','untradeable','event-token']) await t.test(name,async()=>{
+    const h=batchHarness();
+    if(name==='eligibility')h.challenge.canSubmit=()=>false;
+    if(name==='untradeable')h.ctx.services.Configuration.getFeatureSetting=()=>false;
+    if(name==='event-token'){h.ctx.UTEventTokenUtils.hasEventTokenReward=()=>true;h.ctx.services.EventToken.isEventTokenEarningDisabled=()=>true;}
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.equal(h.report().snapshot.status,'blocked');
+  });
+});
+test('batch reuses its initial set snapshot for solve and refreshes before and after submission',async()=>{
+  const h=batchHarness();await h.prepare();let setReads=0;const requestSets=h.ctx.services.SBC.requestSets;
+  h.ctx.services.SBC.requestSets=()=>{setReads++;return requestSets();};
+  await h.button('Start queue').click();
+  assert.equal(h.report().snapshot.status,'completed');assert.equal(setReads,3);
+  assert.equal(h.timerDelays.filter(delay=>delay===500).length,4,'reward check is paced in four cancellable 500ms chunks');
+});
+test('batch stops if played history or an active squad lock changes after save',async t=>{
+  for(const name of ['played','active'])await t.test(name,async()=>{
+    const h=batchHarness();h.ctx.services.SBC.saveChallenge=()=>{
+      h.writes.push('saveChallenge');
+      if(name==='played')h.players[0].getStats=()=>[1,0,0,0,0];
+      else h.activeSquadPlayers.push({_item:h.players[0]});
+      return observable({});
+    };
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.equal(h.report().snapshot.status,'blocked');
+  });
+});
+test('batch rejects a changed saved squad and does not submit or consume another card',async()=>{
+  const h=batchHarness();let loads=0;
+  h.ctx.services.SBC.loadChallenge=()=>{loads++;if(loads===3)h.squad._players[0]._item=h.players[11];return observable(h.challenge);};
+  await h.prepare();await h.button('Start queue').click();
+  assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/saved squad/);
+});
+test('batch validates submit identity and never retries an uncertain submission',async()=>{
+  const h=batchHarness();h.ctx.services.SBC.submitChallenge=()=>{h.writes.push('submitChallenge');return observable({setId:999,challengeId:10,setCompleted:true,grantedChallengeAwards:[]});};
+  await h.prepare();await h.button('Start queue').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'blocked');
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
+  consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));await h.button('Start queue').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);
+});
+test('batch stop while native submit internally saves records the in-flight result and starts no next step',async()=>{
+  const h=batchHarness();let release,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>({observe(owner,callback){h.writes.push('submitChallenge');started();release=()=>{challenge.timesCompleted++;set.timesCompleted++;callback(this,{success:true,status:200,data:{setId:20,challengeId:10,setCompleted:true,grantedChallengeAwards:[]}});};},unobserve(){}});
+  await h.prepare();const pending=h.button('Start queue').click();await entered;
+  await h.button('Stop queue').click();release();await pending;
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'stopped');
+  assert.equal(h.report().receipts.length,1);assert.equal(h.report().receipts[0].completed,true);
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
+  consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));await h.button('Start queue').click();
+  assert.equal(h.writes.filter(x=>x==='submitChallenge').length,1,'a confirmed submit awaiting read verification cannot run again');
+});
+test('batch cannot dispatch save when durable pending journal fails',async()=>{
+  const h=batchHarness();await h.prepare();const save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.batch.v1'&&JSON.parse(value).phase==='save')throw new Error('Storage full');save(key,value);};
+  await h.button('Start queue').click();assert.deepEqual(h.writes,[]);
+});
+test('batch rechecks Paletools locks added while loading the saved challenge and at dispatch journaling',async t=>{
+  for(const phase of ['load','dispatch'])await t.test(phase,async()=>{
+    const h=batchHarness();let loads=0;
+    if(phase==='load')h.ctx.services.SBC.loadChallenge=()=>{loads++;if(loads===3)h.localStorage.setItem('paletools:2026:account:lockedItems','[1000]');return observable(h.challenge);};
+    else {const save=h.localStorage.setItem.bind(h.localStorage);h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.batch.v1'&&JSON.parse(value).phase==='submit')save('paletools:2026:account:lockedItems','[1000]');};}
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/Paletools lock/);
+  });
+});
+
+function dailyHarness({kind='silver',repeats=2,...overrides}={}) {
+  const h=batchHarness({solve:input=>({status_code:4,status:'Optimal',solution:input.sbcData.formation.flatMap((position,index)=>position===-1?[]:[index])
+    .map((slot,index)=>({...input.clubPlayers[index],squadPosition:slot}))}),...overrides}), names={bronze:'Daily Bronze Upgrade',silver:'Daily Silver Upgrade',common:'Daily Common Gold Upgrade',rare:'Daily Rare Gold Upgrade'};
+  Object.assign(h.set,{name:names[kind],isRepeatable:true,isLimitedRepeatable:true,repeats,timesCompleted:0,endTime:Date.now()+3600000,
+    isComplete:()=>false,hasExpired:flag=>{assert.equal(flag,false);return false;},getTimeRemaining:()=>3600,
+    getRepeatsRemaining:()=>h.set.repeats-h.set.timesCompleted});
+  const rating=kind==='bronze'?60:kind==='silver'?65:80;
+  for (let i=12;i<24;i++)h.players.push({...h.players[i%12],id:i+1,definitionId:1000+i,assetId:2000+i,_metaData:{id:2000+i},_staticData:{name:`Player ${i+1}`}});
+  h.players.forEach(player=>{player.rating=rating;player.getTier=()=>kind==='bronze'?1:kind==='silver'?2:3;});
+  if(kind==='bronze'||kind==='silver') {
+    const selected=kind==='bronze'?0:10;
+    h.squad.simpleBrickIndices=Array.from({length:11},(_,index)=>index).filter(index=>index!==selected);
+    h.challenge.eligibilityRequirements=[{scope:0,count:1,kvPairs:{_collection:{1:[1]}}}];
+    h.brickSlot=()=>({_item:{id:0,definitionId:0,concept:false,isPlayer:()=>true,isValid:()=>false},
+      isRegularBrick:()=>true,isCustomBrick:()=>false});
+    const hydrate=()=>{h.squad.simpleBrickIndices.forEach(index=>{h.squad._players[index]=h.brickSlot();});};
+    hydrate();
+    h.ctx.services.SBC.loadChallenge=()=>{hydrate();return observable(h.challenge);};
+  }
+  const consumed=new Set();
+  h.consumed=consumed;
+  h.ctx.services.Club.search=criteria=>observable({items:filterClub(h.players.filter(player=>!consumed.has(player.id)),criteria),retrievedAll:true});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>{
+    h.writes.push('submitChallenge');h.squad._players.slice(0,11).forEach(slot=>consumed.add(slot._item.id));
+    challenge.timesCompleted++;set.timesCompleted++;challenge.status='IN_PROGRESS';
+    return observable({setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]});
+  };
+  h.dailyConsent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the daily cycles shown')).children[0];
+  h.readDailies=async()=>{await h.refresh();await h.button('Build daily plan').click();};
+  h.consentDailies=async()=>{h.dailyConsent.checked=true;await Promise.all(h.dailyConsent.listeners.change.map(fn=>fn()));};
+  h.dailyReport=()=>JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1'));
+  h.control=label=>h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith(label)).children[0];
+  return h;
+}
+test('daily one-click plan is read-only and explicit start executes exactly its finite rights',async()=>{
+  const h=dailyHarness();await h.readDailies();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);assert.equal(h.button('Start daily plan').disabled,true);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent.includes('Daily Silver Upgrade: 2 cycles')));
+  await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,2);
+  assert.equal(h.requests.length,2);
+  assert.equal(h.dailyReport().status,'completed');
+  assert.deepEqual(h.dailyReport().progress,{completedCycles:2,totalCycles:2,confirmedParts:2});
+  assert.equal(h.dailyReport().plan.entries.length,2);
+  assert.equal(h.button('Start daily plan').disabled,true);
+});
+test('a one-card Bronze daily uses one full solve scan and three exact selected-card club reads',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:1}),reads=[];const search=h.ctx.services.Club.search;
+  h.ctx.services.Club.search=criteria=>{reads.push(JSON.parse(JSON.stringify(criteria)));return search(criteria);};
+  await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(h.dailyReport().status,'completed');assert.equal(reads.length,4);assert.equal(reads[0].defId,undefined);
+  for(const read of reads.slice(1)){assert.deepEqual(read.defId,[1000]);assert.equal(read.isExactSearch,true);assert.equal(read.count,91);}
+  assert.equal(h.cacheReads.filter(read=>read==='club-reset').length,4);
+  assert.equal(h.cacheReads.filter(read=>read==='dirty-storage').length,4);
+  assert.equal(h.cacheReads.filter(read=>read==='squads-reset').length,4);
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
+test('card removal at each targeted batch check prevents the next account write',async t=>{
+  for(const phase of [1,2,3])await t.test(`selected read ${phase}`,async()=>{
+    const h=batchHarness(),search=h.ctx.services.Club.search;let filtered=0;
+    h.ctx.services.Club.search=criteria=>{
+      if(criteria.defId&&++filtered===phase)return observable({items:filterClub(h.players,criteria).slice(1),retrievedAll:true});
+      return search(criteria);
+    };
+    await h.prepare();await h.button('Start queue').click();
+    assert.equal(filtered,phase);assert.equal(h.writes.includes('submitChallenge'),false);
+    assert.equal(h.writes.filter(write=>write==='saveChallenge').length,phase===3?1:0);
+    if(phase<3)assert.deepEqual(h.writes,[]);
+  });
+});
+test('Stop during a targeted batch read prevents storage refresh and all later writes',async()=>{
+  const h=batchHarness(),search=h.ctx.services.Club.search;let release,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  h.ctx.services.Club.search=criteria=>{
+    if(!criteria.defId)return search(criteria);
+    return {observe(owner,callback){release=()=>callback(this,{success:true,data:{items:filterClub(h.players,criteria),retrievedAll:true}});entered();},unobserve(){}};
+  };
+  await h.prepare();const pending=h.button('Start queue').click();await started;
+  await h.button('Stop queue').click();release();await pending;
+  assert.deepEqual(h.writes,[]);assert.equal(h.cacheReads.filter(read=>read==='dirty-storage').length,1);
+  assert.equal(h.report().snapshot.status,'stopped');
+});
+test('bronze and silver dailies submit one owned card while retaining ten native player-typed null bricks',async t=>{
+  for(const kind of ['bronze','silver'])await t.test(kind,async()=>{
+    const h=dailyHarness({kind,repeats:1});await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+    assert.equal(h.dailyReport().status,'completed');assert.equal(h.dailyReport().progress.confirmedParts,1);
+    assert.equal(h.requests[0].sbcData.brickIndices.length,10);assert.equal(h.report().receipts[0].cardIds.length,1);
+    assert.equal([...h.consumed].filter(id=>id>0).length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+    const index=h.squad.simpleBrickIndices[0],slot=h.squad._players[index];
+    assert.equal(slot.isRegularBrick(),true);assert.equal(slot._item.isPlayer(),true);assert.equal(slot._item.id,0);
+  });
+});
+test('a brick flag never permits an owned card, concept or malformed null item in an unused daily slot',async t=>{
+  const cases=[
+    ['positive item ID',(h,slot)=>{slot._item={...h.players[1],isValid:()=>false};}],
+    ['nonzero definition',(h,slot)=>{slot._item.definitionId=999;}],
+    ['concept',(h,slot)=>{slot._item.concept=true;}],
+    ['valid item',(h,slot)=>{slot._item.isValid=()=>true;}],
+    ['missing validity',(h,slot)=>{delete slot._item.isValid;}],
+    ['missing regular brick',(h,slot)=>{delete slot.isRegularBrick;}],
+    ['custom brick',(h,slot)=>{slot.isRegularBrick=()=>false;slot.isCustomBrick=()=>true;}]
+  ];
+  for(const [name,change] of cases)await t.test(name,async()=>{
+    const h=dailyHarness({kind:'bronze',repeats:1}),load=h.ctx.services.SBC.loadChallenge;let loads=0;
+    h.ctx.services.SBC.loadChallenge=()=>{const response=load();if(++loads===3)change(h,h.squad._players[1]);return response;};
+    await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+    assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.includes('submitChallenge'),false);
+    assert.equal(h.dailyReport().status,'blocked');assert.equal(h.dailyReport().progress.confirmedParts,0);
+    const message=h.report().phase;assert.match(message,/Slot details:/);
+    const details=JSON.parse(message.split('Slot details: ')[1]);assert.equal(details.length,1);assert.equal(details[0].index,1);
+    assert.equal(details[0].expectedId,null);assert.equal(details[0].simpleBrick,true);
+  });
+});
+test('full daily slot validation is repeated at submit dispatch after inventory reads',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:1}),save=h.localStorage.setItem.bind(h.localStorage);let changed=false;
+  h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.batch.v1'){
+    const report=JSON.parse(value),last=report.snapshot.ledger.at(-1);
+    if(last?.event==='effect-started'&&last.action==='submit'&&!changed){changed=true;h.squad._players[1]._item={...h.players[1],isValid:()=>false};}
+  }};
+  await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(changed,true);assert.equal(h.writes.includes('submitChallenge'),false);assert.match(h.report().phase,/Slot details:/);
+});
+test('daily restores exact manual policy, selected set, queue and consent afterward',async()=>{
+  const h=dailyHarness({repeats:1});await h.prepare();
+  const policyControls=['Protect special cards','Protect evolved cards','Protect played cards'];
+  policyControls.forEach(label=>{h.control(label).checked=false;});
+  h.control('Maximum player rating').value=98;h.control('Player value limit').value=1750;
+  h.control('Allow priced concept players').checked=true;
+  const original='{"manual":"preserve byte for byte"}';h.localStorage.setItem('autosbc.local.policy.v1',original);
+  const selection=h.selects.slice(0,4).map(control=>control.value);
+  await h.button('Build daily plan').click();await h.consentDailies();await h.button('Start daily plan').click();
+  assert.equal(h.dailyReport().status,'completed');assert.equal(h.localStorage.getItem('autosbc.local.policy.v1'),original);
+  assert.deepEqual(h.selects.slice(0,4).map(control=>control.value),selection);
+  policyControls.forEach(label=>assert.equal(h.control(label).checked,false));
+  assert.equal(h.control('Maximum player rating').value,'98');assert.equal(h.control('Player value limit').value,'1750');
+  assert.equal(h.control('Allow priced concept players').checked,true);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent===h.set.name));
+  assert.equal(h.control('Automatically submit the queued squads').checked,true);
+  const request=h.requests[0].solverPolicy;
+  assert.equal(request.maxRating,74);assert.equal(request.maxPlayerPrice,1000);
+  assert.equal(request.protectSpecial,true);assert.equal(request.protectEvolutions,true);assert.equal(request.protectPlayed,true);assert.equal(request.allowConcept,false);
+});
+test('daily rating ceilings and lower user price limits are preserved per kind',async t=>{
+  for(const [kind,maxRating] of [['bronze',64],['silver',74],['common',82],['rare',82]])await t.test(kind,async()=>{
+    const h=dailyHarness({kind,repeats:1});h.control('Player value limit').value=500;
+    await h.readDailies();await h.consentDailies();await h.button('Start daily plan').click();
+    assert.equal(h.dailyReport().status,'completed');assert.equal(h.requests[0].solverPolicy.maxRating,maxRating);assert.equal(h.requests[0].solverPolicy.maxPlayerPrice,500);
+  });
+});
+test('daily stop between cycles prevents the next save and preserves confirmed counts',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();
+  const save=h.localStorage.setItem.bind(h.localStorage);let stopped=false;
+  h.localStorage.setItem=(key,value)=>{save(key,value);if(key==='autosbc.local.daily.v1'){
+    const report=JSON.parse(value);
+    if(!stopped&&report.progress.completedCycles===1&&report.phase.includes('cycle verified')){stopped=true;h.button('Stop daily plan').click();}
+  }};
+  await h.button('Start daily plan').click();
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.requests.length,1);
+  assert.equal(h.dailyReport().status,'stopped');assert.equal(h.dailyReport().progress.completedCycles,1);assert.equal(h.dailyReport().progress.confirmedParts,1);
+});
+test('Stop during the five-second daily pacing wait preserves its receipt and prevents every next-cycle request',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();
+  const original=h.ctx.setTimeout;let entered,release,waiting=false;
+  const started=new Promise(resolve=>{entered=resolve;});
+  h.ctx.setTimeout=(callback,delay,...args)=>{
+    const report=h.dailyReport();
+    if(delay===500&&report?.phase==='Cycle verified. Next daily begins in 5 seconds; Stop cancels it.'&&!waiting){
+      waiting=true;release=()=>callback(...args);entered();return 0;
+    }
+    return original(callback,delay,...args);
+  };
+  let setReads=0;const sets=h.ctx.services.SBC.requestSets;h.ctx.services.SBC.requestSets=(...args)=>{setReads++;return sets(...args);};
+  const pending=h.button('Start daily plan').click();await started;
+  const before={setReads,requests:h.requests.length,writes:h.writes.length};
+  await h.button('Stop daily plan').click();release();await pending;
+  assert.equal(waiting,true);assert.equal(setReads,before.setReads);assert.equal(h.requests.length,before.requests);assert.equal(h.writes.length,before.writes);
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+  assert.equal(h.dailyReport().status,'stopped');assert.deepEqual(h.dailyReport().progress,{completedCycles:1,totalCycles:2,confirmedParts:1});
+  assert.equal(h.dailyReport().cycles[0].child.receipts.length,1);assert.equal(h.dailyReport().cycles[1].status,'planned');
+});
+test('daily stops before saving when remaining rights change after planning',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();h.set.timesCompleted=1;
+  await h.button('Start daily plan').click();
+  assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.match(h.dailyReport().phase,/counters changed/);
+});
+test('daily rejects malformed native expiry before creating a writable plan',async t=>{
+  for(const value of [NaN,Infinity,-1,1.5,Number.MAX_SAFE_INTEGER+1,'12345'])await t.test(String(value),async()=>{
+    const h=dailyHarness();h.set.endTime=value;await h.readDailies();
+    assert.equal(h.button('Start daily plan').disabled,true);assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+    assert.ok(h.elements.some(e=>e.textContent.includes('Cannot read the daily expiry time')));
+  });
+});
+test('daily stop during child submit records the in-flight receipt without another cycle',async()=>{
+  const h=dailyHarness();await h.readDailies();await h.consentDailies();let release,enter;
+  const entered=new Promise(resolve=>{enter=resolve;});
+  h.ctx.services.SBC.submitChallenge=(challenge,set)=>({observe(owner,callback){h.writes.push('submitChallenge');enter();release=()=>{challenge.timesCompleted++;set.timesCompleted++;callback(this,{success:true,status:200,data:{setId:set.id,challengeId:challenge.id,setCompleted:true,grantedChallengeAwards:[]}});};},unobserve(){}});
+  const pending=h.button('Start daily plan').click();await entered;await h.button('Stop daily plan').click();release();await pending;
+  assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.dailyReport().status,'stopped');
+  assert.equal(h.dailyReport().cycles[0].child.receipts.length,1);assert.equal(h.requests.length,1);
+});
+test('daily pending parent journal must persist before any child save dispatch',async()=>{
+  const h=dailyHarness({repeats:1});await h.readDailies();await h.consentDailies();const save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.daily.v1'&&JSON.parse(value).cycles[0]?.child?.phase==='save')throw new Error('Daily journal full');save(key,value);};
+  await h.button('Start daily plan').click();assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Daily journal full')));
+});
+test('daily reload never resumes and pending or malformed stored history blocks another plan',async t=>{
+  const histories=[
+    ['autosbc.local.daily.v1',JSON.stringify({runId:'old',status:'running',plan:{entries:[]},cycles:[{status:'pending'}]})],
+    ['autosbc.local.daily.v1','{broken'],['autosbc.local.batch.v1','{broken'],
+    ['autosbc.local.batch.v1',JSON.stringify({runId:'old',snapshot:{status:'running',queue:[]}})]
+  ];
+  for(const [key,value] of histories)await t.test(`${key}:${value.slice(0,16)}`,async()=>{
+    const h=dailyHarness({storage:{[key]:value}});assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+    await h.readDailies();assert.equal(h.button('Start daily plan').disabled,true);assert.deepEqual(h.writes,[]);
+  });
+});
+test('EA list diagnostics preserve status and safe code without raw response leakage',async()=>{
+  const h=batchHarness();await h.prepare();let reads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:500,retryAfter:0.001,error:{code:'MAX_FAILED_AUTH_ATTEMPTS',secret:'do-not-record'},headers:{Authorization:'do-not-record'}}));},unobserve(){}});
+  await h.button('Start queue').click();
+  assert.equal(reads,2);
+  assert.equal(h.report().lastError.status,500);assert.equal(h.report().lastError.code,'MAX_FAILED_AUTH_ATTEMPTS');
+  assert.equal(h.report().lastError.operation,'Queue SBC sets');assert.doesNotMatch(JSON.stringify(h.report()),/do-not-record/);assert.deepEqual(h.writes,[]);
+});
+test('EA saved-squad conflicts retain bounded names and item IDs without retrying submission',async()=>{
+  const h=batchHarness();await h.prepare();
+  h.ctx.services.SBC.submitChallenge=()=>({observe(owner,callback){
+    h.writes.push('submitChallenge');
+    queueMicrotask(()=>callback(this,{success:false,status:409,error:{code:'CONFLICT',secret:'do-not-record'},
+      data:{itemViolations:[{name:'  Main\u0000\n Squad  ',itemIds:[1,'1','2'],secret:'do-not-record'},
+        {name:'Reserves',itemIds:['2',3]}],secret:'do-not-record'},headers:{Authorization:'do-not-record'}}));
+  },unobserve(){}});
+  await h.button('Start queue').click();
+  const report=h.report();
+  assert.deepEqual(report.lastError,{status:409,code:'CONFLICT',operation:'Automatic SBC submission',
+    itemViolations:[{name:'Main Squad',itemIds:[1,2]},{name:'Reserves',itemIds:[2,3]}]});
+  assert.match(report.phase,/EA reports cards assigned to saved squads: Main Squad, Reserves/);
+  assert.match(report.phase,/Remove the listed cards from those saved squads in EA/);
+  assert.doesNotMatch(JSON.stringify(report),/do-not-record|\\u0000|\\n Squad/);
+  assert.equal(report.snapshot.queue[0].steps[0].status,'uncertain');
+  assert.equal(report.receipts.length,0);assert.equal(h.writes.filter(value=>value==='submitChallenge').length,1);
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
+  consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));await h.button('Start queue').click();
+  assert.equal(h.writes.filter(value=>value==='submitChallenge').length,1);
+});
+test('saved-squad diagnostics reject a malformed list entirely and never infer the cause of a bare 409',async t=>{
+  const row={name:'Main squad',itemIds:[1]},rows=count=>Array.from({length:count},()=>row);
+  const cases=[['absent',undefined],['empty',[]],['wrong container',{name:'Main squad',itemIds:[1]}],['too many squads',rows(31)],
+    ['malformed second row',[row,{name:'Partial proof must not appear',itemIds:[0]}]],['missing name',[{itemIds:[1]}]],
+    ['oversized name',[{...row,name:'x'.repeat(121)}]],['only controls',[{...row,name:' \u0000\n '}]],
+    ['missing item IDs',[{name:'Main squad'}]],['empty item IDs',[{...row,itemIds:[]}]],
+    ['too many items',[{...row,itemIds:Array(33).fill(1)}]],['zero',[{...row,itemIds:[0]}]],
+    ['negative',[{...row,itemIds:[-1]}]],['decimal',[{...row,itemIds:[1.5]}]],
+    ['unsafe number',[{...row,itemIds:[Number.MAX_SAFE_INTEGER+1]}]],['unsafe string',[{...row,itemIds:['9007199254740992']}]],
+    ['boolean',[{...row,itemIds:[true]}]],['numeric exponent',[{...row,itemIds:['1e2']}]],
+    ['over total bound',Array.from({length:11},(_,i)=>({name:`Squad ${i}`,itemIds:Array.from({length:i===10?31:30},(_,j)=>i*30+j+1)}))]];
+  for(const [name,value] of cases)await t.test(name,async()=>{
+    const h=batchHarness();await h.prepare();
+    h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:409,error:{code:409},
+      data:{itemViolations:value},response:{itemViolations:[row]}}));},unobserve(){}});
+    await h.button('Start queue').click();
+    assert.deepEqual(h.report().lastError,{status:409,code:409,operation:'Queue SBC sets'});
+    assert.doesNotMatch(h.report().phase,/saved squads|Main squad|Partial proof/);assert.deepEqual(h.writes,[]);
+  });
+});
+test('saved-squad diagnostics accept their exact total bound and deduplicate numeric string IDs',async()=>{
+  const h=batchHarness();await h.prepare();
+  const rows=Array.from({length:11},(_,i)=>({name:`Squad ${i}`,itemIds:[...Array.from({length:30},(_,j)=>i*30+j+1),String(i*30+1)]}));
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:409,data:{itemViolations:rows}}));},unobserve(){}});
+  await h.button('Start queue').click();
+  assert.equal(h.report().lastError.itemViolations.length,11);
+  assert.equal(h.report().lastError.itemViolations.flatMap(row=>row.itemIds).length,330);
+  assert.match(h.report().phase,/Squad 0, Squad 1, Squad 2, Squad 3, Squad 4 and 6 more/);
+  assert.doesNotMatch(h.report().phase,/Squad 5/);assert.deepEqual(h.writes,[]);
+});
+test('daily two failed initial list reads make no writes and permit a later fresh plan',async()=>{
+  const h=dailyHarness({repeats:1});await h.readDailies();await h.consentDailies();const requestSets=h.ctx.services.SBC.requestSets;let failedReads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){failedReads++;queueMicrotask(()=>callback(this,{success:false,status:429,retryAfter:0.001,error:{code:'RATE_LIMIT'}}));},unobserve(){}});
+  await h.button('Start daily plan').click();
+  assert.equal(failedReads,2);assert.deepEqual(h.writes,[]);assert.equal(h.dailyReport().status,'blocked');assert.equal(h.dailyReport().cycles[0].status,'blocked');
+  assert.equal(h.dailyReport().lastError.status,429);assert.equal(h.dailyReport().lastError.retryAfterSeconds,0.001);
+  h.ctx.services.SBC.requestSets=requestSets;await h.button('Build daily plan').click();await h.consentDailies();
+  assert.equal(h.button('Start daily plan').disabled,false);assert.deepEqual(h.writes,[]);
+});
+for(const serverStatus of [500,502,503,512,521])test(`a ${serverStatus} before the next Bronze cycle retries only the list and never repeats the verified first submission`,async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets,retry=h.ctx.AutoSBCReadRetry,messages=[];let nextReads=0,firstChild,writesBeforeRetry;
+  h.ctx.AutoSBCReadRetry={read:options=>retry.read({...options,onWait:event=>{
+    options.onWait(event);if(event.status===serverStatus)messages.push(h.elements.filter(e=>e.tag==='p').map(e=>e.textContent).join('\n'));
+  }})};
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle===1) {
+      nextReads++;
+      if(nextReads===1) {
+        firstChild=daily.cycles[0].child;writesBeforeRetry=[...h.writes];
+        assert.equal(daily.progress.completedCycles,1);assert.equal(firstChild.receipts.length,1);
+        return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:serverStatus,retryAfter:0.001,error:{code:serverStatus}}));},unobserve(){}};
+      }
+      if(nextReads===2) {
+        assert.deepEqual(h.writes,writesBeforeRetry);assert.deepEqual(daily.cycles[0].child,firstChild);
+      }
+    }
+    return requestSets();
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();
+  assert.equal(nextReads,4,'one failed initial read, one retry, then the next cycle’s pre-submit and reward reads');
+  assert.equal(daily.status,'completed');assert.deepEqual(daily.progress,{completedCycles:2,totalCycles:2,confirmedParts:2});
+  assert.equal(h.writes.filter(write=>write==='saveChallenge').length,2);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,2);
+  assert.equal(h.requests.length,2);assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.notDeepEqual(daily.cycles[0].child.receipts[0].cardIds,daily.cycles[1].child.receipts[0].cardIds);
+  for(const cycle of daily.cycles)assert.equal(cycle.child.snapshot.ledger.filter(event=>event.action==='submit'&&event.event==='effect-started').length,1);
+  assert.ok(messages.length>0);assert.ok(messages.every(message=>message.includes(`EA SBC list request failed (${serverStatus}).`)&&!message.includes('EA limited the list request')));
+});
+test('a second 521 before the next daily cycle stops with the prior receipt and counters unchanged',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets;let nextReads=0,firstChild;
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle!==1)return requestSets();
+    nextReads++;firstChild??=daily.cycles[0].child;
+    return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();
+  assert.equal(nextReads,2);assert.equal(daily.status,'blocked');assert.deepEqual(daily.progress,{completedCycles:1,totalCycles:2,confirmedParts:1});
+  assert.equal(daily.lastError.status,521);assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.equal(daily.cycles[1].status,'blocked');assert.deepEqual(daily.cycles[1].child.receipts,[]);
+  assert.equal(h.requests.length,1);assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
+test('Stop during the next daily cycle’s 521 countdown prevents its retry and preserves the completed cycle',async()=>{
+  const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
+  const requestSets=h.ctx.services.SBC.requestSets,retry=h.ctx.AutoSBCReadRetry;let nextReads=0,firstChild;
+  h.ctx.AutoSBCReadRetry={read:options=>retry.read({...options,onWait:async event=>{
+    await options.onWait(event);if(event.status===521)await h.button('Stop daily plan').click();
+  }})};
+  h.ctx.services.SBC.requestSets=()=>{
+    const daily=h.dailyReport();
+    if(daily.currentCycle!==1)return requestSets();
+    nextReads++;firstChild??=daily.cycles[0].child;
+    return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+  };
+  await h.button('Start daily plan').click();
+  const daily=h.dailyReport();assert.equal(nextReads,1);assert.equal(daily.status,'stopped');
+  assert.deepEqual(daily.progress,{completedCycles:1,totalCycles:2,confirmedParts:1});assert.deepEqual(daily.cycles[0].child,firstChild);
+  assert.equal(h.requests.length,1);assert.equal(h.writes.filter(write=>write==='saveChallenge').length,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+});
+
+function uncertainSubmitReport() {
+  const B=require('../frontend/batch-policy.js');
+  const controller=B.createBatch([20]),players=Array.from({length:11},(_,i)=>({id:String(i+1),concept:false,gamesPlayed:0,isEvolution:false}));
+  controller.startSet(20,{completed:false,remaining:null,repeatable:false});controller.beginStep(10);controller.readyStep(players);
+  controller.confirmEffect(controller.beginEffect('save',players));
+  const reason='Automatic SBC submission: EA returned 409.';
+  controller.failEffect(controller.beginEffect('submit',players),reason);
+  return {runId:'replan-example',scope:{gameYear:26,platform:'ps5'},selectedSets:[{id:'20',name:'Test SBC'}],
+    updatedAt:new Date(Date.now()-60000).toISOString(),phase:reason,snapshot:controller.snapshot(),receipts:[],
+    lastError:{status:409,operation:'Automatic SBC submission'}};
+}
+function replanHarness(options={}) {
+  const report=options.report||uncertainSubmitReport();
+  const h=batchHarness({storage:{'autosbc.local.batch.v1':JSON.stringify(report),...(options.storage||{})}});
+  h.selects[0].value=26;h.selects[1].value='ps5';h.challenge.isCompleted=()=>false;
+  h.original=report;return h;
+}
+test('recovery actions are enabled only for the matching pure report plan',()=>{
+  const h=replanHarness();assert.equal(h.button('Verify cards and replan').disabled,false);
+  assert.equal(h.button('Verify last submission').disabled,true);
+  const claim=reconciliationHarness();assert.equal(claim.button('Verify last submission').disabled,false);
+  assert.equal(claim.button('Verify cards and replan').disabled,true);
+  const empty=harness();assert.equal(empty.button('Verify cards and replan').disabled,true);
+  assert.equal(empty.button('Verify last submission').disabled,true);
+});
+test('read-only card verification brackets fresh ownership with status reads and adds no completion credit',async()=>{
+  const h=replanHarness(),reads=[];
+  const helper=h.ctx.AutoSBCBatchReplan;let ownership;
+  h.ctx.AutoSBCBatchReplan={...helper,reconcile:(report,evidence)=>{ownership=evidence.inventory;return helper.reconcile(report,evidence);}};
+  for(const method of ['loadChallenge','saveChallenge','submitChallenge'])h.ctx.services.SBC[method]=()=>{throw new Error(`Forbidden ${method}`);};
+  for(const method of ['requestSquadList','requestSquadById'])h.ctx.services.Squad[method]=()=>{throw new Error(`Forbidden ${method}`);};
+  for(const [service,method] of [[h.ctx.services.SBC,'requestSets'],[h.ctx.services.SBC,'requestChallengesForSet'],[h.ctx.services.Club,'search'],[h.ctx.services.Item,'searchStorageItems']]){
+    const call=service[method];service[method]=(...args)=>{reads.push(method);if(method==='search')assert.equal(args[0].defId,undefined);return call(...args);};
+  }
+  await h.button('Verify cards and replan').click();
+  assert.deepEqual(reads,['requestSets','requestChallengesForSet','search','searchStorageItems','requestSets','requestChallengesForSet']);
+  assert.deepEqual(h.cacheReads,['club-reset','dirty-storage']);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+  const report=h.report();assert.equal(report.snapshot.status,'stopped');assert.equal(report.snapshot.queue[0].steps[0].status,'blocked');
+  assert.equal(report.snapshot.progress.confirmedChallenges,0);assert.deepEqual(report.receipts,[]);
+  assert.equal(report.reconciliation.ownership.matchedItems.length,11);
+  assert.equal(ownership.clubComplete,true);assert.equal(ownership.clubFilter,undefined);assert.equal(ownership.storageComplete,true);
+  assert.ok(Object.isFrozen(ownership));assert.ok(Object.isFrozen(ownership.items));
+  assert.deepEqual(report.snapshot.ledger.slice(0,-1),h.original.snapshot.ledger);
+  assert.equal(h.button('Verify cards and replan').disabled,true);
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];
+  assert.equal(consent.checked,false);assert.equal(h.button('Start queue').disabled,true);
+});
+test('missing owned cards, repeatable sets and changed completion status cannot clear a 409 attempt',async t=>{
+  const cases=[
+    ['card absent',h=>{h.players.shift();}],
+    ['repeatable',h=>{h.set.isRepeatable=true;}],
+    ['completed flag',h=>{h.challenge.isCompleted=()=>true;}],
+    ['unknown status',h=>{h.challenge.status='UNKNOWN';}],
+    ['advanced counter',h=>{h.challenge.timesCompleted=1;}],
+    ['missing getter',h=>{delete h.challenge.isCompleted;}],
+    ['status changed across ownership read',h=>{const search=h.ctx.services.Item.searchStorageItems;h.ctx.services.Item.searchStorageItems=(...args)=>{h.challenge.status='NOT_STARTED';return search(...args);};}],
+    ['same item in club and storage',h=>{h.ctx.services.Item.searchStorageItems=()=>observable({items:[h.players[0]],endOfList:true});}]
+  ];
+  for(const [name,change] of cases)await t.test(name,async()=>{
+    const h=replanHarness();change(h);const original=h.localStorage.getItem('autosbc.local.batch.v1');
+    await h.button('Verify cards and replan').click();
+    assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+    assert.equal(h.report().snapshot.queue[0].steps[0].status,'uncertain');
+  });
+});
+test('a journal change or cancellation during ownership verification prevents the final status read and journal update',async t=>{
+  for(const variant of ['journal','cancel'])await t.test(variant,async()=>{
+    const h=replanHarness();let release,signal,reads=0;const entered=new Promise(resolve=>{signal=resolve;});
+    const requestSets=h.ctx.services.SBC.requestSets;h.ctx.services.SBC.requestSets=()=>{reads++;return requestSets();};
+    h.ctx.services.Club.search=()=>({observe(owner,callback){release=()=>callback(this,{success:true,data:{items:h.players,retrievedAll:true}});signal();},unobserve(){}});
+    const original=h.localStorage.getItem('autosbc.local.batch.v1');const pending=h.button('Verify cards and replan').click();await entered;
+    const expected=variant==='journal'?JSON.stringify({...h.original,phase:'Changed externally'}):original;
+    if(variant==='journal')h.localStorage.setItem('autosbc.local.batch.v1',expected);else await h.button('Cancel').click();
+    release();await pending;assert.equal(reads,1);assert.deepEqual(h.cacheReads,['club-reset']);
+    assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),expected);assert.deepEqual(h.writes,[]);
+  });
+});
+test('linked daily journals retain the same read-only conclusion without adding a completed cycle',async()=>{
+  const report=uncertainSubmitReport(),daily={runId:'daily-link',scope:report.scope,status:'blocked',
+    plan:{totalCycles:1,entries:[{setId:'20'}]},cycles:[{entry:{setId:'20'},status:'pending',child:report}]};
+  const h=replanHarness({report,storage:{'autosbc.local.daily.v1':JSON.stringify(daily)}});
+  await h.button('Verify cards and replan').click();
+  const updated=JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1'));
+  assert.equal(updated.status,'stopped');assert.equal(updated.cycles[0].status,'blocked');
+  assert.equal(updated.progress.completedCycles,0);assert.equal(updated.progress.confirmedParts,0);
+  assert.deepEqual(updated.cycles[0].child,h.report());assert.deepEqual(h.writes,[]);
+});
+
+function uncertainClaimReport({setCompleted=true}={}) {
+  const B=require('../frontend/batch-policy.js');
+  const controller=B.createBatch([20]),players=Array.from({length:11},(_,i)=>({id:String(i+1),concept:false,gamesPlayed:0,isEvolution:false}));
+  controller.startSet(20,{completed:false,repeatable:false,remaining:1});controller.beginStep(10);controller.readyStep(players);
+  for(const action of ['save','submit'])controller.confirmEffect(controller.beginEffect(action,players));
+  controller.failEffect(controller.beginEffect('claim'),'Queue SBC sets: EA returned 521 (521).');
+  return {runId:'reconcile-fixture',scope:{gameYear:26,platform:'ps5'},selectedSets:[{id:'20',name:'Test SBC'}],phase:'claim read failed',updatedAt:new Date().toISOString(),
+    snapshot:controller.snapshot(),lastError:{status:521,code:521,operation:'Queue SBC sets'},receipts:[{setId:'20',challengeId:'10',completed:true,rewardsGranted:true,setCompleted,
+      at:new Date().toISOString(),beforeChallenge:0,beforeSet:0,cardIds:players.map(player=>player.id),zeroGames:true,coinSpent:0,grantedChallengeAwards:[]}]};
+}
+function reconciliationHarness({report=uncertainClaimReport(),dailyReport,...overrides}={}) {
+  const h=batchHarness({...overrides,storage:{'autosbc.local.batch.v1':JSON.stringify(report),...(dailyReport?{'autosbc.local.daily.v1':JSON.stringify(dailyReport)}:{})}});
+  h.originalReport=JSON.parse(JSON.stringify(report));h.set.timesCompleted=1;h.challenge.timesCompleted=1;
+  h.selects[0].value='26';h.selects[1].value='ps5';return h;
+}
+test('read-only reconciliation verifies stored exact submission and stops without an account write',async()=>{
+  const h=reconciliationHarness(),old=JSON.stringify(h.originalReport);let reads=0;
+  const requestSets=h.ctx.services.SBC.requestSets;h.ctx.services.SBC.requestSets=()=>{reads++;return requestSets();};
+  await h.button('Verify last submission').click();
+  const report=h.report();assert.equal(report.snapshot.status,'stopped');assert.equal(report.snapshot.progress.confirmedChallenges,1);
+  assert.equal(report.snapshot.progress.completed,1);assert.equal(report.snapshot.queue[0].steps[0].status,'completed');
+  assert.deepEqual(report.receipts,h.originalReport.receipts);assert.deepEqual(report.snapshot.ledger.slice(0,h.originalReport.snapshot.ledger.length),h.originalReport.snapshot.ledger);
+  assert.equal(JSON.stringify(h.originalReport),old);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.equal(reads,1);
+  const reportText=h.localStorage.getItem('autosbc.local.batch.v1');
+  await h.button('Verify last submission').click();assert.equal(reads,1);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),reportText);
+});
+test('reconciliation cannot resolve a write ambiguity or a forged/missing submit confirmation',async t=>{
+  for(const kind of ['submit-uncertain','missing-confirmation','receipt-mismatch'])await t.test(kind,async()=>{
+    const report=uncertainClaimReport();
+    if(kind==='submit-uncertain')report.snapshot.ledger.at(-1).action='submit';
+    if(kind==='missing-confirmation')report.snapshot.ledger=report.snapshot.ledger.filter(event=>!(event.action==='submit'&&event.event==='effect-confirmed'));
+    if(kind==='receipt-mismatch')report.receipts[0].challengeId='11';
+    const h=reconciliationHarness({report});let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+    const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Verify last submission').click();
+    assert.equal(reads,0);assert.deepEqual(h.writes,[]);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);
+  });
+});
+test('reconciliation rejects unchanged counters and mismatched scope without clearing evidence',async t=>{
+  for(const kind of ['challenge-counter','set-counter','scope'])await t.test(kind,async()=>{
+    const h=reconciliationHarness();
+    if(kind==='challenge-counter')h.challenge.timesCompleted=0;
+    if(kind==='set-counter')h.set.timesCompleted=0;
+    if(kind==='scope')h.selects[1].value='pc';
+    const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Verify last submission').click();
+    assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+  });
+});
+test('two 521 list failures during read-only reconciliation stop after one retry and preserve the original journal',async()=>{
+  const h=reconciliationHarness();let reads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}});
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Verify last submission').click();
+  assert.equal(reads,2);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+test('cancel during reconciliation prevents journal updates and further reads',async()=>{
+  const h=reconciliationHarness();let release,enter;const entered=new Promise(resolve=>{enter=resolve;});
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){enter();release=()=>callback(this,{success:true,data:{sets:[h.set]}});},unobserve(){}});
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');const pending=h.button('Verify last submission').click();await entered;
+  await h.button('Cancel').click();release();await pending;
+  assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+function linkedDaily(report) {
+  const D=require('../frontend/daily-plan.js');
+  const plan=D.createPlan([{id:20,name:'Daily Silver Upgrade',completed:false,expired:false,isRepeatable:true,isLimitedRepeatable:true,repeats:1,timesCompleted:0,remaining:1}]);
+  return {runId:'daily-fixture',scope:report.scope,day:new Date().toDateString(),plan,status:'blocked',phase:'old claim uncertainty',currentCycle:0,
+    cycles:[{entry:plan.entries[0],status:'pending',child:report}],progress:{completedCycles:0,totalCycles:1,confirmedParts:0}};
+}
+test('reconciliation updates the matching Daily child while preserving its original evidence',async t=>{
+  for(const setCompleted of [false,true])await t.test(String(setCompleted),async()=>{
+    const report=uncertainClaimReport({setCompleted}),h=reconciliationHarness({report,dailyReport:linkedDaily(report)});
+    await h.button('Verify last submission').click();
+    const daily=JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1'));
+    assert.equal(daily.status,'stopped');assert.equal(daily.progress.confirmedParts,1);assert.equal(daily.progress.completedCycles,setCompleted?1:0);
+    assert.equal(daily.cycles[0].status,setCompleted?'completed':'blocked');assert.deepEqual(daily.cycles[0].child,h.report());
+    assert.deepEqual(daily.cycles[0].child.receipts,report.receipts);assert.deepEqual(h.writes,[]);
+  });
+});
+test('mismatched Daily linkage fails closed before any EA read',async()=>{
+  const report=uncertainClaimReport(),daily=linkedDaily(report);daily.cycles[0].child=JSON.parse(JSON.stringify(report));daily.cycles[0].child.phase='different';
+  const h=reconciliationHarness({report,dailyReport:daily});let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Verify last submission').click();
+  assert.equal(reads,0);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);
+});
+test('linked journal second-write failure leaves a blocking mismatch instead of resuming',async()=>{
+  const report=uncertainClaimReport(),h=reconciliationHarness({report,dailyReport:linkedDaily(report)}),save=h.localStorage.setItem.bind(h.localStorage);
+  h.localStorage.setItem=(key,value)=>{if(key==='autosbc.local.batch.v1')throw new Error('Storage full');save(key,value);};
+  await h.button('Verify last submission').click();assert.equal(h.report().snapshot.status,'blocked');
+  assert.equal(JSON.parse(h.localStorage.getItem('autosbc.local.daily.v1')).status,'stopped');
+  h.localStorage.setItem=save;let reads=0;h.ctx.services.SBC.requestSets=()=>{reads++;throw new Error('must not read');};
+  await h.button('Verify last submission').click();assert.equal(reads,0);assert.deepEqual(h.writes,[]);
+});
+test('stop during the post-submit pacing window prevents immediate reward GET',async()=>{
+  const h=batchHarness();await h.prepare();let reads=0;const requestSets=h.ctx.services.SBC.requestSets,oldTimer=h.ctx.setTimeout;let stopped=false;
+  h.ctx.services.SBC.requestSets=()=>{reads++;return requestSets();};
+  h.ctx.setTimeout=(callback,delay,...args)=>{if(delay===500&&!stopped){stopped=true;h.button('Stop queue').click();}return oldTimer(callback,delay,...args);};
+  await h.button('Start queue').click();
+  assert.equal(reads,2);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);assert.equal(h.report().snapshot.status,'stopped');
+  assert.ok(h.elements.some(e=>e.tag==='p'&&e.textContent.includes('1 submission receipts · 0 counter verifications')));
+});
+test('completed repeatable sets leave the manual queue when a later set fails',async()=>{
+  const h=batchHarness(),other={id:30,name:'Other SBC',isComplete:()=>false,isRepeatable:false,isLimitedRepeatable:false,timesCompleted:0};
+  h.set.isRepeatable=true;h.set.isLimitedRepeatable=true;h.set.getRepeatsRemaining=()=>9;
+  h.ctx.services.SBC.requestSets=()=>observable({sets:[h.set,other]});
+  h.ctx.services.SBC.requestChallengesForSet=set=>set.id===20?observable({challenges:[h.challenge]}):{observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001}));},unobserve(){}};
+  await h.prepare();h.selects[2].value='30';await h.button('Add selected set').click();
+  const consent=h.elements.find(e=>e.tag==='label'&&e.textContent.startsWith('Automatically submit the queued squads')).children[0];consent.checked=true;await Promise.all(consent.listeners.change.map(fn=>fn()));
+  await h.button('Start queue').click();
+  assert.equal(h.report().snapshot.progress.completed,1);assert.equal(h.writes.filter(write=>write==='submitChallenge').length,1);
+  assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent==='Other SBC'));
+});
+test('manual batch cannot restart a reloaded claim-pending journal or malformed history',async t=>{
+  const pending=uncertainClaimReport();pending.snapshot.status='running';pending.snapshot.queue[0].status='running';pending.snapshot.queue[0].steps[0].status='claim-pending';pending.snapshot.ledger.pop();
+  for(const history of [JSON.stringify(pending),'{broken'])await t.test(history.slice(0,20),async()=>{
+    const h=batchHarness({storage:{'autosbc.local.batch.v1':history}});await h.prepare();await h.button('Start queue').click();
+    assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),history);
+  });
+});
+test('reconciliation removes only a proven completed set from the manual queue',async t=>{
+  for(const setCompleted of [false,true])await t.test(String(setCompleted),async()=>{
+    const h=reconciliationHarness({report:uncertainClaimReport({setCompleted})});await h.refresh();await h.button('Add selected set').click();
+    await h.button('Verify last submission').click();
+    assert.ok(h.elements.some(e=>e.tag==='ol'&&e.textContent===(setCompleted?'No sets added yet.':'Test SBC')));
+    assert.deepEqual(h.writes,[]);
+  });
+});
+test('batch report details show the exact existing JSON only after explicit click without requests or mutation',async()=>{
+  const report=uncertainClaimReport(),h=reconciliationHarness({report});
+  const field=h.elements.find(e=>e.tag==='label'&&e.textContent==='SBC run report (JSON)').children[0];
+  const details=h.elements.find(e=>e.tag==='details'&&e.children[0]?.textContent==='Run details');
+  assert.equal(field.value,'');assert.equal(field.readOnly,true);
+  h.ctx.fetch=()=>{throw new Error('must not request');};h.ctx.services.SBC.requestSets=()=>{throw new Error('must not read EA');};
+  const original=h.localStorage.getItem('autosbc.local.batch.v1');await h.button('Show report JSON').click();
+  assert.deepEqual(JSON.parse(field.value),report);assert.equal(details.open,true);
+  assert.equal(h.localStorage.getItem('autosbc.local.batch.v1'),original);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+});
+test('Daily report details are explicit, readonly, and use the same report as download',async()=>{
+  const report=uncertainClaimReport(),dailyReport=linkedDaily(report),h=reconciliationHarness({report,dailyReport});
+  const field=h.elements.find(e=>e.tag==='label'&&e.textContent==='Daily run report (JSON)').children[0];
+  assert.equal(field.value,'');assert.equal(field.readOnly,true);
+  await h.button('Show daily report JSON').click();assert.deepEqual(JSON.parse(field.value),dailyReport);assert.deepEqual(h.writes,[]);
+  const empty=harness();assert.equal(empty.button('Show report JSON').disabled,true);assert.equal(empty.button('Show daily report JSON').disabled,true);
+});

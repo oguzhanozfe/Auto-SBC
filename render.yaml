@@ -1,0 +1,29 @@
+# Single-owner evaluation only. Explicit free plan; no disk/database/worker.
+services:
+  - type: web
+    name: auto-sbc-studio-free
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    autoDeployTrigger: "off"
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 40
+    envVars:
+      - key: AUTOSBC_HOSTED
+        value: "1"
+      - key: AUTOSBC_API_TOKEN
+        generateValue: true
+      # RENDER_EXTERNAL_URL supplies the exact HTTPS origin automatically.
+      - key: AUTOSBC_EXTENSION_IDS
+        sync: false
+      - key: AUTOSBC_SOLVER_WORKERS
+        value: "1"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: AUTOSBC_MAX_CHEMISTRY_PLAYERS
+        value: "200"
+      - key: AUTOSBC_GAME_YEAR
+        value: "26"
+      - key: AUTOSBC_PLATFORM
+        value: ps5

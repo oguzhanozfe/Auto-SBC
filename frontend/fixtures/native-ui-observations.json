@@ -1,0 +1,35 @@
+{
+  "observedOn": "2026-09-09",
+  "source": "Sanitized rendered EA Web App observations with the user's existing SBC Monkey installed; no extension implementation or account identifiers.",
+  "nativeSquad": {
+    "heading": "10x 85+ Upgrade",
+    "requirements": ["Any TOTW/TOTS/FOF/FUTTIES: Min. 1 Players", "Team Rating: Min. 84", "Number of Players in the Squad: 11"],
+    "buttons": ["Exchange Players", "Use Squad Builder", "Clear Squad", "Use Monkey"],
+    "solvedRequirementCounter": "3/3",
+    "observedRating": "84",
+    "observedChemistry": "0/33"
+  },
+  "readiness": {
+    "observed": "Opening a challenge or item detail and immediately clicking its injected Monkey button sometimes had no effect; a later interaction worked.",
+    "inference": "Handler or view readiness is a hypothesis, not a verified cause. Our entry binds before insertion and waits for a stable active challenge."
+  },
+  "itemDetails": {
+    "heading": "Player Details",
+    "buttons": ["Lock for Monkey", "Player Bio", "Apply Consumable", "Swap Player", "Send to Transfer List", "Search Transfer Market", "Compare Price", "Remove Last Evolution", "Send to My Club", "Quick Sell"],
+    "afterLockLabel": "Unlock for Monkey",
+    "evolutionCaveat": "The Remove Last Evolution menu alone did not establish the card's evolution status."
+  },
+  "provisionsRepeat": {
+    "heading": "Provisions Upgrade",
+    "requirements": {"minimumPlayerRating": 85, "players": 3, "brickSlots": 8, "teamRatingRequirement": null, "chemistryRequirement": null},
+    "before": {"challengeFraction": "0/1 SBCs", "completedText": "COMPLETED: 0.", "repeatableText": "Repeatable: 15", "resetText": "19 Hours 54 Mins"},
+    "after": {"challengeFraction": "0/1 SBCs", "completedText": "COMPLETED: 1.", "repeatableText": "Repeatable: 14", "resetText": "19 Hours 53 Mins"},
+    "brickCaveat": "A displayed squad rating of 40 with eight bricks was not a team-rating requirement."
+  },
+  "exhaustedDaily": {
+    "heading": "Daily Bronze Upgrade",
+    "before": {"challengeFraction": "0/1 SBCs", "completedText": "COMPLETED: 14.", "repeatableText": "Repeatable: 1"},
+    "after": {"challengeFraction": "1/1 SBCs", "completedText": null, "repeatableText": "Repeatable: 0", "resetText": "19 Hours 50 Mins", "groupRewardsVisible": false},
+    "missingValueRule": "Missing COMPLETED is unknown, never zero. Explicit Repeatable: 0 establishes no repeats remaining."
+  }
+}
