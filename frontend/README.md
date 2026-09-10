@@ -93,8 +93,12 @@ Played-card rules uses the same EA getters as Player Bio. Positive or
 unreadable lifetime/current counts block selection. EA can initialize absent raw
 statistics to zero; this is not an independent history database.
 
-Set/challenge list reads may retry once after a numeric 429 with a visible,
-cancellable delay. Save and Submit are never automatically retried. A 409 can
+Only set/challenge list reads may retry once after numeric 429 or an integer
+500–599 response, with a visible, cancellable delay. The default is 60 seconds;
+a usable Retry-After is honored up to five minutes. Two total attempts are the
+limit even when the error changes. Unknown 512/521 responses retain their codes
+without an inferred cause. Other 4xx responses stop immediately. Load, Save and
+Submit are never automatically retried. A 409 can
 have several causes. Saved-squad diagnostics are shown only if EA returns a fully
 validated bounded list; generic failures remain generic.
 
@@ -118,6 +122,12 @@ Squad identifiers have their own validation; native squad zero is distinct from
 a physical player ID, which must be positive. A zero alias returning another
 squad identity is not accepted silently.
 
+Owned-only Apply and batch pre-write checks use fresh exact-definition Club
+queries for the reviewed cards; they still refresh all Storage and saved-squad
+locks. The ownership record marks that limited Club scope. Solving, concept
+previews and no-completion recovery retain full Club reads. The one-card Bronze
+path passed live in 27.0.12; this does not certify every native inventory shape.
+
 **Verify cards and replan** supports one narrow case: an eleven-player submission
 returned 409, without a successful target receipt. Fresh status must show the
 same nonrepeatable, incomplete challenge with zero completion counters both
@@ -126,3 +136,10 @@ changed journal, scope, status, missing player or incomplete read leaves the
 attempt unresolved. Success appends evidence, retains the original uncertain
 event and prior receipts, and permits a separately started fresh plan. It never
 claims the failed attempt completed or repeats that recorded submission.
+
+At the 27.0.13 live checkpoint, ten selected-set parts and four Bronze dailies
+had completed automatically. The original selected request remained 2/5 sets,
+13/17 parts. The latest daily plan verified 1/57, then stopped on a 426 list read
+before the next write. Full daily-plan validation remains pending. Only the 521
+list retry was observed live; the wider 5xx policy has unit coverage. Report
+downloads were verified through Chrome's native Save dialog and file readback.

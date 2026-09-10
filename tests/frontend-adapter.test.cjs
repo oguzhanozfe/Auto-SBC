@@ -982,9 +982,10 @@ test('daily reload never resumes and pending or malformed stored history blocks 
   });
 });
 test('EA list diagnostics preserve status and safe code without raw response leakage',async()=>{
-  const h=batchHarness();await h.prepare();
-  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:500,error:{code:'MAX_FAILED_AUTH_ATTEMPTS',secret:'do-not-record'},headers:{Authorization:'do-not-record'}}));},unobserve(){}});
+  const h=batchHarness();await h.prepare();let reads=0;
+  h.ctx.services.SBC.requestSets=()=>({observe(owner,callback){reads++;queueMicrotask(()=>callback(this,{success:false,status:500,retryAfter:0.001,error:{code:'MAX_FAILED_AUTH_ATTEMPTS',secret:'do-not-record'},headers:{Authorization:'do-not-record'}}));},unobserve(){}});
   await h.button('Start queue').click();
+  assert.equal(reads,2);
   assert.equal(h.report().lastError.status,500);assert.equal(h.report().lastError.code,'MAX_FAILED_AUTH_ATTEMPTS');
   assert.equal(h.report().lastError.operation,'Queue SBC sets');assert.doesNotMatch(JSON.stringify(h.report()),/do-not-record/);assert.deepEqual(h.writes,[]);
 });
@@ -1048,11 +1049,11 @@ test('daily two failed initial list reads make no writes and permit a later fres
   h.ctx.services.SBC.requestSets=requestSets;await h.button('Build daily plan').click();await h.consentDailies();
   assert.equal(h.button('Start daily plan').disabled,false);assert.deepEqual(h.writes,[]);
 });
-test('a 521 before the next Bronze cycle retries only the list and never repeats the verified first submission',async()=>{
+for(const serverStatus of [500,502,503,512,521])test(`a ${serverStatus} before the next Bronze cycle retries only the list and never repeats the verified first submission`,async()=>{
   const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();
   const requestSets=h.ctx.services.SBC.requestSets,retry=h.ctx.AutoSBCReadRetry,messages=[];let nextReads=0,firstChild,writesBeforeRetry;
   h.ctx.AutoSBCReadRetry={read:options=>retry.read({...options,onWait:event=>{
-    options.onWait(event);if(event.status===521)messages.push(h.elements.filter(e=>e.tag==='p').map(e=>e.textContent).join('\n'));
+    options.onWait(event);if(event.status===serverStatus)messages.push(h.elements.filter(e=>e.tag==='p').map(e=>e.textContent).join('\n'));
   }})};
   h.ctx.services.SBC.requestSets=()=>{
     const daily=h.dailyReport();
@@ -1061,7 +1062,7 @@ test('a 521 before the next Bronze cycle retries only the list and never repeats
       if(nextReads===1) {
         firstChild=daily.cycles[0].child;writesBeforeRetry=[...h.writes];
         assert.equal(daily.progress.completedCycles,1);assert.equal(firstChild.receipts.length,1);
-        return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:521,retryAfter:0.001,error:{code:521}}));},unobserve(){}};
+        return {observe(owner,callback){queueMicrotask(()=>callback(this,{success:false,status:serverStatus,retryAfter:0.001,error:{code:serverStatus}}));},unobserve(){}};
       }
       if(nextReads===2) {
         assert.deepEqual(h.writes,writesBeforeRetry);assert.deepEqual(daily.cycles[0].child,firstChild);
@@ -1077,7 +1078,7 @@ test('a 521 before the next Bronze cycle retries only the list and never repeats
   assert.equal(h.requests.length,2);assert.deepEqual(daily.cycles[0].child,firstChild);
   assert.notDeepEqual(daily.cycles[0].child.receipts[0].cardIds,daily.cycles[1].child.receipts[0].cardIds);
   for(const cycle of daily.cycles)assert.equal(cycle.child.snapshot.ledger.filter(event=>event.action==='submit'&&event.event==='effect-started').length,1);
-  assert.ok(messages.length>0);assert.ok(messages.every(message=>message.includes('The EA SBC list is temporarily unavailable (521).')&&!message.includes('EA limited the list request')));
+  assert.ok(messages.length>0);assert.ok(messages.every(message=>message.includes(`EA SBC list request failed (${serverStatus}).`)&&!message.includes('EA limited the list request')));
 });
 test('a second 521 before the next daily cycle stops with the prior receipt and counters unchanged',async()=>{
   const h=dailyHarness({kind:'bronze',repeats:2});await h.readDailies();await h.consentDailies();

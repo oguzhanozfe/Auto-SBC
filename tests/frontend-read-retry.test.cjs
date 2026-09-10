@@ -14,6 +14,7 @@ function fixture(extra={}) {
 }
 const transient=(status,seconds)=>Object.assign(new Error(`EA ${status}`),{status,...(seconds===undefined?{}:{retryAfterSeconds:seconds})});
 const limited=seconds=>transient(429,seconds);
+const retryableStatuses=[429,500,502,503,512,521,599];
 
 test('both allowed reads return successful values without sleeping or retrying',async()=>{
   for(const kind of ['requestSets','requestChallengesForSet']) {
@@ -27,8 +28,8 @@ test('load, save, submit and unknown operation kinds cannot dispatch',async()=>{
     assert.equal(f.calls,0);assert.deepEqual(f.sleeps,[]);
   }
 });
-test('strict numeric 429 and 521 retry either allowed list once after sixty interruptible seconds',async()=>{
-  for(const status of [429,521])for(const kind of ['requestSets','requestChallengesForSet']) {
+test('strict integer 429 and server statuses retry either allowed list once after sixty interruptible seconds',async()=>{
+  for(const status of retryableStatuses)for(const kind of ['requestSets','requestChallengesForSet']) {
     const f=fixture({kind}),request=f.options.request;let first=true;
     f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status);}return result;};
     assert.deepEqual(await Retry.read(f.options),{sets:[]});
@@ -36,11 +37,11 @@ test('strict numeric 429 and 521 retry either allowed list once after sixty inte
     assert.equal(f.sleeps.reduce((sum,ms)=>sum+ms,0),60000);
     assert.ok(f.sleeps.every(ms=>ms>0&&ms<=500));
     assert.equal(f.progress[0].remainingMs,60000);assert.equal(f.progress.at(-1).remainingMs,0);
-    assert.ok(f.progress.every(event=>event.kind===kind&&event.status===status&&event.reason===(status===429?'rate-limit':'list-unavailable')&&event.attempt===2&&event.delayMs===60000));
+    assert.ok(f.progress.every(event=>event.kind===kind&&event.status===status&&event.reason===(status===429?'rate-limit':'request-failed')&&event.attempt===2&&event.delayMs===60000));
   }
 });
 test('positive Retry-After is respected exactly, including the five-minute boundary',async()=>{
-  for(const status of [429,521])for(const seconds of [0.75,2,90,300]) {
+  for(const status of retryableStatuses)for(const seconds of [0.75,2,90,300]) {
     const f=fixture(),request=f.options.request;let first=true;
     f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status,seconds);}return result;};
     await Retry.read(f.options);
@@ -49,28 +50,29 @@ test('positive Retry-After is respected exactly, including the five-minute bound
   }
 });
 test('long server delays halt instead of shortening the requested cooldown',async()=>{
-  for(const status of [429,521])for(const seconds of [300.1,600,Infinity]) {
+  for(const status of retryableStatuses)for(const seconds of [300.1,600,Infinity]) {
     const error=transient(status,seconds),f=fixture({request:async()=>{throw error;}});
     await assert.rejects(Retry.read(f.options),e=>e.status===status&&e.cause===error&&e.retryAfterSeconds===seconds);
     assert.deepEqual(f.sleeps,[]);assert.deepEqual(f.progress,[]);
   }
 });
 test('missing and malformed delay metadata use the documented local fallback',async()=>{
-  for(const status of [429,521])for(const seconds of [undefined,null,0,-1,NaN,'5',true]) {
+  for(const status of retryableStatuses)for(const seconds of [undefined,null,0,-1,NaN,'5',true]) {
     const f=fixture(),request=f.options.request;let first=true;
     f.options.request=async()=>{const result=await request();if(first){first=false;throw transient(status,seconds);}return result;};
     await Retry.read(f.options);assert.equal(f.calls,2);assert.equal(f.attemptTimes[1]-f.attemptTimes[0],60000);
   }
 });
-test('other statuses, timeouts and nonnumeric retry statuses propagate without another attempt',async()=>{
-  for(const error of [Object.assign(new Error('EA 401'),{status:401}),Object.assign(new Error('EA 500'),{status:500}),
-    new Error('Timeout'),...['429','521',new Number(521),true,undefined].map(status=>transient(status))]) {
+test('other 4xx, timeouts and malformed or out-of-range statuses never retry',async()=>{
+  const excluded=[0,200,400,401,403,409,458,499,600,429.1,500.5,599.5,NaN,Infinity,
+    '429','500','502','503','512','521',new Number(521),true,undefined,null];
+  for(const error of [new Error('Timeout'),Object.assign(new Error('Code without a status'),{code:512}),...excluded.map(status=>transient(status))]) {
     let calls=0;const f=fixture({request:async()=>{calls++;throw error;}});
     await assert.rejects(Retry.read(f.options),e=>e===error);assert.equal(calls,1);assert.deepEqual(f.sleeps,[]);
   }
 });
-test('a second failure ends the read even when 429 and 521 alternate',async()=>{
-  for(const firstStatus of [429,521])for(const secondStatus of [429,521,500]) {
+test('a second failure ends the read even with mixed rate-limit and server statuses',async()=>{
+  for(const firstStatus of retryableStatuses)for(const secondStatus of [...retryableStatuses,401,403,458,600]) {
     let calls=0;const first=transient(firstStatus,1),second=transient(secondStatus,1);
     const f=fixture({request:async()=>{throw ++calls===1?first:second;}});
     await assert.rejects(Retry.read(f.options),e=>e===second);assert.equal(calls,2);
@@ -79,7 +81,7 @@ test('a second failure ends the read even when 429 and 521 alternate',async()=>{
   }
 });
 test('guard failures before dispatch and during waiting stop immediately without becoming retries',async()=>{
-  for(const status of [429,521]) {
+  for(const status of retryableStatuses) {
     const stop=Object.assign(new Error('Stopped'),{status});
     const before=fixture({guard:()=>{throw stop;}});
     await assert.rejects(Retry.read(before.options),e=>e===stop);assert.equal(before.calls,0);assert.deepEqual(before.sleeps,[]);
@@ -91,7 +93,7 @@ test('guard failures before dispatch and during waiting stop immediately without
   }
 });
 test('stop on the final countdown prevents the second dispatch',async()=>{
-  for(const status of [429,521]) {
+  for(const status of retryableStatuses) {
     const stop=new Error('Stopped at deadline');let stopped=false,calls=0;
     const f=fixture({request:async()=>{calls++;throw transient(status,1);},guard:()=>{if(stopped)throw stop;},
       onWait:event=>{if(event.remainingMs===0)stopped=true;}});

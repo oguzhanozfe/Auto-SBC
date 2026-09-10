@@ -1,12 +1,13 @@
 # Real-world acceptance cases
 
-Evidence checkpoint: **10 September 2026, version 27.0.11**. The selected five-set
-request stands at **2/5 groups and 13/17 parts**: ten selected-set parts completed automatically
-and three through earlier solve/Apply plus native submission. The daily plan contained **60 repetitions**. After correcting a fixed-slot
-validation bug, its first Bronze cycle completed automatically with an exact
-receipt and verified counters. The next cycle stopped on an initial 521 list
-read before any write: **1/60 verified daily cycles**, making eleven fully automatic
-parts/cycles overall. Earlier Daily Silver tests are separate from this plan.
+Live checkpoint: **27.0.13, 10 September 2026**. The selected five-set request stands at **2/5 groups
+and 13/17 parts**: ten selected-set parts completed automatically and three
+through earlier solve/Apply plus native submission. After the earlier **1/60**
+Bronze daily run, a fresh 59-cycle plan verified **2/59** more cycles, and the
+27.0.13 plan verified **1/57**. That is four automatic Bronze dailies and
+**fourteen automatic parts/cycles overall**, confirmed in the UI and local reports.
+Earlier Daily Silver tests are separate. Neither the original 60 rights nor the
+replacement plan has been fully completed or validated.
 
 “Observed” means an account action or read was verified. “Mocked” means a
 controlled test exercises the behavior. “Pending” is an acceptance condition,
@@ -108,10 +109,22 @@ tests originally missed this native empty-slot shape. The 27.0.11 regression
 uses one player and ten regular empty bricks, rejects unexpected owned cards,
 and checks again immediately before dispatch. Its first Bronze cycle passed
 live at 00:34:43 UTC. The next cycle stopped on an initial 521 list read before
-any write; completed progress remained intact. **Pending:** validate bounded
-read-error handling across the rest of the finite plan, then measure actual
-inventory shortages before proposing pack handling. A valid saved squad must
-not be reported as a completed daily.
+any write; completed progress remained intact. In 27.0.12, a fresh 59-cycle plan
+verified two more Bronze cycles. Between them, an initial 521 set-list failure
+recovered after the single 60-second retry. The following cycle stopped on an
+initial 512 list failure before any write. The three post-solve ownership reads
+successfully queried the selected card definitions while refreshing full Storage
+and saved-squad locks. They did not repeat the full club scan.
+
+27.0.13 permits one retry for numeric 429 or integer 500–599 only on the two
+allowlisted set/challenge list reads. This is an application retry policy;
+512/521 have no defined cause in the inspected EA client. The fresh 27.0.13 plan
+verified one of its 57 cycles, then stopped on an initial 426 list response
+before any write. That 4xx response is outside the retry policy. The test ended
+there: 56 rights remain by arithmetic, without another rights refresh. Only the
+521 retry was observed live; the broader 5xx range has unit coverage.
+**Pending:** the remaining finite cycles and actual inventory shortages before
+proposing pack handling. A valid saved squad must not be reported as completed.
 
 ## 6. Early FC 27, an empty club and an outdated price snapshot
 
@@ -166,9 +179,10 @@ if more rights become available during the run.
 
 ## Next work, ordered by observed friction
 
-1. Carry the verified fixed-slot correction through the daily plan. Handle the
-   observed next-cycle 521 list failure with bounded, cancellable read recovery
-   while preserving the completed first cycle and preventing write replay.
+1. Carry the four verified Bronze completions through the remaining daily
+   rights. Validate bounded, cancellable list-read recovery while preserving
+   receipts and preventing write replay; do not assign undocumented causes to
+   the observed 512/521 responses.
 2. Carry the now-observed all-saved-squad read through the remaining four parts.
    Improve explanations for actual read, ownership or eligibility failures
    before widening recovery to other uncertain states.
@@ -193,3 +207,12 @@ club candidates after frontend protections; that number must not be equated
 with the final modeled pool or with a requirement to model every card in every
 position. Record eligible/model counts and diagnose coverage/search behavior
 before using this workload to choose a host.
+
+Offline replays of that same exported request are documented in
+[HOSTING.md](HOSTING.md). Eight-worker runs found a feasible squad within the
+30-second budget; a separate one-worker sparse-domain experiment used 587.5 MiB
+and 30.251 seconds but returned UNKNOWN with no solution. Other local service
+activity could overlap, so these are not controlled speed or hosting-capacity
+comparisons. This actual 81-rating/31-chemistry case remains separate from the
+historical all-flexible 3,000-card stress test. Neither replaces daily and
+rating-only acceptance work or independently excludes a hosting provider.

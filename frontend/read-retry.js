@@ -6,7 +6,8 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
   const READ_KINDS = new Set(['requestSets','requestChallengesForSet']);
-  const RETRY_STATUSES = new Set([429,521]);
+  // This is a bounded read policy, not an interpretation of EA-specific codes.
+  const isRetryableStatus = status => status === 429 || Number.isInteger(status) && status >= 500 && status <= 599;
   const DEFAULT_DELAY_MS = 60000, MAX_DELAY_SECONDS = 300, WAIT_CHUNK_MS = 500;
   const timer = ms => new Promise(resolve => setTimeout(resolve,ms));
 
@@ -26,13 +27,13 @@
       let result, retryableError;
       try { result = await request(); }
       catch (error) {
-        if (attempt !== 0 || !RETRY_STATUSES.has(error?.status)) throw error;
+        if (attempt !== 0 || !isRetryableStatus(error?.status)) throw error;
         retryableError = error;
       }
       if (!retryableError) { await guard(); return result; }
 
       await guard();
-      const status = retryableError.status, reason = status === 429 ? 'rate-limit' : 'list-unavailable';
+      const status = retryableError.status, reason = status === 429 ? 'rate-limit' : 'request-failed';
       const seconds = retryableError.retryAfterSeconds;
       if (typeof seconds === 'number' && seconds > MAX_DELAY_SECONDS) {
         const error = new Error('EA requested a retry delay longer than five minutes; automatic read retry stopped.', {cause:retryableError});

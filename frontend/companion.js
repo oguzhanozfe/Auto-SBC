@@ -772,7 +772,7 @@
     const retry = window.AutoSBCReadRetry;
     if (!retry) throw new Error('The EA read module did not load. Reload the extension.');
     return retry.read({kind,request,guard,onWait:({remainingMs,status:responseStatus}) => {
-      const reason = responseStatus === 521 ? 'The EA SBC list is temporarily unavailable (521).' : 'EA limited the list request (429).';
+      const reason = responseStatus === 429 ? 'EA limited the list request (429).' : `EA SBC list request failed (${responseStatus}).`;
       status(`${reason} One retry in ${Math.ceil(remainingMs/1000)} seconds. Select Stop to cancel.`);
     }});
   }
@@ -1251,7 +1251,9 @@
   function downloadJSON(value, filename) {
     const url = URL.createObjectURL(new Blob([JSON.stringify(value,null,2)], {type:'application/json'}));
     const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
-    setTimeout(() => URL.revokeObjectURL(url),1000);
+    // Chrome may keep its Save dialog open before reading the blob. Keep the
+    // snapshot available while the user chooses a filename; unload also frees it.
+    setTimeout(() => URL.revokeObjectURL(url),300000);
   }
   function reportDetails(parent,title,buttonLabel,fieldLabel,getReport) {
     const details = el('details',undefined,parent); el('summary',title,details);
@@ -1385,8 +1387,7 @@
   ui.export = el('button', 'Export solve request', controls); ui.export.disabled = true;
   ui.export.addEventListener('click', () => {
     if (!state.input) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(state.input,null,2)], {type:'application/json'}));
-    const link = document.createElement('a'); link.href = url; link.download = `autosbc-request-${state.input.sbcData.challengeId}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+    downloadJSON(state.input,`autosbc-request-${state.input.sbcData.challengeId}.json`);
   });
   ui.status = el('p', 'Load SBCs to begin, or build a daily plan.', panel); ui.status.className = 'status';
   ui.poolInfo = el('p', '', panel); ui.poolInfo.className = 'muted';

@@ -13,7 +13,8 @@ protection policy and solver. It preserves the exported requirements, formation,
 per-card positions, policy and 30-second solve budget. Only anonymous aggregates
 are reported; the request files remain local.
 
-These measurements used macOS ARM64, Python 3.12.14 and eight solver workers.
+The initial measurements used macOS ARM64, Python 3.12.14 and eight solver workers.
+The separate one-worker experiment is identified below.
 Wall time covers planner execution, excluding imports, request validation,
 preparing a temporary copy of the public catalog, HTTP transport and job polling.
 Peak RSS includes the entire benchmark process. The public catalog contained
@@ -27,6 +28,7 @@ measurements, not complete hosted-service capacity tests.
 | 91-rated squad, normal single preview | 3,191 | 3,122 | 11 players, no chemistry | 279.9 MiB | 6.876 s | Optimal |
 | Pre-Season Challenge 6, normal single preview — original assignment model | 3,190 | 3,121 | 11 players, 31 chemistry, actual formation and alternative positions | 2,817.8 MiB | 30.386 s | Feasible; cheapest cost not proven |
 | Same Pre-Season request — exact sparse assignment domains | 3,190 | 3,121 | Same candidates and requirements; impossible out-of-position assignments omitted | 2,046.7 MiB | 30.193 s | Feasible; cheapest cost not proven |
+| Same Pre-Season request — sparse domains, one worker | 3,190 | 3,121 | Same exported request; one-worker configuration | 587.5 MiB | 30.251 s | Search UNKNOWN; no solution returned |
 
 The primary daily measurement is the first row: maximum rating 64, maximum card
 value 1,000, with special, played and evolved cards protected. It is a native
@@ -57,6 +59,20 @@ a deterministic memory or speed improvement. The historical 2,817.8 MiB peak
 does not establish that all real chemistry SBCs need approximately 3 GB,
 and does not independently settle whether Render is suitable. Daily and rating
 results likewise do not prove that a full service fits its limits.
+
+The one-worker experiment used the same actual exported request and returned
+zero solution players. Its search status was `UNKNOWN`; the planner reported
+`UNSUPPORTED_CHEMISTRY` with 30 rows excluded for unsupported profiles. CPU time
+was 29.971 seconds. The local service remained active and daily solves could
+overlap this process, so this is not a controlled speed comparison. Its lower
+memory measurement does not demonstrate successful low-memory solving, a memory
+upper bound or hosted capacity. The aggregate report is
+`hosting-real-preseason6-one-worker-experiment.json` in the delivery outputs.
+
+Daily repetition and rating-only parts remain the first product workloads to
+validate. The real 81-rating/31-chemistry Pre-Season case is a separate coverage
+and resource check; it must not displace those priorities or stand in for every
+user's workload.
 
 ## Historical synthetic stress measurements
 
@@ -93,10 +109,11 @@ Keep these sizes separate:
   every synthetic candidate every position changes the model independently of
   inventory size.
 
-The observed table provides initial daily, rating and chemistry measurements.
-Optimized chemistry, constrained-CPU runs, HTTP service overhead and memory
-retention across sequential jobs still need measurement. Host recommendations
-remain provisional.
+The observed table provides initial daily, rating and chemistry measurements,
+including sparse domains and one solver worker. A worker count is not an
+enforced CPU quota. Controlled repeated runs, allocated-CPU limits, HTTP service
+overhead and memory retention across sequential jobs still need measurement.
+Host recommendations remain provisional.
 
 The benchmark requires an explicit source. Preserve the actual export; do not
 replace its position options or change its policy to make a smaller benchmark.
@@ -129,7 +146,7 @@ labelled as such.
 | Daily Silver / Common Gold / Rare Gold | Fresh native requirements and owned eligible pool for each tier; unopened reward packs contribute no players | Successful solve or explicit shortage, time and memory. Silver completion and finite daily planning observed; representative tier measurements pending |
 | 10x85+ rating part | Observed 84 rating, 11 players and required rarity-group card, with played, evolution and saved-squad protections | Imported inventory versus eligible candidates, solution status, time and memory. Native completion observed; representative hosting measurement pending |
 | Multi-part player / pick set | Actual remaining 90/91-rated or other native parts, solved sequentially with updated ownership and rights | One actual 91-rated preview measured at 279.9 MiB / 6.876 s. Whole-sequence service capacity and memory retention remain unmeasured |
-| A chemistry SBC | Actual native formation, target and per-card alternative positions; separate exported cards, policy-retained rows and forced-zero rows | Actual Pre-Season Challenge 6 measured above. Equivalent sparse position domains, worker limits and host measurements remain pending |
+| A chemistry SBC | Actual native formation, target and per-card alternative positions; separate exported cards, policy-retained rows and forced-zero rows | Actual Pre-Season Challenge 6 measured above with sparse domains and eight/one workers. The one-worker run returned no solution; controlled repetitions and host measurements remain pending |
 | Early FC 27 concepts | Matching-season eligible concept candidates and fresh quotes; preserve no-quote and stale-quote outcomes | Separate quote-fetch time from solver time and memory. FC 26 concept placement observed; FC 27 live flow and representative measurement pending |
 
 For each run, record the workload shape above, hardware and runtime, allocated
@@ -195,8 +212,8 @@ These requirements apply independently of the outstanding capacity measurements.
 These constraints follow [Cloud Run's execution guidance](https://docs.cloud.google.com/run/docs/tips/general)
 and [Chrome's extension service-worker lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle).
 
-The next capacity check is to validate and remeasure the chemistry model change,
-then test the captured workloads with the intended CPU/worker limits and service
-lifecycle. Render remains under consideration; neither the synthetic stress case
+The next capacity check is to measure repeated daily and rating requests with
+the intended CPU/worker limits and service lifecycle, then reproduce the actual
+chemistry case under controlled conditions. Render remains under consideration; neither the synthetic stress case
 nor the historical unoptimized chemistry result settles that choice. No provider
 is selected by the current evidence.

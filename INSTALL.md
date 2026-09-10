@@ -17,15 +17,10 @@ node frontend/build.mjs
 ./start_server.sh
 ```
 
-On Windows, use:
-
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-lock.txt
-node frontend/build.mjs
-.venv\Scripts\python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-```
-
+The current service supports macOS and Linux. It uses Unix file locking and
+cannot run directly under native Windows Python. On Windows, use a Linux
+environment such as WSL and follow the Linux commands above; that setup still
+needs its own end-to-end browser validation.
 Node 22+ is only needed for the build command. Packaged releases include the
 built extension. Open **http://127.0.0.1:8000**, then use **Try sample players**
 for a local demonstration without EA sign-in.

@@ -2,6 +2,13 @@
 
 This document records the implemented boundaries. Exact final test counts, catalog coverage and packaging hashes are recorded with the delivery report.
 
+Current live checkpoint: **27.0.13, 10 September 2026**. The selected five-set
+request has **2/5 sets and 13/17 parts** verified. Ten selected-set parts and four
+Bronze dailies completed automatically: **14 automatic parts/cycles**. The daily
+reports record 1/60, 2/59 and 1/57 in separately started finite plans. Full-plan
+validation remains pending. The chronological entries retain their earlier
+version-specific counts and failures.
+
 ## Data path
 
 ```text
@@ -189,7 +196,7 @@ are recorded in the release report. On 10 September, the live batch started set
 list before solving. The exported journal contains no save or submit receipts.
 After that first attempt, the task count remained at 1/5 groups and 3/17 segments.
 
-## Daily automation and read pacing (27.0.6; live test pending)
+## Daily automation and read pacing (27.0.6 implementation checkpoint)
 
 A separate Daily button reads the current finite rights for Daily Bronze, Silver,
 Common Gold and Rare Gold Upgrade. Explicitly starting its displayed plan runs
@@ -255,7 +262,7 @@ Completed set cycles leave the manual queue; partial sets remain stopped.
 
 Normal post-submit verification waits two cancellable seconds before its forced
 read. This is application pacing, not a documented EA requirement or a proven
-explanation for status521. 521 is not automatically retried. The UI distinguishes
+explanation for status521. That version did not retry 521. The UI distinguishes
 submission receipts from completed counter verification. Recovery currently
 supports claim-uncertain reports; submitted, claim-pending, uncertain save/submit
 and malformed reports stay blocked. There is no automatic replay after reload.
@@ -378,11 +385,72 @@ and full revisions, then refresh Storage and every saved-squad lock. Solve,
 concept and no-completion recovery reads remain complete. A filtered ownership
 proof is explicitly marked incomplete for the whole Club. Adapter regressions
 cover missing/swapped cards, off-filter revisions, cumulative pages, stale squad
-hydration, changed locks and Stop. Live validation of this narrower read follows
-separately; mocks alone do not establish the native query behavior.
+hydration, changed locks and Stop. The 27.0.12 one-card Bronze run subsequently
+passed all three targeted post-solve checks live. Full Storage and saved-squad
+refreshes remained enabled. This establishes the observed native query path,
+not every possible club or revision combination.
 
 The allowlisted SBC set/challenge list reads also retry a numeric 521 once with
 the same bounded, cancellable cooldown as 429. Mixed failures still permit only
 two total attempts. Save, load and submit are outside the retry allowlist. Daily
 tests preserve a completed first cycle across a next-cycle transient failure,
 repeated failure and Stop during the countdown, without duplicate submissions.
+
+The fresh 27.0.12 daily plan verified **2/59 Bronze cycles**, with successful
+receipts at **00:58:52.282Z** and **01:00:13.762Z**. An initial 521 set-list read
+before the second cycle recovered after one 60-second retry. Before the next
+cycle, the initial set-list read returned 512; its child ledger contains only
+`batch-stopped`, with no save or submit. The local export
+`autosbc-daily-targeted-521-recovered-2026-09-10.json` preserves both completed
+child reports and the blocked cycle.
+
+## Bounded list-error policy and live checkpoint (27.0.13)
+
+Only `requestSets` and `requestChallengesForSet` may retry after a numeric 429
+or an integer status from 500 through 599. There is one retry per read operation,
+two total attempts even when the error changes. A usable positive Retry-After
+is honored up to five minutes; otherwise the fallback is 60 seconds. Stop and
+journal/scope guards run throughout the visible countdown. Load, Save and Submit
+remain outside this retry path, and stopped runs never resume after reload.
+
+The inspected public EA client gives neither 512 nor 521 a defined error name.
+Unknown codes pass through its HTTP conversion and receive a generic error
+message. The retry range is application policy, not evidence that these codes
+mean temporary overload, authentication, captcha or a restriction. The source
+defines separate authentication/captcha and service codes. See EA's
+[public client bundle](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/ocompiled.js?_=10821)
+and [SBC service/error handling](https://www.ea.com/ea-sports-fc/ultimate-team/web-app/js/compiled_2.js?_=10821).
+
+The fresh 27.0.13 plan had 57 rights and verified **1/57 Bronze cycles**. The
+receipt is timestamped **01:08:34.062Z**, counter verification completed at
+**01:08:36.413Z**, and the next initial set-list read returned 426 at
+**01:08:36.415Z**. Its child has no save or submit attempt. That response is
+outside the retry policy; the test stopped without broadening it. The local
+report `autosbc-daily-27.0.13-2026-09-10.json` was downloaded and read back.
+
+There are now four verified automatic Bronze dailies and ten automatic
+selected-set parts, **14 fully automatic completions**. The original selected
+request remains **2/5 sets and 13/17 parts**. Fifty-six daily rights remain by
+arithmetic; this is not a fresh rights query. Balance remained **577,251**;
+no purchases, pack opening or pick selection occurred. The complete daily plan
+and remaining selected-set work are still pending. Only the 521 list retry was
+observed live; the broader 5xx policy, including 512, has unit coverage.
+
+The download lifetime correction also passed twice in Chrome: the native Save
+dialog remained available for renaming and saved both actual reports. The first
+file was 38,468 bytes. At this release checkpoint, **227 Python and 337 browser
+tests passed**. The local launcher check reported no missing packages and a
+ready 27.0.13 server; these checks do not establish uninterrupted automation.
+
+The English dashboard also passed a browser smoke check against the connected
+27.0.13 service: its clearly labelled 22-player sample produced an 11-player,
+84-rating, 33-chemistry squad with zero quoted coins in 0.8 seconds. Setup,
+download, privacy and feedback links were visible. This used sample data and
+performed no EA account action.
+
+The same actual Pre-Season 6 export also had an offline one-worker experiment:
+**587.5 MiB**, **30.251 seconds**, search **UNKNOWN**, and zero solution players.
+The planner reported `UNSUPPORTED_CHEMISTRY` with 30 excluded profiles. Concurrent
+local service activity could overlap; no controlled speed, successful low-memory
+solve or hosted-capacity conclusion follows. See [HOSTING.md](HOSTING.md) for
+the workload and limits. Daily and rating-only work remain the immediate priorities.

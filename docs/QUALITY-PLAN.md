@@ -6,15 +6,25 @@ The goal is reliable SBC completion with visible limits and preserved club cards
 
 | Area | Current evidence | Acceptance check |
 | --- | --- | --- |
-| Owned squads | Earlier solve/Apply flows plus nine fully automatic parts; selected request: 2/5 groups and 12/17 parts. Played/evolution checks preserved; balance 577,251 | Finish the three remaining groups with exact receipts and protected-card checks |
+| Owned squads | Ten selected-set parts fully automatic; selected request: 2/5 groups and 13/17 parts. Played/evolution checks preserved; balance 577,251 | Finish the three remaining groups/four parts with exact receipts and protected-card checks |
 | Concept players | 27.0.3: Mason Toye's exact 65-rated EA concept placed using an observed 200-coin listing; no purchase or submission | Preserve identity, source, platform and 120-second live quote age; never pretend a concept is owned |
-| Card protection | Zero-game checks, Evolution, active squad and Paletools locks; pre-Apply reread verified | Recheck at automatic submit; changed/missing stats or locks stop consumption |
-| Finite automation | 27.0.6 submitted one part; 27.0.7 submitted and verified eight more, including completion of the 98+ FOF/FUTTIES Pick | Resolve the later 409 without repeating an uncertain exchange, then finish the queue |
-| Read recovery | 27.0.7 successfully used one bounded 429 read retry during the transition to Yan Diomandé; Stop checks are covered in tests | Preserve the bounded cooldown and never automatically retry a write |
-| Daily preset | 27.0.6 implements finite Bronze/Silver/Common Gold/Rare Gold plans, low-rating profiles, a whole-job journal and separate child batches; live completion is pending | Read today's finite rights, complete each planned cycle once, stop on changed counters or uncertain results, and preserve the manual queue and settings |
-| Recovery | 27.0.7 read-only reconciliation resolved the confirmed-submit/521-read report. The later 4152 submit409 has no receipt and is not counted | Permit a fresh plan only after strict status and fresh physical-ownership proof; preserve the original uncertainty and all receipts |
+| Card protection | Zero-game, evolution, all saved-squad and Paletools locks. One-card targeted Club checks passed live; Storage and saved squads still refresh | Preserve exact physical/revision identity and ownership before save/submit; changed or unreadable protection stops consumption |
+| Finite automation | 14 fully automatic parts/cycles: ten selected-set parts plus four Bronze dailies. Full selected queue and daily plan remain unfinished | Complete the finite remaining work without replaying successful or uncertain effects |
+| Read recovery | One 429 retry and one 521 retry observed live. 27.0.13 allows one list-only retry for numeric 429/integer 500–599; broader range is unit-tested | Preserve bounded cooldown, generic unknown-code reporting and no write retries. The observed next-cycle 426 stays outside the policy |
+| Daily preset | Reports verify 1/60, then 2/59, then 1/57 in fresh finite plans: four Bronze cycles. Latest 426 list failure stopped before the next write | Validate remaining cycles and actual eligible-card shortages; preserve manual settings and unopened rewards. Do not claim all 60 passed |
+| Recovery | 27.0.7 reconciled confirmed-submit/521-read without resubmission. 27.0.9 proved no completion for 4152/409; a later fresh protected solve completed 4152 | Preserve original uncertainty and receipts; do not widen no-completion recovery beyond its strict status/ownership proof |
 | Diagnostics | EA status and solver diagnostics available | Explain exact unsatisfied constraints, stale prices and retry state in ordinary language |
 | FC 27 | Separate catalog exists; prior source had no usable FC 27 market prices | Verify live FC 27 adapter, definitions and market prices after launch; never reuse FC 26 prices |
+
+This is the 27.0.13 checkpoint: 227 Python and 337 browser tests passed. These
+tests and four live Bronze cycles do not establish full-plan reliability. The
+concrete journeys in [REAL-WORLD-CASES.md](REAL-WORLD-CASES.md) prioritize daily
+rights, protected rating parts, concepts and understandable stopped-state recovery.
+The actual Pre-Season 6 export is an 81-rating/31-chemistry case; its one-worker
+replay returned UNKNOWN with no solution at 587.5 MiB/30.251 seconds. It is
+separate from the historical all-flexible 3,000-card synthetic stress case and
+does not supersede those product priorities. See [HOSTING.md](HOSTING.md) for
+measurement and concurrent-activity limits.
 
 ## Scoped solver acceptance backlog
 
