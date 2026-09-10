@@ -27,7 +27,7 @@ suite and a real browser smoke test. Record actual live results separately from
 mocked tests, and never count a saved squad as a completed SBC.
 
 Before public launch, complete the live daily plan, cover remaining recovery
-states, protect saved-squad references consistently, and resolve or explicitly
+states, validate all-saved-squad protection live, and resolve or explicitly
 reject unsupported combined/OR requirements. See [the quality plan](QUALITY-PLAN.md)
 for testable examples. FC 27 compatibility and usable market prices remain
 separate launch checks.

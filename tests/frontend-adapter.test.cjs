@@ -291,6 +291,36 @@ test('an inactive saved squad lock added after preview blocks Apply before savin
   await h.button('Apply squad').click();assert.deepEqual(h.writes,[]);
   assert.ok(h.elements.some(e=>e.textContent.includes('Locked player')));
 });
+test('saved squad ID zero is accepted for active and inactive squads while physical item IDs stay positive',async t=>{
+  for(const activeId of [0,7])await t.test(`active squad ${activeId}`,async()=>{
+    const h=harness(),slots=[];slots[22]={_item:h.players[0]};h.savedSquads.set(0,slots);
+    h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:activeId,listFull:false,squads:[...h.savedSquads].map(([id,players])=>h.nativeSquad(id,players))});
+    await h.refresh();await h.button('Solve and preview').click();
+    assert.equal(h.requests[0].clubPlayers.some(player=>player.id===1),false);
+    assert.ok(h.requests[0].solverPolicy.lockedItemIds.includes('1'));assert.deepEqual(h.writes,[]);
+  });
+  const h=harness();h.players[0].id=0;await h.refresh();await h.button('Solve and preview').click();
+  assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+});
+test('a zero squad alias returning a different native squad ID is rejected',async()=>{
+  const h=harness();h.savedSquads.set(0,[]);const read=h.ctx.services.Squad.requestSquadById;
+  h.ctx.services.Squad.requestSquadById=id=>id===0?observable({squad:h.nativeSquad(7,[])}):read(id);
+  await h.refresh();await h.button('Solve and preview').click();assert.equal(h.requests.length,0);assert.deepEqual(h.writes,[]);
+  assert.ok(h.elements.some(e=>e.textContent.includes('Cannot read saved squad players or match the squad identity')));
+});
+test('saved squad identity diagnostics are bounded and do not serialize unknown objects or strings',async()=>{
+  const h=harness();const squads=[{getId:()=>0},{},{getId:()=>{throw new Error('do-not-record');}},
+    {getId:()=>({token:'do-not-record'})},{getId:()=> 'do-not-record'},...Array.from({length:40},(_,i)=>({getId:()=>i+10}))];
+  h.ctx.services.Squad.requestSquadList=()=>observable({activeSquadId:'7',squads,token:'do-not-record'});
+  await h.refresh();await h.button('Solve and preview').click();
+  const message=h.elements.find(e=>e.tag==='p'&&e.textContent.includes('Squad identity details:')).textContent;
+  const details=JSON.parse(message.split('Squad identity details: ')[1]);
+  assert.deepEqual(details.activeSquadId,{type:'string',value:'7'});assert.equal(details.count,45);assert.equal(details.squads.length,30);
+  assert.deepEqual(details.squads[0],{getIdPresent:true,type:'number',value:'0'});
+  assert.equal(details.squads[1].getIdPresent,false);assert.equal(details.squads[2].getterFailed,true);
+  assert.equal(details.squads[3].value,'[non-scalar]');assert.equal(details.squads[4].value,'[non-numeric string]');
+  assert.doesNotMatch(message,/do-not-record|token/);assert.deepEqual(h.writes,[]);assert.equal(h.requests.length,0);
+});
 test('fresh inventory and saved squad adapters fail closed on incomplete identities or roster models',async t=>{
   const cases=[
     ['missing club reset',h=>{h.ctx.repositories.Item.getClub=()=>({});}],

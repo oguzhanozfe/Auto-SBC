@@ -305,3 +305,16 @@ contained zero usable/fresh prices. Their provider publication timestamp remaine
 3 September, 08:58:19 UTC. The UI correctly reports `awaiting_market_prices`;
 fresh retrieval does not make that provider snapshot current. This price-only
 check did not scan more catalog pages or access an EA account.
+
+The 27.0.9 read-only no-completion check passed live at
+2026-09-10T00:21:29.532Z for Yan Diomandé challenge 4152: all eleven original
+physical cards remained owned and both status reads showed no completion. The
+report retained its eight previous verified parts and original uncertain event;
+no completion credit or submission was added. Its exported record was preserved
+before starting a fresh queue.
+
+The fresh 27.0.9 queue stopped before any save/submit on saved-squad identity
+validation. Version 27.0.10 separates native squad identifiers from physical card
+IDs and adds bounded typed diagnostics; the actual original mismatch is not
+attributed without live evidence. Native squad zero is supported while returned
+identity must still match exactly. The correction adds five adapter regressions.

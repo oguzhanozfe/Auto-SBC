@@ -106,3 +106,23 @@ See [VERIFICATION.md](../docs/VERIFICATION.md) for actual account results and
 [QUALITY-PLAN.md](../docs/QUALITY-PLAN.md) for remaining acceptance checks. Tests
 cover policy, lifecycle, read recovery and a mocked adapter; they do not certify
 all private EA interfaces or guarantee uninterrupted automation.
+
+## Fresh ownership and stopped 409 verification (27.0.9+)
+
+Each protected inventory read clears the local Club cache and invalidates SBC
+Storage before reading cards. Physical ownership is captured before native squad
+hydration can add saved references to the local item repository. Every saved
+squad is then refreshed and all 23 native player slots, including substitutes
+and reserves, become hard locks. Missing or mismatched responses stop the action.
+Squad identifiers have their own validation; native squad zero is distinct from
+a physical player ID, which must be positive. A zero alias returning another
+squad identity is not accepted silently.
+
+**Verify cards and replan** supports one narrow case: an eleven-player submission
+returned 409, without a successful target receipt. Fresh status must show the
+same nonrepeatable, incomplete challenge with zero completion counters both
+before and after reading all eleven exact physical cards as still owned. A
+changed journal, scope, status, missing player or incomplete read leaves the
+attempt unresolved. Success appends evidence, retains the original uncertain
+event and prior receipts, and permits a separately started fresh plan. It never
+claims the failed attempt completed or repeats that recorded submission.

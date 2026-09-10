@@ -127,6 +127,19 @@
     return (typeof value === 'number' || typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value)) &&
       Number.isSafeInteger(Number(value)) && Number(value) > 0 ? String(value) : null;
   }
+  function savedSquadId(value) {
+    // EA squad entities accept ID 0; physical player item IDs remain positive.
+    return (typeof value === 'number' || typeof value === 'string' && /^(0|[1-9]\d{0,15})$/.test(value)) &&
+      Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? String(value) : null;
+  }
+  function squadIdentityError(message,listed,entries=[]) {
+    const scalar = value => ({type:typeof value,value:
+      value === null ? 'null' : typeof value === 'number' || typeof value === 'boolean' || typeof value === 'undefined' ? String(value) :
+      typeof value === 'string' && /^-?\d{1,16}$/.test(value) ? value : typeof value === 'string' ? '[non-numeric string]' : '[non-scalar]'});
+    const diagnostic = {activeSquadId:scalar(listed?.activeSquadId),count:Array.isArray(listed?.squads) ? listed.squads.length : null,
+      squads:entries.slice(0,30).map(entry => ({getIdPresent:entry.present,...scalar(entry.value),...(entry.failed ? {getterFailed:true} : {})}))};
+    return new Error(`${message} Squad identity details: ${JSON.stringify(diagnostic)}`);
+  }
   async function pages(storage, guard) {
     guard();
     if (!storage) {
@@ -207,14 +220,20 @@
     guard(); const squadService = savedSquadAdapter();
     squadService.resetSquadsCache();
     const listed = await observe(squadService.requestSquadList(),'Saved squad list'); guard();
-    if (!Array.isArray(listed.squads) || !listed.squads.length || !physicalId(listed.activeSquadId)) throw new Error('Cannot read the complete saved squad list.');
-    const ids = listed.squads.map(squad => typeof squad?.getId === 'function' ? physicalId(squad.getId()) : null);
-    if (ids.some(id => !id) || new Set(ids).size !== ids.length || !ids.includes(physicalId(listed.activeSquadId))) throw new Error('Saved squad identities or the active squad are missing.');
+    if (!Array.isArray(listed.squads) || !listed.squads.length) throw squadIdentityError('Cannot read the complete saved squad list.',listed);
+    const entries = listed.squads.map(squad => {
+      const present = typeof squad?.getId === 'function';
+      try { return {present,value:present ? squad.getId() : undefined}; }
+      catch { return {present,value:undefined,failed:true}; }
+    });
+    const ids = entries.map(entry => entry.failed ? null : savedSquadId(entry.value));
+    const activeId = savedSquadId(listed.activeSquadId);
+    if (activeId === null || ids.some(id => id === null) || new Set(ids).size !== ids.length || !ids.includes(activeId)) throw squadIdentityError('Saved squad identities or the active squad are missing.',listed,entries);
     const locked = new Set();
     for (const id of ids) {
       guard(); const response = await observe(squadService.requestSquadById(Number(id)),`Saved squad ${id}`); guard();
       const squad = response.squad;
-      if (typeof squad?.getId !== 'function' || physicalId(squad.getId()) !== id || typeof squad.getPlayers !== 'function') throw new Error('Cannot read saved squad players or match the squad identity.');
+      if (typeof squad?.getId !== 'function' || savedSquadId(squad.getId()) !== id || typeof squad.getPlayers !== 'function') throw new Error('Cannot read saved squad players or match the squad identity.');
       const slots = squad.getPlayers();
       // EA models contain 23 player slots, including bench and reserves. The
       // native factory fills empty slots; this checks its reported model shape.
